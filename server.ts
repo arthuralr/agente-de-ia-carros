@@ -1,0 +1,1164 @@
+import dotenv from 'dotenv';
+import express, { NextFunction, Request, Response } from 'express';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { pool, verifyDatabaseConnection } from './src/db/pool';
+import {
+  DbContractRow,
+  DbLeadRow,
+  DbRadarRow,
+  DbVehicleRow,
+  seedNeonDatabaseIfEmpty,
+} from './src/db/repository';
+import {
+  buildClearSessionCookieHeader,
+  buildSessionCookieHeader,
+  DbAdminUserRow,
+  ensureAdminUsersSchemaAndSeed,
+  parseCookies,
+  PublicAdminUser,
+  SESSION_COOKIE_NAME,
+  signPublicLeadChatToken,
+  signSessionToken,
+  verifyPassword,
+  verifyPublicLeadChatToken,
+  verifySessionToken,
+} from './src/db/auth';
+
+if (fs.existsSync('.env.local')) {
+  dotenv.config({ path: '.env.local', override: true });
+}
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+app.set('trust proxy', 1);
+const PORT = Number(process.env.PORT) || 3000;
+
+app.use(express.json({ limit: '5mb' }));
+
+interface GeneratePostBody {
+  vehicle: {
+    brand: string;
+    model: string;
+    version: string;
+    year: string;
+    km: number;
+    price: number;
+    color: string;
+    transmission: string;
+    fuel: string;
+    optionals: string[];
+  };
+  platform: string;
+  tone: string;
+  differentials: string;
+  dealershipName: string;
+  whatsapp: string;
+  city: string;
+}
+
+interface ChatRequestBody {
+  messages: { sender: 'ia' | 'cliente'; text: string }[];
+  vehicle?: {
+    brand: string;
+    model: string;
+    version: string;
+    year: string;
+    km: number;
+    price: number;
+    color: string;
+    transmission: string;
+    fuel: string;
+    status: string;
+    optionals: string[];
+  } | null;
+  inventorySummary?: string;
+  settings?: {
+    tradeName: string;
+    address: string;
+    city: string;
+    state: string;
+    whatsapp: string;
+    hoursWeekdays: string;
+    hoursSaturday: string;
+    aiAssistantName: string;
+  };
+}
+
+function getGeminiClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    throw new Error(
+      'Chave GEMINI_API_KEY não configurada no ambiente. Configure-a em Settings > Secrets ou .env.local para utilizar a IA.'
+    );
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      timeout: 60000,
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+async function callGeminiWithRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient =
+        msg.includes('503') ||
+        msg.includes('504') ||
+        msg.includes('429') ||
+        msg.includes('UNAVAILABLE') ||
+        msg.includes('DEADLINE_EXCEEDED') ||
+        msg.includes('high demand');
+      if (!isTransient || attempt === maxRetries) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
+function formatGeminiError(err: unknown): { status: number; message: string } {
+  const raw = err instanceof Error ? err.message : 'Erro desconhecido ao consultar Gemini API.';
+  if (raw.includes('503') || raw.includes('UNAVAILABLE')) {
+    return {
+      status: 503,
+      message: 'O serviço de IA está com alta demanda temporária no momento. Tente novamente em alguns segundos.',
+    };
+  }
+  if (raw.includes('504') || raw.includes('DEADLINE_EXCEEDED')) {
+    return {
+      status: 504,
+      message: 'A requisição de IA excedeu o tempo limite. Tente novamente em instantes.',
+    };
+  }
+  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+    return {
+      status: 429,
+      message: 'Limite temporário de requisições da API Gemini atingido. Aguarde alguns instantes.',
+    };
+  }
+  if (raw.includes('403') || raw.includes('400') || raw.includes('API_KEY_INVALID')) {
+    return {
+      status: 400,
+      message: 'Chave GEMINI_API_KEY inválida ou sem permissão. Verifique a configuração em .env.local ou Settings > Secrets.',
+    };
+  }
+  return { status: 500, message: raw };
+}
+
+interface AuthenticatedRequest extends Request {
+  adminUser?: PublicAdminUser;
+}
+
+async function resolveAuthenticatedAdmin(
+  req: Request
+): Promise<PublicAdminUser | null> {
+  const cookies = parseCookies(req.headers.cookie);
+  let token = cookies[SESSION_COOKIE_NAME] || '';
+
+  if (!token) {
+    const authHeader = req.headers.authorization;
+    if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+      token = authHeader.slice(7).trim();
+    }
+  }
+
+  if (!token) return null;
+
+  const payload = verifySessionToken(token);
+  if (!payload) return null;
+
+  const userRes = await pool.query<DbAdminUserRow>(
+    `SELECT id, name, email, role, avatar_url, active
+     FROM admin_users
+     WHERE id = $1 AND active = true
+     LIMIT 1`,
+    [payload.sub]
+  );
+
+  const row = userRes.rows[0];
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    avatarUrl: row.avatar_url,
+  };
+}
+
+async function requireAdminAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const user = await resolveAuthenticatedAdmin(req);
+    if (!user) {
+      res.status(401).json({
+        error: 'Autenticação administrativa necessária. Faça login para continuar.',
+      });
+      return;
+    }
+    req.adminUser = user;
+    next();
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao validar sessão administrativa.';
+    res.status(500).json({ error: message });
+  }
+}
+
+// ============================================================================
+// Authentication Routes (HttpOnly JWT Cookie + Neon PostgreSQL)
+// ============================================================================
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const rawPassword = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    if (!rawEmail || !rawPassword) {
+      res.status(400).json({ error: 'Informe o e-mail corporativo e a senha.' });
+      return;
+    }
+
+    const userRes = await pool.query<DbAdminUserRow>(
+      `SELECT id, name, email, password_hash, role, avatar_url, active
+       FROM admin_users
+       WHERE LOWER(email) = $1
+       LIMIT 1`,
+      [rawEmail]
+    );
+
+    const row = userRes.rows[0];
+    if (!row || !row.active || !verifyPassword(rawPassword, row.password_hash)) {
+      res.status(401).json({
+        error: 'E-mail ou senha inválidos. Verifique suas credenciais e tente novamente.',
+      });
+      return;
+    }
+
+    await pool.query('UPDATE admin_users SET last_login_at = NOW() WHERE id = $1', [
+      row.id,
+    ]);
+
+    const user: PublicAdminUser = {
+      id: row.id,
+      name: row.name,
+      email: row.email,
+      role: row.role,
+      avatarUrl: row.avatar_url,
+    };
+
+    const token = signSessionToken(user);
+    res.setHeader('Set-Cookie', buildSessionCookieHeader(req, token));
+    res.json({ authenticated: true, user, token });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao autenticar no banco de dados.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.setHeader('Set-Cookie', buildClearSessionCookieHeader(req));
+  res.json({ loggedOut: true });
+});
+
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const user = await resolveAuthenticatedAdmin(req);
+    if (!user) {
+      res.status(401).json({ authenticated: false, error: 'Sessão não autenticada.' });
+      return;
+    }
+    res.json({ authenticated: true, user });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao verificar sessão ativa.';
+    res.status(500).json({ authenticated: false, error: message });
+  }
+});
+
+// ============================================================================
+// Neon PostgreSQL API Routes (Public Storefront vs Protected Admin)
+// ============================================================================
+
+app.get('/api/health/db', async (_req, res) => {
+  try {
+    const info = await verifyDatabaseConnection();
+    res.json(info);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao conectar ao PostgreSQL.';
+    res.status(500).json({ connected: false, error: message });
+  }
+});
+
+app.get('/api/public/vehicles', async (_req, res) => {
+  try {
+    const result = await pool.query<DbVehicleRow>(
+      "SELECT * FROM vehicles WHERE status = 'Disponivel' ORDER BY created_at DESC, id DESC"
+    );
+    res.json(result.rows);
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao consultar estoque público.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/public/leads', async (req, res) => {
+  try {
+    const { name, phone, vehicle_interest, chat_history } = req.body;
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
+
+    if (!cleanName || !cleanPhone) {
+      res.status(400).json({ error: 'Nome e telefone/WhatsApp são obrigatórios.' });
+      return;
+    }
+
+    const result = await pool.query<DbLeadRow>(
+      `INSERT INTO leads (name, phone, vehicle_interest, stage, chat_history)
+       VALUES ($1, $2, $3, 'Novo Lead', $4)
+       RETURNING *`,
+      [
+        cleanName,
+        cleanPhone,
+        vehicle_interest ? String(vehicle_interest).trim() : 'Atendimento Geral',
+        typeof chat_history === 'string'
+          ? chat_history
+          : JSON.stringify(chat_history || []),
+      ]
+    );
+
+    const created = result.rows[0];
+    const chatToken = signPublicLeadChatToken(created.id);
+    res.status(201).json({ ...created, chatToken });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao registrar interesse.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.patch('/api/public/leads/:id/chat', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: 'ID de atendimento inválido.' });
+    return;
+  }
+
+  const chatToken =
+    typeof req.body?.chatToken === 'string' ? req.body.chatToken.trim() : '';
+  if (!verifyPublicLeadChatToken(id, chatToken)) {
+    res.status(401).json({ error: 'Token de atendimento inválido.' });
+    return;
+  }
+
+  try {
+    const rawHistory = req.body?.chat_history;
+    const serialized =
+      typeof rawHistory === 'string'
+        ? rawHistory
+        : JSON.stringify(rawHistory || []);
+
+    const result = await pool.query<DbLeadRow>(
+      'UPDATE leads SET chat_history = $1 WHERE id = $2 RETURNING id, chat_history',
+      [serialized, id]
+    );
+
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Atendimento não encontrado.' });
+      return;
+    }
+
+    res.json({ updated: true, id });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao sincronizar histórico do chat.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get('/api/vehicles', requireAdminAuth, async (req, res) => {
+  try {
+    const statusFilter =
+      typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    if (statusFilter) {
+      const result = await pool.query<DbVehicleRow>(
+        'SELECT * FROM vehicles WHERE status = $1 ORDER BY created_at DESC, id DESC',
+        [statusFilter]
+      );
+      res.json(result.rows);
+      return;
+    }
+
+    const result = await pool.query<DbVehicleRow>(
+      'SELECT * FROM vehicles ORDER BY created_at DESC, id DESC'
+    );
+    res.json(result.rows);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao listar veículos.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
+  try {
+    const {
+      brand,
+      model,
+      version,
+      year_fab,
+      year_model,
+      km,
+      price,
+      status,
+      fuel,
+      transmission,
+      image_url,
+      options,
+    } = req.body;
+
+    if (!brand || !String(brand).trim() || !model || !String(model).trim()) {
+      res.status(400).json({ error: 'Marca e modelo são obrigatórios.' });
+      return;
+    }
+
+    const parsedYearFab = Number(year_fab);
+    const parsedYearModel = Number(year_model);
+    const parsedKm = Number(km);
+    const parsedPrice = Number(price);
+
+    if (!Number.isFinite(parsedYearFab) || !Number.isFinite(parsedYearModel)) {
+      res.status(400).json({ error: 'Ano de fabricação e ano do modelo inválidos.' });
+      return;
+    }
+
+    const vehicleStatus =
+      typeof status === 'string' &&
+      status.trim() !== '' &&
+      status.trim() !== 'Disponível'
+        ? status.trim()
+        : 'Disponivel';
+
+    const result = await pool.query<DbVehicleRow>(
+      `INSERT INTO vehicles (brand, model, version, year_fab, year_model, km, price, status, fuel, transmission, image_url, options)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [
+        String(brand).trim(),
+        String(model).trim(),
+        version ? String(version).trim() : '',
+        parsedYearFab,
+        parsedYearModel,
+        Number.isFinite(parsedKm) ? parsedKm : 0,
+        Number.isFinite(parsedPrice) ? parsedPrice : 0,
+        vehicleStatus,
+        fuel ? String(fuel).trim() : 'Flex',
+        transmission ? String(transmission).trim() : 'Automático',
+        image_url ? String(image_url).trim() : '',
+        Array.isArray(options) ? options.map(String) : [],
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao cadastrar veículo no banco.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: 'ID de veículo inválido.' });
+    return;
+  }
+
+  try {
+    const {
+      brand,
+      model,
+      version,
+      year_fab,
+      year_model,
+      km,
+      price,
+      status,
+      fuel,
+      transmission,
+      image_url,
+      options,
+    } = req.body;
+
+    const normalizedStatus =
+      typeof status === 'string' && status.trim() === 'Disponível'
+        ? 'Disponivel'
+        : status;
+
+    const result = await pool.query<DbVehicleRow>(
+      `UPDATE vehicles
+       SET brand = COALESCE($1, brand),
+           model = COALESCE($2, model),
+           version = COALESCE($3, version),
+           year_fab = COALESCE($4, year_fab),
+           year_model = COALESCE($5, year_model),
+           km = COALESCE($6, km),
+           price = COALESCE($7, price),
+           status = COALESCE($8, status),
+           fuel = COALESCE($9, fuel),
+           transmission = COALESCE($10, transmission),
+           image_url = COALESCE($11, image_url),
+           options = COALESCE($12, options)
+       WHERE id = $13
+       RETURNING *`,
+      [
+        brand,
+        model,
+        version,
+        year_fab !== undefined ? Number(year_fab) : null,
+        year_model !== undefined ? Number(year_model) : null,
+        km !== undefined ? Number(km) : null,
+        price !== undefined ? Number(price) : null,
+        normalizedStatus,
+        fuel,
+        transmission,
+        image_url,
+        Array.isArray(options) ? options : null,
+        id,
+      ]
+    );
+
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Veículo não encontrado.' });
+      return;
+    }
+
+    res.json(result.rows[0]);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao atualizar veículo.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.delete('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: 'ID de veículo inválido.' });
+    return;
+  }
+
+  try {
+    await pool.query('UPDATE contracts SET vehicle_id = NULL WHERE vehicle_id = $1', [id]);
+    const result = await pool.query('DELETE FROM vehicles WHERE id = $1', [id]);
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Veículo não encontrado.' });
+      return;
+    }
+    res.json({ deleted: true, id });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao remover veículo.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get('/api/leads', requireAdminAuth, async (_req, res) => {
+  try {
+    const result = await pool.query<DbLeadRow>(
+      'SELECT * FROM leads ORDER BY id DESC'
+    );
+    res.json(result.rows);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao listar leads.';
+    res.status(500).json({ error: message });
+  }
+});
+
+const ALLOWED_LEAD_STAGES = [
+  'Novo Lead',
+  'Em Atendimento',
+  'Proposta',
+  'Fechado',
+] as const;
+
+app.post('/api/leads', requireAdminAuth, async (req, res) => {
+  try {
+    const { name, phone, vehicle_interest, stage, chat_history } = req.body;
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
+
+    if (!cleanName || !cleanPhone) {
+      res.status(400).json({ error: 'Nome e telefone/WhatsApp são obrigatórios.' });
+      return;
+    }
+
+    const requestedStage = typeof stage === 'string' ? stage.trim() : '';
+    const validStage = ALLOWED_LEAD_STAGES.includes(
+      requestedStage as (typeof ALLOWED_LEAD_STAGES)[number]
+    )
+      ? requestedStage
+      : 'Novo Lead';
+
+    const result = await pool.query<DbLeadRow>(
+      `INSERT INTO leads (name, phone, vehicle_interest, stage, chat_history)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [
+        cleanName,
+        cleanPhone,
+        vehicle_interest ? String(vehicle_interest).trim() : 'Atendimento Geral',
+        validStage,
+        typeof chat_history === 'string'
+          ? chat_history
+          : JSON.stringify(chat_history || []),
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao salvar lead.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.patch('/api/leads/:id', requireAdminAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: 'ID de lead inválido.' });
+    return;
+  }
+
+  try {
+    const { name, phone, vehicle_interest, stage, chat_history } = req.body;
+
+    if (
+      stage !== undefined &&
+      stage !== null &&
+      !ALLOWED_LEAD_STAGES.includes(stage as (typeof ALLOWED_LEAD_STAGES)[number])
+    ) {
+      res.status(400).json({ error: 'Estágio de funil inválido.' });
+      return;
+    }
+
+    const result = await pool.query<DbLeadRow>(
+      `UPDATE leads
+       SET name = COALESCE($1, name),
+           phone = COALESCE($2, phone),
+           vehicle_interest = COALESCE($3, vehicle_interest),
+           stage = COALESCE($4, stage),
+           chat_history = COALESCE($5, chat_history)
+       WHERE id = $6
+       RETURNING *`,
+      [
+        name !== undefined ? String(name).trim() : null,
+        phone !== undefined ? String(phone).trim() : null,
+        vehicle_interest !== undefined ? String(vehicle_interest).trim() : null,
+        stage ?? null,
+        chat_history !== undefined
+          ? typeof chat_history === 'string'
+            ? chat_history
+            : JSON.stringify(chat_history)
+          : null,
+        id,
+      ]
+    );
+
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Lead não encontrado.' });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao atualizar lead.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get('/api/contracts', requireAdminAuth, async (_req, res) => {
+  try {
+    const result = await pool.query<
+      DbContractRow & {
+        vehicle_brand?: string | null;
+        vehicle_model?: string | null;
+        vehicle_year_fab?: number | null;
+        vehicle_year_model?: number | null;
+      }
+    >(
+      `SELECT c.*,
+              v.brand AS vehicle_brand,
+              v.model AS vehicle_model,
+              v.year_fab AS vehicle_year_fab,
+              v.year_model AS vehicle_year_model
+       FROM contracts c
+       LEFT JOIN vehicles v ON v.id = c.vehicle_id
+       ORDER BY c.id DESC`
+    );
+    res.json(result.rows);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao listar contratos.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/contracts', requireAdminAuth, async (req, res) => {
+  try {
+    const { client_name, client_cpf, vehicle_id, final_price, payment_method } =
+      req.body;
+
+    const cleanName = typeof client_name === 'string' ? client_name.trim() : '';
+    const cleanCpf = typeof client_cpf === 'string' ? client_cpf.trim() : '';
+    const parsedPrice = Number(final_price);
+
+    if (!cleanName || !cleanCpf) {
+      res.status(400).json({ error: 'Nome e CPF do comprador são obrigatórios.' });
+      return;
+    }
+
+    if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+      res.status(400).json({ error: 'Preço final negociado inválido.' });
+      return;
+    }
+
+    const parsedVehicleId =
+      vehicle_id && Number.isInteger(Number(vehicle_id))
+        ? Number(vehicle_id)
+        : null;
+
+    const insertRes = await pool.query<{ id: number }>(
+      `INSERT INTO contracts (client_name, client_cpf, vehicle_id, final_price, payment_method)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [
+        cleanName,
+        cleanCpf,
+        parsedVehicleId,
+        parsedPrice,
+        payment_method ? String(payment_method).trim() : 'À vista',
+      ]
+    );
+
+    const createdId = insertRes.rows[0].id;
+    const joined = await pool.query<
+      DbContractRow & {
+        vehicle_brand?: string | null;
+        vehicle_model?: string | null;
+        vehicle_year_fab?: number | null;
+        vehicle_year_model?: number | null;
+      }
+    >(
+      `SELECT c.*,
+              v.brand AS vehicle_brand,
+              v.model AS vehicle_model,
+              v.year_fab AS vehicle_year_fab,
+              v.year_model AS vehicle_year_model
+       FROM contracts c
+       LEFT JOIN vehicles v ON v.id = c.vehicle_id
+       WHERE c.id = $1`,
+      [createdId]
+    );
+
+    res.status(201).json(joined.rows[0]);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao registrar contrato.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get('/api/radar', requireAdminAuth, async (_req, res) => {
+  try {
+    const result = await pool.query<DbRadarRow>(
+      'SELECT * FROM radar_opportunities ORDER BY id DESC'
+    );
+    res.json(result.rows);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao listar radar.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/radar', requireAdminAuth, async (req, res) => {
+  try {
+    const { platform, title, price, fipe_price, link } = req.body;
+    const cleanTitle = typeof title === 'string' ? title.trim() : '';
+    const parsedPrice = Number(price);
+    const parsedFipe = Number(fipe_price);
+
+    if (!cleanTitle || !Number.isFinite(parsedPrice) || parsedPrice <= 0 || !Number.isFinite(parsedFipe) || parsedFipe <= 0) {
+      res.status(400).json({ error: 'Título, preço do anúncio e valor FIPE válidos são obrigatórios.' });
+      return;
+    }
+
+    const discountPercent = Number(
+      (((parsedFipe - parsedPrice) / parsedFipe) * 100).toFixed(1)
+    );
+
+    const result = await pool.query<DbRadarRow>(
+      `INSERT INTO radar_opportunities (platform, title, price, fipe_price, discount_percent, link)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [
+        platform ? String(platform).trim() : 'OLX',
+        cleanTitle,
+        parsedPrice,
+        parsedFipe,
+        discountPercent,
+        link ? String(link).trim() : 'https://www.olx.com.br',
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao registrar oportunidade no radar.';
+    res.status(500).json({ error: message });
+  }
+});
+
+// ============================================================================
+// Gemini AI Routes
+// ============================================================================
+
+app.post('/api/ai/generate-post', requireAdminAuth, async (req, res) => {
+  const body = req.body as GeneratePostBody;
+  if (!body || !body.vehicle) {
+    res.status(400).json({ error: 'Dados do veículo são obrigatórios.' });
+    return;
+  }
+
+  try {
+    const ai = getGeminiClient();
+
+    const formattedPrice = new Intl.NumberFormat('pt-BR', {
+      style: 'currency',
+      currency: 'BRL',
+      maximumFractionDigits: 0,
+    }).format(body.vehicle.price);
+
+    const formattedKm = new Intl.NumberFormat('pt-BR').format(body.vehicle.km);
+
+    const prompt = `Você é o estrategista sênior de social media automotiva da revenda "${body.dealershipName || 'Armazém do Carro'}" localizada em ${body.city || 'São Paulo - SP'}.
+
+Crie uma copy de alta conversão em Português do Brasil para a plataforma "${body.platform}" com tom "${body.tone}".
+
+Dados do veículo em estoque:
+- Veículo: ${body.vehicle.brand} ${body.vehicle.model} ${body.vehicle.version}
+- Ano: ${body.vehicle.year}
+- Quilometragem: ${formattedKm} km
+- Preço: ${formattedPrice}
+- Cor: ${body.vehicle.color}
+- Câmbio / Combustível: ${body.vehicle.transmission} / ${body.vehicle.fuel}
+- Opcionais principais: ${Array.isArray(body.vehicle.optionals) && body.vehicle.optionals.length > 0 ? body.vehicle.optionals.join(', ') : 'Padrão de série'}
+- Diferenciais informados pelo vendedor: ${body.differentials || 'Laudo cautelar 100% aprovado, procedência garantida, aceitamos usado na troca e financiamento facilitado.'}
+- WhatsApp comercial: ${body.whatsapp || '(11) 99482-1040'}
+
+Instruções:
+1. A legenda deve ter gancho forte na primeira linha, leitura escaneável (bullet points limpos), prova de valor/diferenciais, gatilho de urgência real (sem exageros bregas) e CTA direto para o WhatsApp e catálogo.
+2. Adapte o ritmo para ${body.platform} (especialmente para Instagram e TikTok Shop, incluindo roteiro dinâmico de cenas curtas 0-15s com gancho de retenção).
+3. Gere de 6 a 10 hashtags automotivas otimizadas para alcance regional e vendas no Instagram e TikTok Shop.`;
+
+    const response = await callGeminiWithRetry(() =>
+      ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: prompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          systemInstruction:
+            'Você escreve copys automotivas elegantes, persuasivas e profissionais em pt-BR para revendas premium de seminovos. Retorne estritamente JSON válido conforme o schema.',
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              headline: {
+                type: Type.STRING,
+                description: 'Gancho inicial curto e impactante (máx 90 caracteres).',
+              },
+              legenda: {
+                type: Type.STRING,
+                description: 'Texto completo da legenda formatado com quebras de linha para a rede social.',
+              },
+              gatilhos: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: 'Lista com 3 gatilhos mentais aplicados na copy.',
+              },
+              ctaWhatsapp: {
+                type: Type.STRING,
+                description: 'Chamada para ação final direcionando para o WhatsApp da loja.',
+              },
+              hashtags: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: 'Hashtags sem espaços, começando com #.',
+              },
+              roteiroReels: {
+                type: Type.STRING,
+                description: 'Sugestão rápida de 3 tomadas de vídeo (0-15s) para acompanhar o post.',
+              },
+            },
+            required: ['headline', 'legenda', 'gatilhos', 'ctaWhatsapp', 'hashtags', 'roteiroReels'],
+          },
+        },
+      })
+    );
+
+    const rawText = response.text?.trim();
+    if (!rawText) {
+      res.status(502).json({ error: 'A IA não retornou conteúdo textual válido.' });
+      return;
+    }
+
+    const parsed = JSON.parse(rawText);
+    res.json(parsed);
+  } catch (err: unknown) {
+    const formatted = formatGeminiError(err);
+    console.error('[AI Generate Post Error]', err);
+    res.status(formatted.status).json({ error: formatted.message });
+  }
+});
+
+app.post('/api/ai/chat', async (req, res) => {
+  const body = req.body as ChatRequestBody;
+  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
+    res.status(400).json({ error: 'Histórico de mensagens é obrigatório.' });
+    return;
+  }
+
+  try {
+    const ai = getGeminiClient();
+    const s = body.settings;
+    const dealership = s?.tradeName || 'Armazém do Carro';
+    const assistantName = s?.aiAssistantName || 'Consultor Virtual Armazém';
+
+    // Consulta direta ao estoque real no Neon PostgreSQL para garantir dados 100% verídicos
+    let dbInventoryText = '';
+    try {
+      const stockRes = await pool.query<DbVehicleRow>(
+        `SELECT brand, model, version, year_fab, year_model, km, price, status, fuel, transmission, options
+         FROM vehicles
+         WHERE status IN ('Disponivel', 'Disponível', 'Reservado')
+         ORDER BY created_at DESC, id DESC`
+      );
+      if (stockRes.rows.length > 0) {
+        dbInventoryText = stockRes.rows
+          .map((v) => {
+            const formattedPrice = new Intl.NumberFormat('pt-BR', {
+              style: 'currency',
+              currency: 'BRL',
+              maximumFractionDigits: 0,
+            }).format(Number(v.price));
+            const formattedKm = new Intl.NumberFormat('pt-BR').format(Number(v.km));
+            const opts =
+              Array.isArray(v.options) && v.options.length > 0
+                ? v.options.join(', ')
+                : 'Pacote de série';
+            return `- ${v.brand} ${v.model} ${v.version || ''} | Ano: ${v.year_fab}/${v.year_model} | Km: ${formattedKm} km | Preço: ${formattedPrice} | Status: ${v.status} | Câmbio: ${v.transmission || 'N/I'} | Combustível: ${v.fuel || 'N/I'} | Opcionais: ${opts}`.trim();
+          })
+          .join('\n');
+      }
+    } catch {
+      dbInventoryText = '';
+    }
+
+    const realStockContext =
+      dbInventoryText ||
+      body.inventorySummary ||
+      'Nenhum veículo listado no momento.';
+
+    const vehicleContext = body.vehicle
+      ? `Veículo selecionado pelo cliente:
+- Modelo: ${body.vehicle.brand} ${body.vehicle.model} ${body.vehicle.version}
+- Ano: ${body.vehicle.year} | Km: ${new Intl.NumberFormat('pt-BR').format(body.vehicle.km)} km
+- Preço à vista: ${new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL', maximumFractionDigits: 0 }).format(body.vehicle.price)}
+- Cor: ${body.vehicle.color} | Câmbio: ${body.vehicle.transmission} | Combustível: ${body.vehicle.fuel}
+- Status atual: ${body.vehicle.status}
+- Opcionais: ${Array.isArray(body.vehicle.optionals) && body.vehicle.optionals.length > 0 ? body.vehicle.optionals.join(', ') : 'Padrão de série'}
+
+Estoque completo disponível no banco de dados (caso o cliente pergunte sobre outros veículos):
+${realStockContext}`
+      : `Estoque real disponível no banco de dados (${dealership}):
+${realStockContext}`;
+
+    const conversationTranscript = body.messages
+      .map((m) => `${m.sender === 'cliente' ? 'Cliente' : assistantName}: ${m.text}`)
+      .join('\n');
+
+    const chatConfig = {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+      maxOutputTokens: 500,
+      systemInstruction: `Você é o Consultor Oficial da revenda "${dealership}" (${s?.address || 'Av. Ibirapuera, 2.840 — Moema'}, ${s?.city || 'São Paulo'}/${s?.state || 'SP'}).
+Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursSaturday || '09:00 às 16:00'} | WhatsApp: ${s?.whatsapp || '(11) 99482-1040'}.
+
+1. FORMATAÇÃO VISUAL LIMPA, CURTA E ESTRUTURADA (OBRIGATÓRIO):
+- É PROIBIDO enviar blocos longos ou densos de texto corrido.
+- Seja objetivo e direto (idealmente entre 60 e 160 palavras por resposta).
+- Separe seções com linha em branco e use parágrafos curtos (1 frase por parágrafo).
+- Use listas em Markdown com \`- \` para apresentar ficha técnica, diferenciais, opcionais ou opções de estoque.
+- Use negritos estratégicos (\`**texto**\`) para destacar nomes de modelos, anos, quilometragem e preços (ex: **BMW 320i M Sport (2023/2024)** por **R$ 314.900**).
+
+2. PERSONALIDADE COMERCIAL CONSULTIVA E VERACIDADE:
+- Atue estritamente como o Consultor Oficial do ${dealership}, especialista em seminovos selecionados com procedência garantida, **laudo cautelar 100% aprovado** e **garantia legal de 90 dias (CDC)**.
+- Utilize APENAS os dados reais do estoque fornecidos no contexto do banco de dados. NUNCA invente especificações, preços, anos, versões, taxas exatas de financiamento ou veículos que não constam no estoque. Se uma informação não estiver listada, diga com clareza que confirmará presencialmente ou pelo WhatsApp.
+- Quando pertinente, destaque que aceitamos veículo usado na troca (mediante avaliação presencial) e trabalhamos com financiamento bancário e carta de crédito contemplada.
+
+3. CHAMADA PARA AÇÃO (CTA) ATIVA:
+- Toda resposta sobre veículos ou estoque DEVE terminar com uma linha separada convidando o cliente a avançar na negociação (ex.: solicitar simulação de financiamento, informar nome e WhatsApp no formulário acima para receber o laudo cautelar completo, ou agendar visita/test-drive no showroom).`,
+    };
+
+    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
+
+    const wantsStream =
+      (req.body as { stream?: boolean }).stream !== false &&
+      (req.headers.accept?.includes('text/event-stream') ||
+        (req.body as { stream?: boolean }).stream === true);
+
+    if (!wantsStream) {
+      const response = await callGeminiWithRetry(() =>
+        ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: contentsPrompt,
+          config: chatConfig,
+        })
+      );
+
+      const reply = response.text?.trim();
+      if (!reply) {
+        res.status(502).json({ error: 'O assistente não retornou uma resposta válida.' });
+        return;
+      }
+
+      res.json({ reply });
+      return;
+    }
+
+    const stream = await callGeminiWithRetry(() =>
+      ai.models.generateContentStream({
+        model: 'gemini-3.1-flash-lite',
+        contents: contentsPrompt,
+        config: chatConfig,
+      })
+    );
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    let clientClosed = false;
+    res.on('close', () => {
+      clientClosed = true;
+    });
+
+    let fullText = '';
+    try {
+      for await (const chunk of stream) {
+        if (clientClosed) break;
+        const delta = chunk.text;
+        if (delta) {
+          fullText += delta;
+          res.write(`data: ${JSON.stringify({ type: 'chunk', text: delta })}\n\n`);
+        }
+      }
+
+      if (!clientClosed) {
+        const trimmed = fullText.trim();
+        if (!trimmed) {
+          res.write(
+            `data: ${JSON.stringify({
+              type: 'error',
+              error: 'O assistente não retornou uma resposta válida.',
+            })}\n\n`
+          );
+        } else {
+          res.write(`data: ${JSON.stringify({ type: 'done', reply: trimmed })}\n\n`);
+        }
+        res.end();
+      }
+    } catch (streamErr: unknown) {
+      const formatted = formatGeminiError(streamErr);
+      console.error('[AI Chat Stream Error]', streamErr);
+      if (!clientClosed) {
+        res.write(
+          `data: ${JSON.stringify({ type: 'error', error: formatted.message })}\n\n`
+        );
+        res.end();
+      }
+    }
+  } catch (err: unknown) {
+    const formatted = formatGeminiError(err);
+    console.error('[AI Chat Error]', err);
+    if (!res.headersSent) {
+      res.status(formatted.status).json({ error: formatted.message });
+    } else {
+      res.write(
+        `data: ${JSON.stringify({ type: 'error', error: formatted.message })}\n\n`
+      );
+      res.end();
+    }
+  }
+});
+
+let dbInitPromise: Promise<void> | null = null;
+
+export function ensureDatabaseInitialized(): Promise<void> {
+  if (!dbInitPromise) {
+    dbInitPromise = (async () => {
+      try {
+        await seedNeonDatabaseIfEmpty();
+        await ensureAdminUsersSchemaAndSeed();
+        console.log('[DB] Neon PostgreSQL conectado e tabelas verificadas.');
+      } catch (err) {
+        console.error('[DB] Falha ao inicializar/semear Neon PostgreSQL:', err);
+        dbInitPromise = null;
+      }
+    })();
+  }
+  return dbInitPromise;
+}
+
+async function startServer() {
+  await ensureDatabaseInitialized();
+
+  const isProd =
+    process.env.NODE_ENV === 'production' &&
+    fs.existsSync(path.join(__dirname, 'dist'));
+
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Armazém do Carro server listening on http://0.0.0.0:${PORT}`);
+  });
+}
+
+if (!process.env.VERCEL) {
+  void startServer();
+}
+
+export default app;

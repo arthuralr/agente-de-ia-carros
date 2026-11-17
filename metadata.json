@@ -1,0 +1,6 @@
+{
+  "name": "Armazém do Carro — Painel Administrativo",
+  "description": "Painel administrativo completo para gestão de estoque, CRM de leads, geração de contratos, posts com IA e radar de oportunidades da revenda Armazém do Carro.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
