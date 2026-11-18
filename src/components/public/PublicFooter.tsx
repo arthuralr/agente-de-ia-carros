@@ -14,11 +14,13 @@ import { formatWhatsAppLink } from '../../utils/formatters';
 interface PublicFooterProps {
   settings: DealershipSettings;
   onOpenAdmin: () => void;
+  onOpenPrivacy?: () => void;
 }
 
 export const PublicFooter: React.FC<PublicFooterProps> = ({
   settings,
   onOpenAdmin,
+  onOpenPrivacy,
 }) => {
   const [infoModal, setInfoModal] = useState<'address' | 'social' | null>(null);
 
@@ -128,6 +130,18 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
               © {new Date().getFullYear()} {settings.tradeName}. Todos os direitos
               reservados.
             </span>
+            {onOpenPrivacy && (
+              <>
+                <span aria-hidden="true">·</span>
+                <button
+                  type="button"
+                  onClick={onOpenPrivacy}
+                  className="text-zinc-400 hover:text-white transition-colors underline underline-offset-4 whitespace-nowrap"
+                >
+                  Política de Privacidade (LGPD)
+                </button>
+              </>
+            )}
             <span aria-hidden="true">·</span>
             <button
               type="button"

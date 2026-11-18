@@ -38,6 +38,8 @@ export interface ApiLeadRow {
   vehicle_interest: string | null;
   stage: string | null;
   chat_history: string | null;
+  lgpd_consent?: boolean | null;
+  lgpd_consent_at?: string | null;
   created_at: string;
 }
 
@@ -212,6 +214,16 @@ export function mapDbLeadToFrontend(row: ApiLeadRow): Lead {
     visitScheduled: seedMatch?.visitScheduled,
     proposalValue: seedMatch?.proposalValue,
     notes: seedMatch?.notes || '',
+    lgpdConsent: row.lgpd_consent ?? true,
+    lgpdConsentAt: row.lgpd_consent_at
+      ? new Date(row.lgpd_consent_at).toLocaleString('pt-BR', {
+          day: '2-digit',
+          month: '2-digit',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      : undefined,
     chatHistory,
   };
 }

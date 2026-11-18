@@ -38,6 +38,7 @@ import { PublicHomePage } from './components/public/PublicHomePage';
 import { VehicleDetailModal } from './components/public/VehicleDetailModal';
 import { AiChatDrawer } from './components/public/AiChatDrawer';
 import { StandaloneChatPage } from './components/public/StandaloneChatPage';
+import { PrivacyPolicyPage } from './components/public/PrivacyPolicyPage';
 import { AdminLoginPage } from './components/auth/AdminLoginPage';
 import { adminFetch, clearAdminSessionToken } from './utils/authSession';
 
@@ -73,6 +74,9 @@ function parseRouteFromPathname(pathname: string): {
   if (clean === '/chat' || clean === '/atendimento') {
     return { viewMode: 'chat', module: 'inventory' };
   }
+  if (clean === '/privacidade' || clean === '/politica-de-privacidade') {
+    return { viewMode: 'privacy', module: 'inventory' };
+  }
   if (clean === '/login') {
     return { viewMode: 'login', module: 'inventory' };
   }
@@ -97,6 +101,7 @@ function parseRouteFromPathname(pathname: string): {
 function getPathForView(viewMode: AppViewMode, module: NavModule): string {
   if (viewMode === 'home') return '/inicio';
   if (viewMode === 'chat') return '/chat';
+  if (viewMode === 'privacy') return '/privacidade';
   if (viewMode === 'login') return '/login';
   if (viewMode === 'admin') return MODULE_PATH_MAP[module] || '/admin/estoque';
   return '/';
@@ -635,6 +640,7 @@ export default function App() {
         phone: lead.whatsapp,
         vehicle_interest: lead.vehicleInterestLabel,
         chat_history: JSON.stringify(lead.chatHistory),
+        lgpd_consent: lead.lgpdConsent === true,
       }),
     });
 
@@ -664,6 +670,36 @@ export default function App() {
       setLeads((prev) => [hydratedLead, ...prev]);
     }
     return hydratedLead;
+  };
+
+  const handleDeleteLead = async (id: string): Promise<void> => {
+    const target = leads.find((l) => l.id === id);
+    if (/^\d+$/.test(id)) {
+      const res = await adminFetch(`/api/leads/${id}`, {
+        method: 'DELETE',
+      });
+      if (res.status === 401) {
+        handleUnauthorizedSession();
+        throw new Error('Sessão administrativa expirada.');
+      }
+      if (!res.ok) {
+        const errData = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        throw new Error(
+          errData.error || 'Falha ao excluir dados do lead no banco Neon.'
+        );
+      }
+    }
+
+    setLeads((prev) => prev.filter((l) => l.id !== id));
+    if (target) {
+      pushActivity(
+        'Dados pessoais excluídos (LGPD)',
+        `Registro de ${target.name} removido definitivamente do CRM`,
+        'crm'
+      );
+    }
   };
 
   const handleSyncPublicLeadChat = async (
@@ -785,7 +821,18 @@ export default function App() {
     setChatOpen(true);
   };
 
-  // 1A. Public Standalone Mobile-First Agent Page (/chat or /atendimento)
+  // 1A. Public LGPD Privacy Policy Page (/privacidade)
+  if (viewMode === 'privacy') {
+    return (
+      <PrivacyPolicyPage
+        settings={settings}
+        onBack={() => navigateTo('catalog')}
+        onOpenChat={() => navigateTo('chat')}
+      />
+    );
+  }
+
+  // 1B. Public Standalone Mobile-First Agent Page (/chat or /atendimento)
   if (viewMode === 'chat') {
     return (
       <StandaloneChatPage
@@ -797,11 +844,12 @@ export default function App() {
           void hydratePublicVehicles();
           navigateTo('catalog');
         }}
+        onOpenPrivacy={() => navigateTo('privacy')}
       />
     );
   }
 
-  // 1B. Public Storefront Views (Always accessible without authentication)
+  // 1C. Public Storefront Views (Always accessible without authentication)
   if (viewMode === 'catalog' || viewMode === 'home') {
     return (
       <>
@@ -814,6 +862,7 @@ export default function App() {
             onOpenDetails={(v) => setDetailVehicle(v)}
             onInterest={openVehicleInterestChat}
             onOpenGeneralChat={openGeneralChat}
+            onOpenPrivacy={() => navigateTo('privacy')}
           />
         ) : (
           <PublicHomePage
@@ -824,6 +873,7 @@ export default function App() {
             onOpenDetails={(v) => setDetailVehicle(v)}
             onInterest={openVehicleInterestChat}
             onOpenGeneralChat={openGeneralChat}
+            onOpenPrivacy={() => navigateTo('privacy')}
           />
         )}
 
@@ -846,6 +896,7 @@ export default function App() {
             setChatOpen(false);
             navigateTo('chat');
           }}
+          onOpenPrivacy={() => navigateTo('privacy')}
         />
       </>
     );
@@ -944,6 +995,7 @@ export default function App() {
               aiAssistantName={settings.aiAssistantName}
               onUpdateLead={handleUpdateLead}
               onAddLead={handleAddLeadAdmin}
+              onDeleteLead={handleDeleteLead}
               onRefreshLeads={refreshLeadsFromDb}
               onGenerateContractForLead={(leadId, vehicleId) => {
                 setContractPreselect({ leadId, vehicleId });

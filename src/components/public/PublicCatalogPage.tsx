@@ -23,6 +23,7 @@ interface PublicCatalogPageProps {
   onOpenDetails: (vehicle: Vehicle) => void;
   onInterest: (vehicle: Vehicle) => void;
   onOpenGeneralChat: () => void;
+  onOpenPrivacy?: () => void;
 }
 
 const CATEGORIES: ('Todos' | VehicleCategory)[] = [
@@ -47,6 +48,7 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
   onOpenDetails,
   onInterest,
   onOpenGeneralChat,
+  onOpenPrivacy,
 }) => {
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState<'Todos' | VehicleCategory>('Todos');
@@ -522,7 +524,11 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
         )}
       </main>
 
-      <PublicFooter settings={settings} onOpenAdmin={onOpenAdmin} />
+      <PublicFooter
+        settings={settings}
+        onOpenAdmin={onOpenAdmin}
+        onOpenPrivacy={onOpenPrivacy}
+      />
     </div>
   );
 };

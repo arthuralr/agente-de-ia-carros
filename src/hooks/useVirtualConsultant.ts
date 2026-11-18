@@ -36,6 +36,7 @@ export function useVirtualConsultant({
 
   const [customerName, setCustomerName] = useState('');
   const [customerWhatsapp, setCustomerWhatsapp] = useState('');
+  const [lgpdConsent, setLgpdConsent] = useState(false);
   const [isSavingLead, setIsSavingLead] = useState(false);
   const [leadSaveError, setLeadSaveError] = useState<string | null>(null);
   const [leadSaved, setLeadSaved] = useState(false);
@@ -256,6 +257,7 @@ export function useVirtualConsultant({
     lastTriggerRef.current = triggerKey;
     setLeadSaved(false);
     setLeadSaveError(null);
+    setLgpdConsent(false);
     setPersistedLeadId(null);
     persistedLeadIdRef.current = null;
     setErrorMsg(null);
@@ -346,6 +348,12 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
     async (e: React.FormEvent) => {
       e.preventDefault();
       if (!customerName.trim() || !customerWhatsapp.trim() || isSavingLead) return;
+      if (!lgpdConsent) {
+        setLeadSaveError(
+          'Marque a caixa de consentimento (LGPD) para autorizar o contato comercial.'
+        );
+        return;
+      }
 
       setIsSavingLead(true);
       setLeadSaveError(null);
@@ -368,6 +376,7 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
         createdAt: 'Agora',
         lastActivity: 'Agora',
         notes: leadNote,
+        lgpdConsent: true,
         chatHistory: messages,
       };
 
@@ -392,6 +401,7 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
       isSavingLead,
       leadNote,
       leadSourceLabel,
+      lgpdConsent,
       messages,
       onCaptureLead,
       settings.city,
@@ -411,6 +421,8 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
     setCustomerName,
     customerWhatsapp,
     setCustomerWhatsapp,
+    lgpdConsent,
+    setLgpdConsent,
     isSavingLead,
     leadSaveError,
     leadSaved,

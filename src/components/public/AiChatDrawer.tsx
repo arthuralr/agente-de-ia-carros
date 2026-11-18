@@ -29,6 +29,7 @@ interface AiChatDrawerProps {
   onCaptureLead: (lead: Lead) => Promise<Lead>;
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
   onOpenStandaloneChat?: () => void;
+  onOpenPrivacy?: () => void;
 }
 
 export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
@@ -40,6 +41,7 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
   onCaptureLead,
   onSyncLeadChat,
   onOpenStandaloneChat,
+  onOpenPrivacy,
 }) => {
   const {
     messages,
@@ -52,6 +54,8 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
     setCustomerName,
     customerWhatsapp,
     setCustomerWhatsapp,
+    lgpdConsent,
+    setLgpdConsent,
     isSavingLead,
     leadSaveError,
     leadSaved,
@@ -180,14 +184,46 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
                 />
               </div>
 
+              <label className="flex items-start gap-2.5 text-[11px] text-zinc-400 leading-relaxed cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={lgpdConsent}
+                  onChange={(e) => setLgpdConsent(e.target.checked)}
+                  disabled={isSavingLead}
+                  className="mt-0.5 h-4 w-4 rounded border-white/20 bg-[#111114] text-red-600 focus:ring-red-600 shrink-0"
+                />
+                <span>
+                  Autorizo a coleta do meu <strong className="text-zinc-200">nome</strong> e{' '}
+                  <strong className="text-zinc-200">telefone</strong> para atendimento comercial e
+                  envio de ofertas de veículos pela {settings.tradeName}, conforme a{' '}
+                  {onOpenPrivacy ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        onClose();
+                        onOpenPrivacy();
+                      }}
+                      className="text-red-400 hover:text-red-300 underline underline-offset-2"
+                    >
+                      Política de Privacidade (LGPD)
+                    </button>
+                  ) : (
+                    <span>Política de Privacidade (LGPD)</span>
+                  )}
+                  .
+                </span>
+              </label>
+
               <button
                 type="submit"
                 disabled={
                   isSavingLead ||
                   !customerName.trim() ||
-                  !customerWhatsapp.trim()
+                  !customerWhatsapp.trim() ||
+                  !lgpdConsent
                 }
-                className="w-full py-2 px-3 rounded-md text-xs font-semibold text-white bg-red-600 hover:bg-red-500 disabled:opacity-60 transition-colors inline-flex items-center justify-center gap-2"
+                className="w-full py-2 px-3 rounded-md text-xs font-semibold text-white bg-red-600 hover:bg-red-500 disabled:opacity-50 transition-colors inline-flex items-center justify-center gap-2"
               >
                 {isSavingLead ? (
                   <>

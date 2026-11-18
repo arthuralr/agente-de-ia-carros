@@ -19,6 +19,7 @@ interface PublicHomePageProps {
   onOpenDetails: (vehicle: Vehicle) => void;
   onInterest: (vehicle: Vehicle) => void;
   onOpenGeneralChat: () => void;
+  onOpenPrivacy?: () => void;
 }
 
 export const PublicHomePage: React.FC<PublicHomePageProps> = ({
@@ -29,6 +30,7 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
   onOpenDetails,
   onInterest,
   onOpenGeneralChat,
+  onOpenPrivacy,
 }) => {
   const activeStock = vehicles.filter((v) => v.status !== 'Vendido');
   const heroVehicle = activeStock[0];
@@ -263,7 +265,11 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
         </section>
       </main>
 
-      <PublicFooter settings={settings} onOpenAdmin={onOpenAdmin} />
+      <PublicFooter
+        settings={settings}
+        onOpenAdmin={onOpenAdmin}
+        onOpenPrivacy={onOpenPrivacy}
+      />
     </div>
   );
 };

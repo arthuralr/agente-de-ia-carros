@@ -30,6 +30,7 @@ interface StandaloneChatPageProps {
   onCaptureLead: (lead: Lead) => Promise<Lead>;
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
   onOpenCatalog: () => void;
+  onOpenPrivacy?: () => void;
 }
 
 export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
@@ -38,6 +39,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   onCaptureLead,
   onSyncLeadChat,
   onOpenCatalog,
+  onOpenPrivacy,
 }) => {
   // Permite personalização leve via query string (ex.: ?loja=Parceiro) para uso B2B em links externos
   const effectiveSettings = useMemo(() => {
@@ -65,6 +67,8 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setCustomerName,
     customerWhatsapp,
     setCustomerWhatsapp,
+    lgpdConsent,
+    setLgpdConsent,
     isSavingLead,
     leadSaveError,
     leadSaved,
@@ -243,12 +247,43 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                   className="w-full px-3 py-2.5 bg-[#09090B] border border-white/[0.1] rounded-xl text-xs text-white font-mono placeholder:text-zinc-500 focus:outline-none focus:border-red-600"
                 />
 
+                <label className="flex items-start gap-2.5 text-[11px] text-zinc-400 leading-relaxed cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={lgpdConsent}
+                    onChange={(e) => setLgpdConsent(e.target.checked)}
+                    disabled={isSavingLead}
+                    className="mt-0.5 h-4 w-4 rounded border-white/20 bg-[#09090B] text-red-600 focus:ring-red-600 shrink-0"
+                  />
+                  <span>
+                    Autorizo o uso do meu <strong className="text-zinc-200">nome</strong> e{' '}
+                    <strong className="text-zinc-200">WhatsApp</strong> para atendimento comercial e
+                    envio de ofertas de veículos, conforme a{' '}
+                    {onOpenPrivacy ? (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          onOpenPrivacy();
+                        }}
+                        className="text-red-400 hover:text-red-300 underline underline-offset-2"
+                      >
+                        Política de Privacidade (LGPD)
+                      </button>
+                    ) : (
+                      <span>Política de Privacidade (LGPD)</span>
+                    )}
+                    .
+                  </span>
+                </label>
+
                 <button
                   type="submit"
                   disabled={
                     isSavingLead ||
                     !customerName.trim() ||
-                    !customerWhatsapp.trim()
+                    !customerWhatsapp.trim() ||
+                    !lgpdConsent
                   }
                   className="w-full min-h-[44px] py-2.5 px-4 rounded-xl text-xs font-semibold text-white bg-red-600 hover:bg-red-500 disabled:opacity-50 transition-colors inline-flex items-center justify-center gap-2"
                 >
@@ -331,12 +366,42 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                       disabled={isSavingLead}
                       className="w-full min-h-[44px] px-3.5 py-2 bg-[#09090B] border border-white/[0.1] rounded-xl text-sm text-white font-mono placeholder:text-zinc-500 focus:outline-none focus:border-red-600"
                     />
+                    <label className="flex items-start gap-2.5 py-1 text-xs text-zinc-300 leading-relaxed cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={lgpdConsent}
+                        onChange={(e) => setLgpdConsent(e.target.checked)}
+                        disabled={isSavingLead}
+                        className="mt-0.5 h-5 w-5 rounded border-white/20 bg-[#09090B] text-red-600 focus:ring-red-600 shrink-0"
+                      />
+                      <span>
+                        Autorizo a coleta de <strong className="text-white">nome</strong> e{' '}
+                        <strong className="text-white">telefone</strong> para atendimento e ofertas
+                        de veículos conforme a{' '}
+                        {onOpenPrivacy ? (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              onOpenPrivacy();
+                            }}
+                            className="text-red-400 hover:text-red-300 underline underline-offset-2"
+                          >
+                            Política de Privacidade (LGPD)
+                          </button>
+                        ) : (
+                          <span>Política de Privacidade (LGPD)</span>
+                        )}
+                        .
+                      </span>
+                    </label>
                     <button
                       type="submit"
                       disabled={
                         isSavingLead ||
                         !customerName.trim() ||
-                        !customerWhatsapp.trim()
+                        !customerWhatsapp.trim() ||
+                        !lgpdConsent
                       }
                       className="w-full min-h-[44px] py-2.5 px-4 rounded-xl text-xs font-semibold text-white bg-red-600 hover:bg-red-500 disabled:opacity-50 transition-colors inline-flex items-center justify-center gap-2"
                     >

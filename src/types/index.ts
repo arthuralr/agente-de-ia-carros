@@ -1,4 +1,4 @@
-export type AppViewMode = 'catalog' | 'home' | 'chat' | 'login' | 'admin';
+export type AppViewMode = 'catalog' | 'home' | 'chat' | 'privacy' | 'login' | 'admin';
 
 export interface AdminUser {
   id: number;
@@ -71,6 +71,8 @@ export interface Lead {
   visitScheduled?: string;
   proposalValue?: number;
   notes: string;
+  lgpdConsent?: boolean;
+  lgpdConsentAt?: string;
   chatHistory: ChatMessage[];
 }
 

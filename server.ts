@@ -326,7 +326,7 @@ app.get('/api/public/vehicles', async (_req, res) => {
 
 app.post('/api/public/leads', async (req, res) => {
   try {
-    const { name, phone, vehicle_interest, chat_history } = req.body;
+    const { name, phone, vehicle_interest, chat_history, lgpd_consent } = req.body;
     const cleanName = typeof name === 'string' ? name.trim() : '';
     const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
 
@@ -335,9 +335,17 @@ app.post('/api/public/leads', async (req, res) => {
       return;
     }
 
+    if (lgpd_consent !== true) {
+      res.status(400).json({
+        error:
+          'Consentimento ativo (LGPD) é obrigatório para registrar seus dados e iniciar o atendimento comercial.',
+      });
+      return;
+    }
+
     const result = await pool.query<DbLeadRow>(
-      `INSERT INTO leads (name, phone, vehicle_interest, stage, chat_history)
-       VALUES ($1, $2, $3, 'Novo Lead', $4)
+      `INSERT INTO leads (name, phone, vehicle_interest, stage, chat_history, lgpd_consent, lgpd_consent_at)
+       VALUES ($1, $2, $3, 'Novo Lead', $4, true, NOW())
        RETURNING *`,
       [
         cleanName,
@@ -690,6 +698,29 @@ app.patch('/api/leads/:id', requireAdminAuth, async (req, res) => {
   }
 });
 
+app.delete('/api/leads/:id', requireAdminAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: 'ID de lead inválido.' });
+    return;
+  }
+
+  try {
+    const result = await pool.query<{ id: number; name: string }>(
+      'DELETE FROM leads WHERE id = $1 RETURNING id, name',
+      [id]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Lead não encontrado.' });
+      return;
+    }
+    res.json({ deleted: true, id: result.rows[0].id, name: result.rows[0].name });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Erro ao excluir dados do lead.';
+    res.status(500).json({ error: message });
+  }
+});
+
 app.get('/api/contracts', requireAdminAuth, async (_req, res) => {
   try {
     const result = await pool.query<
@@ -1015,7 +1046,12 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 - Quando pertinente, destaque que aceitamos veículo usado na troca (mediante avaliação presencial) e trabalhamos com financiamento bancário e carta de crédito contemplada.
 
 3. CHAMADA PARA AÇÃO (CTA) ATIVA:
-- Toda resposta sobre veículos ou estoque DEVE terminar com uma linha separada convidando o cliente a avançar na negociação (ex.: solicitar simulação de financiamento, informar nome e WhatsApp no formulário acima para receber o laudo cautelar completo, ou agendar visita/test-drive no showroom).`,
+- Toda resposta sobre veículos ou estoque DEVE terminar com uma linha separada convidando o cliente a avançar na negociação (ex.: solicitar simulação de financiamento, informar apenas nome e WhatsApp no formulário de atendimento para receber o laudo cautelar completo, ou agendar visita/test-drive no showroom).
+
+4. MINIMIZAÇÃO DE DADOS E PRIVACIDADE (LGPD):
+- Solicite APENAS os dados estritamente necessários para o atendimento inicial: **Nome** e **WhatsApp**.
+- É PROIBIDO solicitar CPF, RG, CNH, endereço residencial, comprovante de renda, dados bancários ou número de cartão pelo chat.
+- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente, NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.`,
     };
 
     const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;

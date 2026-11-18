@@ -54,6 +54,11 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
     await client.query(
       "UPDATE vehicles SET status = 'Disponivel' WHERE status = 'Disponível'"
     );
+    await client.query(`
+      ALTER TABLE leads
+      ADD COLUMN IF NOT EXISTS lgpd_consent BOOLEAN NOT NULL DEFAULT true,
+      ADD COLUMN IF NOT EXISTS lgpd_consent_at TIMESTAMPTZ
+    `);
     const vehCount = await client.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM vehicles'
     );
