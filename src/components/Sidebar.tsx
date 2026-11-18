@@ -5,7 +5,6 @@ import {
   Users,
   FileSignature,
   Sparkles,
-  Radar,
   Settings,
   LogOut,
   X,
@@ -21,7 +20,6 @@ interface SidebarProps {
   counts: {
     availableVehicles: number;
     newLeads: number;
-    radarDeals: number;
   };
   onLogout: () => void;
   mobileOpen: boolean;
@@ -51,7 +49,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'crm', label: 'CRM & Leads', icon: Users, count: counts.newLeads },
     { id: 'contracts', label: 'Contratos & Docs', icon: FileSignature },
     { id: 'social_ai', label: 'Posts com IA', icon: Sparkles },
-    { id: 'radar', label: 'Radar de Oportunidades', icon: Radar, count: counts.radarDeals },
     { id: 'settings', label: 'Configurações', icon: Settings },
   ];
 

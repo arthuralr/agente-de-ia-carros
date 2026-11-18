@@ -3,13 +3,11 @@ import {
   ContractRecord,
   Lead,
   LeadStage,
-  RadarOpportunity,
   Vehicle,
   VehicleStatus,
 } from '../types';
 import {
   INITIAL_LEADS,
-  INITIAL_RADAR_OPPORTUNITIES,
   INITIAL_VEHICLES,
   inferVehicleCategory,
 } from '../data/mockData';
@@ -55,17 +53,6 @@ export interface ApiContractRow {
   vehicle_model?: string | null;
   vehicle_year_fab?: number | null;
   vehicle_year_model?: number | null;
-}
-
-export interface ApiRadarRow {
-  id: number;
-  platform: string;
-  title: string;
-  price: string | number;
-  fipe_price: string | number;
-  discount_percent: string | number;
-  link: string;
-  created_at: string;
 }
 
 export function mapDbContractToFrontend(row: ApiContractRow): ContractRecord {
@@ -225,45 +212,5 @@ export function mapDbLeadToFrontend(row: ApiLeadRow): Lead {
         })
       : undefined,
     chatHistory,
-  };
-}
-
-export function mapDbRadarToFrontend(row: ApiRadarRow): RadarOpportunity {
-  const seedMatch = INITIAL_RADAR_OPPORTUNITIES.find(
-    (s) => s.title.toLowerCase() === row.title.toLowerCase()
-  );
-  const firstWord = row.title.split(' ')[0] || 'Multimarcas';
-  const source: RadarOpportunity['source'] =
-    row.platform === 'Webmotors' || row.platform === 'Marketplace'
-      ? row.platform
-      : 'OLX';
-
-  const askingPrice = Number(row.price) || 0;
-  const fipePrice = Number(row.fipe_price) || 0;
-  const calculatedDiscount =
-    fipePrice > 0
-      ? Number((((fipePrice - askingPrice) / fipePrice) * 100).toFixed(1))
-      : Number(row.discount_percent) || 0;
-
-  return {
-    id: String(row.id),
-    title: row.title,
-    brand: seedMatch?.brand || firstWord,
-    model: seedMatch?.model || row.title.replace(firstWord, '').trim(),
-    year: seedMatch?.year || '2023/2023',
-    km: seedMatch?.km || 25000,
-    askingPrice,
-    fipePrice,
-    discountPercent: calculatedDiscount,
-    source,
-    link: row.link || 'https://www.olx.com.br',
-    city: seedMatch?.city || 'São Paulo - SP',
-    distanceKm: seedMatch?.distanceKm || 15,
-    postedAgo: seedMatch?.postedAgo || 'Hoje',
-    sellerType: seedMatch?.sellerType || 'Particular',
-    highlights: seedMatch?.highlights || 'Oportunidade abaixo da Tabela FIPE',
-    imageUrl: seedMatch?.imageUrl || '/src/assets/images/car_bmw_320i_1794944463154.jpg',
-    saved: seedMatch?.saved || false,
-    imported: false,
   };
 }

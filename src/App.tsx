@@ -7,7 +7,6 @@ import {
   DealershipSettings,
   Lead,
   NavModule,
-  RadarOpportunity,
   Vehicle,
 } from './types';
 import {
@@ -17,10 +16,8 @@ import {
 } from './data/mockData';
 import {
   ApiLeadRow,
-  ApiRadarRow,
   ApiVehicleRow,
   mapDbLeadToFrontend,
-  mapDbRadarToFrontend,
   mapDbVehicleToFrontend,
   parseYearPair,
 } from './db/mappers';
@@ -31,7 +28,6 @@ import { InventoryModule } from './components/modules/InventoryModule';
 import { CrmModule } from './components/modules/CrmModule';
 import { ContractsModule } from './components/modules/ContractsModule';
 import { SocialAiModule } from './components/modules/SocialAiModule';
-import { RadarModule } from './components/modules/RadarModule';
 import { SettingsModule } from './components/modules/SettingsModule';
 import { PublicCatalogPage } from './components/public/PublicCatalogPage';
 import { PublicHomePage } from './components/public/PublicHomePage';
@@ -58,7 +54,6 @@ const MODULE_PATH_MAP: Record<NavModule, string> = {
   crm: '/admin/crm',
   contracts: '/admin/contratos',
   social_ai: '/admin/ia',
-  radar: '/admin/radar',
   settings: '/admin/configuracoes',
 };
 
@@ -90,7 +85,6 @@ function parseRouteFromPathname(pathname: string): {
     if (sub === '/ia' || sub === '/posts-ia') {
       return { viewMode: 'admin', module: 'social_ai' };
     }
-    if (sub === '/radar') return { viewMode: 'admin', module: 'radar' };
     if (sub === '/configuracoes') return { viewMode: 'admin', module: 'settings' };
     return { viewMode: 'admin', module: 'inventory' };
   }
@@ -134,7 +128,6 @@ export default function App() {
   const [settings, setSettings] = useState<DealershipSettings>(() =>
     loadStored('armazem_settings_v1', INITIAL_SETTINGS)
   );
-  const [radarItems, setRadarItems] = useState<RadarOpportunity[]>([]);
   const [activities, setActivities] = useState<ActivityLog[]>(INITIAL_ACTIVITY);
 
   // Public Chat Lead Token Store (allows public visitors to append chat turns without admin auth)
@@ -183,7 +176,6 @@ export default function App() {
       clearAdminSessionToken();
       setAuthUser(null);
       setLeads([]);
-      setRadarItems([]);
       setLoginRedirectNotice(notice);
       navigateTo('login', undefined, true);
     },
@@ -206,17 +198,12 @@ export default function App() {
 
   const hydrateAdminData = useCallback(async () => {
     try {
-      const [vehRes, leadRes, radarRes] = await Promise.all([
+      const [vehRes, leadRes] = await Promise.all([
         adminFetch('/api/vehicles'),
         adminFetch('/api/leads'),
-        adminFetch('/api/radar'),
       ]);
 
-      if (
-        vehRes.status === 401 ||
-        leadRes.status === 401 ||
-        radarRes.status === 401
-      ) {
+      if (vehRes.status === 401 || leadRes.status === 401) {
         handleUnauthorizedSession();
         return;
       }
@@ -232,13 +219,6 @@ export default function App() {
         const rows = (await leadRes.json()) as ApiLeadRow[];
         if (Array.isArray(rows)) {
           setLeads(rows.map(mapDbLeadToFrontend));
-        }
-      }
-
-      if (radarRes.ok) {
-        const rows = (await radarRes.json()) as ApiRadarRow[];
-        if (Array.isArray(rows)) {
-          setRadarItems(rows.map(mapDbRadarToFrontend));
         }
       }
     } catch {
@@ -373,7 +353,6 @@ export default function App() {
     clearAdminSessionToken();
     setAuthUser(null);
     setLeads([]);
-    setRadarItems([]);
     setLoginRedirectNotice('Sessão encerrada com segurança.');
     void hydratePublicVehicles();
     navigateTo('login', undefined, true);
@@ -725,83 +704,6 @@ export default function App() {
     }
   };
 
-  const refreshRadarFromDb = async () => {
-    const res = await adminFetch('/api/radar');
-    if (res.status === 401) {
-      handleUnauthorizedSession();
-      return;
-    }
-    if (res.ok) {
-      const rows = (await res.json()) as ApiRadarRow[];
-      setRadarItems((prev) =>
-        rows.map((row) => {
-          const mapped = mapDbRadarToFrontend(row);
-          const existing = prev.find((p) => p.id === mapped.id);
-          return existing
-            ? { ...mapped, saved: existing.saved, imported: existing.imported }
-            : mapped;
-        })
-      );
-    }
-  };
-
-  const handleAddRadarOpportunity = async (payload: {
-    platform: 'OLX' | 'Webmotors' | 'Marketplace';
-    title: string;
-    price: number;
-    fipe_price: number;
-    link: string;
-  }) => {
-    const res = await adminFetch('/api/radar', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    if (res.status === 401) {
-      handleUnauthorizedSession();
-      throw new Error('Sessão administrativa expirada.');
-    }
-
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Falha ao cadastrar oportunidade no radar.');
-    }
-
-    const mapped = mapDbRadarToFrontend(data as ApiRadarRow);
-    setRadarItems((prev) => [mapped, ...prev]);
-    pushActivity(
-      'Nova oportunidade monitorada no Radar',
-      `${mapped.title} (${mapped.source})`,
-      'radar'
-    );
-  };
-
-  const handleToggleRadarSave = (id: string) => {
-    setRadarItems((prev) =>
-      prev.map((item) =>
-        item.id === id ? { ...item, saved: !item.saved } : item
-      )
-    );
-  };
-
-  const handleImportRadarToInventory = (
-    opp: RadarOpportunity,
-    newVehicle: Vehicle
-  ) => {
-    setRadarItems((prev) =>
-      prev.map((item) =>
-        item.id === opp.id ? { ...item, imported: true } : item
-      )
-    );
-    void handleAddVehicle(newVehicle);
-    pushActivity(
-      'Oportunidade importada do Radar',
-      `${opp.title} (${opp.source}) entrou no estoque disponível`,
-      'radar'
-    );
-  };
-
   const handleQuickNewVehicle = () => {
     navigateTo('admin', 'inventory');
     setTriggerNewVehicleModal(true);
@@ -941,7 +843,6 @@ export default function App() {
           availableVehicles: vehicles.filter((v) => v.status === 'Disponível')
             .length,
           newLeads: leads.filter((l) => l.stage === 'Novo Lead').length,
-          radarDeals: radarItems.filter((r) => !r.imported).length,
         }}
         onLogout={() => void handleLogout()}
         mobileOpen={mobileMenuOpen}
@@ -1034,17 +935,6 @@ export default function App() {
               preselectedVehicleId={socialPreselectVehicleId}
               onClearPreselection={() => setSocialPreselectVehicleId(null)}
               onUnauthorized={() => handleUnauthorizedSession()}
-            />
-          )}
-
-          {activeModule === 'radar' && (
-            <RadarModule
-              opportunities={radarItems}
-              settings={settings}
-              onToggleSave={handleToggleRadarSave}
-              onImportToInventory={handleImportRadarToInventory}
-              onRefreshRadar={refreshRadarFromDb}
-              onAddOpportunity={handleAddRadarOpportunity}
             />
           )}
 

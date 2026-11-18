@@ -30,10 +30,6 @@ const MODULE_META: Record<NavModule, { title: string; subtitle: string }> = {
     title: 'Gerador de Posts para Redes Sociais',
     subtitle: 'Copywriting automotivo com IA · Instagram, Reels e TikTok Shop',
   },
-  radar: {
-    title: 'Radar de Oportunidades',
-    subtitle: 'Captação regional · Anúncios abaixo da Tabela FIPE na sua região',
-  },
   settings: {
     title: 'Configurações da Revenda',
     subtitle: 'Parâmetros institucionais · Dados fiscais, horários e regras do sistema',

@@ -37,17 +37,6 @@ export interface DbContractRow {
   created_at: Date;
 }
 
-export interface DbRadarRow {
-  id: number;
-  platform: string;
-  title: string;
-  price: string;
-  fipe_price: string;
-  discount_percent: string;
-  link: string;
-  created_at: Date;
-}
-
 export async function seedNeonDatabaseIfEmpty(): Promise<void> {
   const client = await pool.connect();
   try {
@@ -350,70 +339,6 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
           'Transferência TED/PIX à vista na assinatura',
         ]
       );
-    }
-
-    const radarCount = await client.query<{ count: number }>(
-      'SELECT COUNT(*)::int AS count FROM radar_opportunities'
-    );
-    if ((radarCount.rows[0]?.count ?? 0) === 0) {
-      const seedRadar = [
-        {
-          platform: 'OLX',
-          title: 'BMW 320i GP 2.0 Turbo Flex Automática',
-          price: 249000,
-          fipe_price: 289500,
-          discount_percent: 14.0,
-          link: 'https://www.olx.com.br',
-        },
-        {
-          platform: 'Marketplace',
-          title: 'Jeep Compass Longitude T270 1.3 Turbo',
-          price: 129900,
-          fipe_price: 151400,
-          discount_percent: 14.2,
-          link: 'https://www.facebook.com/marketplace',
-        },
-        {
-          platform: 'Webmotors',
-          title: 'Toyota Corolla Cross XRE 2.0 Flex',
-          price: 141500,
-          fipe_price: 162800,
-          discount_percent: 13.1,
-          link: 'https://www.webmotors.com.br',
-        },
-        {
-          platform: 'OLX',
-          title: 'Honda Civic Touring 1.5 Turbo',
-          price: 134000,
-          fipe_price: 154900,
-          discount_percent: 13.5,
-          link: 'https://www.olx.com.br',
-        },
-        {
-          platform: 'Webmotors',
-          title: 'Porsche Macan 2.0 Turbo PDK',
-          price: 389000,
-          fipe_price: 446000,
-          discount_percent: 12.8,
-          link: 'https://www.webmotors.com.br',
-        },
-        {
-          platform: 'OLX',
-          title: 'Volkswagen Golf GTI 2.0 TSI',
-          price: 239000,
-          fipe_price: 274500,
-          discount_percent: 12.9,
-          link: 'https://www.olx.com.br',
-        },
-      ];
-
-      for (const r of seedRadar) {
-        await client.query(
-          `INSERT INTO radar_opportunities (platform, title, price, fipe_price, discount_percent, link)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [r.platform, r.title, r.price, r.fipe_price, r.discount_percent, r.link]
-        );
-      }
     }
   } finally {
     client.release();

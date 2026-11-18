@@ -14,7 +14,6 @@ export type NavModule =
   | 'crm'
   | 'contracts'
   | 'social_ai'
-  | 'radar'
   | 'settings';
 
 export type VehicleStatus = 'Disponível' | 'Reservado' | 'Vendido';
@@ -98,34 +97,12 @@ export interface GeneratedPostResponse {
   roteiroReels: string;
 }
 
-export interface RadarOpportunity {
-  id: string;
-  title: string;
-  brand: string;
-  model: string;
-  year: string;
-  km: number;
-  askingPrice: number;
-  fipePrice: number;
-  discountPercent?: number;
-  source: 'OLX' | 'Webmotors' | 'Marketplace';
-  link?: string;
-  city: string;
-  distanceKm: number;
-  postedAgo: string;
-  sellerType: 'Particular' | 'Repasse';
-  highlights: string;
-  imageUrl: string;
-  saved: boolean;
-  imported: boolean;
-}
-
 export interface ActivityLog {
   id: string;
   title: string;
   detail: string;
   time: string;
-  category: 'estoque' | 'crm' | 'contrato' | 'radar';
+  category: 'estoque' | 'crm' | 'contrato';
 }
 
 export interface DealershipSettings {
@@ -142,7 +119,6 @@ export interface DealershipSettings {
   hoursWeekdays: string;
   hoursSaturday: string;
   hoursSunday: string;
-  radarDefaultRadiusKm: number;
   minResaleMarginPct: number;
   defaultSocialCta: string;
   aiAssistantName: string;

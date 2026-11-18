@@ -219,32 +219,14 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
       <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-4">
         <div>
           <h2 className="font-display text-base font-semibold text-white">
-            Parâmetros Gerais, Radar & Garantia CDC
+            Parâmetros Gerais & Garantia CDC
           </h2>
           <p className="text-xs text-zinc-400 mt-0.5">
-            Regras operacionais padrão dos módulos de Radar, CRM e Contratos.
+            Regras operacionais padrão dos módulos de Estoque, CRM e Contratos.
           </p>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div>
-            <label className="block text-xs font-medium text-zinc-300 mb-1">
-              Raio Padrão do Radar (km)
-            </label>
-            <input
-              type="number"
-              min={10}
-              max={500}
-              value={form.radarDefaultRadiusKm}
-              onChange={(e) =>
-                setForm({
-                  ...form,
-                  radarDefaultRadiusKm: Number(e.target.value) || 100,
-                })
-              }
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white font-mono focus:outline-none"
-            />
-          </div>
 
           <div>
             <label className="block text-xs font-medium text-zinc-300 mb-1">

@@ -139,8 +139,8 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
                 Entrar na Gestão Interna
               </h1>
               <p className="text-sm text-zinc-400 mt-1.5 leading-relaxed">
-                Autentique-se para gerenciar estoque, CRM de leads, contratos,
-                radar de oportunidades e gerador de posts com IA.
+                Autentique-se para gerenciar estoque, CRM de leads, contratos e
+                gerador de posts com IA.
               </p>
             </div>
 

@@ -8,7 +8,6 @@ import { pool, verifyDatabaseConnection } from './src/db/pool';
 import {
   DbContractRow,
   DbLeadRow,
-  DbRadarRow,
   DbVehicleRow,
   seedNeonDatabaseIfEmpty,
 } from './src/db/repository';
@@ -807,54 +806,6 @@ app.post('/api/contracts', requireAdminAuth, async (req, res) => {
     res.status(201).json(joined.rows[0]);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Erro ao registrar contrato.';
-    res.status(500).json({ error: message });
-  }
-});
-
-app.get('/api/radar', requireAdminAuth, async (_req, res) => {
-  try {
-    const result = await pool.query<DbRadarRow>(
-      'SELECT * FROM radar_opportunities ORDER BY id DESC'
-    );
-    res.json(result.rows);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erro ao listar radar.';
-    res.status(500).json({ error: message });
-  }
-});
-
-app.post('/api/radar', requireAdminAuth, async (req, res) => {
-  try {
-    const { platform, title, price, fipe_price, link } = req.body;
-    const cleanTitle = typeof title === 'string' ? title.trim() : '';
-    const parsedPrice = Number(price);
-    const parsedFipe = Number(fipe_price);
-
-    if (!cleanTitle || !Number.isFinite(parsedPrice) || parsedPrice <= 0 || !Number.isFinite(parsedFipe) || parsedFipe <= 0) {
-      res.status(400).json({ error: 'Título, preço do anúncio e valor FIPE válidos são obrigatórios.' });
-      return;
-    }
-
-    const discountPercent = Number(
-      (((parsedFipe - parsedPrice) / parsedFipe) * 100).toFixed(1)
-    );
-
-    const result = await pool.query<DbRadarRow>(
-      `INSERT INTO radar_opportunities (platform, title, price, fipe_price, discount_percent, link)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [
-        platform ? String(platform).trim() : 'OLX',
-        cleanTitle,
-        parsedPrice,
-        parsedFipe,
-        discountPercent,
-        link ? String(link).trim() : 'https://www.olx.com.br',
-      ]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Erro ao registrar oportunidade no radar.';
     res.status(500).json({ error: message });
   }
 });
