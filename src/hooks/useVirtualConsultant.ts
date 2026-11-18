@@ -76,7 +76,11 @@ export function useVirtualConsultant({
           .filter((v) => v.status !== 'Vendido')
           .map(
             (v) =>
-              `${v.brand} ${v.model} ${v.version} (${v.year}, ${formatKm(v.km)}, ${formatBRL(v.price)})`
+              `${v.brand} ${v.model} ${v.version} (${v.year}, ${formatKm(v.km)}, ${formatBRL(v.price)}${
+                v.fipePrice > 0
+                  ? `, FIPE${v.fipeCode ? ` ${v.fipeCode}` : ''}: ${formatBRL(v.fipePrice)}`
+                  : ''
+              })`
           )
           .join('\n');
 
@@ -101,6 +105,8 @@ export function useVirtualConsultant({
                   year: vehicleContext.year,
                   km: vehicleContext.km,
                   price: vehicleContext.price,
+                  fipePrice: vehicleContext.fipePrice,
+                  fipeCode: vehicleContext.fipeCode,
                   color: vehicleContext.color,
                   transmission: vehicleContext.transmission,
                   fuel: vehicleContext.fuel,

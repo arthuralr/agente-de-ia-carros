@@ -1,14 +1,17 @@
 import React, { useEffect, useState } from 'react';
 import {
+  BadgePercent,
   Check,
   ChevronLeft,
   ChevronRight,
+  Loader2,
   MessageCircle,
   MessageSquare,
+  RefreshCw,
   ShieldCheck,
   X,
 } from 'lucide-react';
-import { DealershipSettings, Vehicle } from '../../types';
+import { DealershipSettings, FipeLookupResult, Vehicle } from '../../types';
 import { inferVehicleCategory } from '../../data/mockData';
 import { formatBRL, formatKm, formatWhatsAppLink } from '../../utils/formatters';
 import { VehicleImage } from '../VehicleImage';
@@ -27,9 +30,14 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
   onInterest,
 }) => {
   const [activePhotoIndex, setActivePhotoIndex] = useState(0);
+  const [liveFipe, setLiveFipe] = useState<FipeLookupResult | null>(null);
+  const [loadingFipe, setLoadingFipe] = useState(false);
+  const [fipeCheckError, setFipeCheckError] = useState<string | null>(null);
 
   useEffect(() => {
     setActivePhotoIndex(0);
+    setLiveFipe(null);
+    setFipeCheckError(null);
   }, [vehicle]);
 
   if (!vehicle) return null;
@@ -39,6 +47,44 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
       ? vehicle.gallery
       : [vehicle.imageUrl];
   const category = inferVehicleCategory(vehicle);
+
+  const displayedFipePrice =
+    liveFipe?.recommended.valorNumerico || vehicle.fipePrice;
+  const fipeDiff =
+    displayedFipePrice > 0 ? displayedFipePrice - vehicle.price : 0;
+  const fipePctLabel =
+    displayedFipePrice > 0
+      ? ((Math.abs(fipeDiff) / displayedFipePrice) * 100)
+          .toFixed(1)
+          .replace('.', ',')
+      : '';
+
+  const handleRefreshLiveFipe = async () => {
+    if (!vehicle.fipeCode) return;
+    setLoadingFipe(true);
+    setFipeCheckError(null);
+    try {
+      const yearHint = vehicle.year.split('/').pop()?.trim() || '';
+      const res = await fetch(
+        `/api/fipe/${encodeURIComponent(vehicle.fipeCode)}?ano=${encodeURIComponent(
+          yearHint
+        )}`
+      );
+      const data = (await res.json().catch(() => ({}))) as FipeLookupResult & {
+        error?: string;
+      };
+      if (!res.ok || !data.recommended) {
+        throw new Error(data.error || 'Falha ao consultar Tabela FIPE.');
+      }
+      setLiveFipe(data);
+    } catch (err: unknown) {
+      setFipeCheckError(
+        err instanceof Error ? err.message : 'Erro ao consultar Tabela FIPE.'
+      );
+    } finally {
+      setLoadingFipe(false);
+    }
+  };
 
   const handlePrev = () => {
     setActivePhotoIndex((prev) => (prev === 0 ? photos.length - 1 : prev - 1));
@@ -156,10 +202,63 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
                 <p className="font-mono text-3xl font-semibold text-white tabular-nums mt-1">
                   {formatBRL(vehicle.price)}
                 </p>
-                {vehicle.fipePrice > 0 && (
-                  <p className="text-xs text-zinc-500 font-mono tabular-nums mt-1">
-                    Referência Tabela FIPE: {formatBRL(vehicle.fipePrice)}
-                  </p>
+
+                {(displayedFipePrice > 0 || vehicle.fipeCode) && (
+                  <div className="mt-3 p-3 rounded-lg bg-[#111114] border border-white/[0.06] space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5 text-xs text-zinc-300 font-mono tabular-nums">
+                        <BadgePercent className="w-3.5 h-3.5 text-red-500 shrink-0" />
+                        <span>
+                          FIPE: {displayedFipePrice > 0 ? formatBRL(displayedFipePrice) : 'Não salvo'}
+                        </span>
+                      </span>
+                      {vehicle.fipeCode && (
+                        <span className="text-[11px] font-mono text-zinc-400">
+                          Cód. {vehicle.fipeCode}
+                        </span>
+                      )}
+                    </div>
+
+                    {fipeDiff !== 0 && displayedFipePrice > 0 && (
+                      <p
+                        className={`text-xs font-medium font-mono tabular-nums ${
+                          fipeDiff > 0 ? 'text-emerald-400' : 'text-amber-400'
+                        }`}
+                      >
+                        {fipeDiff > 0
+                          ? `${fipePctLabel}% abaixo da Tabela FIPE (${formatBRL(fipeDiff)} de vantagem)`
+                          : `${fipePctLabel}% acima da Tabela FIPE`}
+                      </p>
+                    )}
+
+                    {liveFipe && (
+                      <p className="text-[11px] text-zinc-400">
+                        Atualizado ao vivo (BrasilAPI · Ref. {liveFipe.recommended.mesReferencia})
+                      </p>
+                    )}
+
+                    {fipeCheckError && (
+                      <p className="text-[11px] text-red-400">{fipeCheckError}</p>
+                    )}
+
+                    {vehicle.fipeCode && (
+                      <button
+                        type="button"
+                        onClick={() => void handleRefreshLiveFipe()}
+                        disabled={loadingFipe}
+                        className="inline-flex items-center gap-1.5 text-[11px] font-medium text-red-400 hover:text-red-300 transition-colors disabled:opacity-60 pt-0.5"
+                      >
+                        {loadingFipe ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <RefreshCw className="w-3 h-3" />
+                        )}
+                        <span>
+                          {loadingFipe ? 'Consultando BrasilAPI...' : 'Verificar Tabela FIPE ao vivo'}
+                        </span>
+                      </button>
+                    )}
+                  </div>
                 )}
 
                 <div className="mt-5 space-y-2.5">

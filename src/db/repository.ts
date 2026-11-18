@@ -9,6 +9,8 @@ export interface DbVehicleRow {
   year_model: number;
   km: number;
   price: string;
+  fipe_code?: string | null;
+  fipe_price?: string | null;
   status: string | null;
   fuel: string | null;
   transmission: string | null;
@@ -43,6 +45,11 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
     await client.query(
       "UPDATE vehicles SET status = 'Disponivel' WHERE status = 'Disponível'"
     );
+    await client.query(`
+      ALTER TABLE vehicles
+      ADD COLUMN IF NOT EXISTS fipe_code VARCHAR(32),
+      ADD COLUMN IF NOT EXISTS fipe_price NUMERIC
+    `);
     await client.query(`
       ALTER TABLE leads
       ADD COLUMN IF NOT EXISTS lgpd_consent BOOLEAN NOT NULL DEFAULT true,

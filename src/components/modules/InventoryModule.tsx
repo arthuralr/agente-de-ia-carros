@@ -1,17 +1,24 @@
 import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
+  BadgePercent,
   Check,
   Edit3,
   Loader2,
   Plus,
+  RefreshCw,
   Search,
   Sparkles,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
-import { Vehicle, VehicleCategory, VehicleStatus } from '../../types';
+import {
+  FipeLookupResult,
+  Vehicle,
+  VehicleCategory,
+  VehicleStatus,
+} from '../../types';
 import { SHOWROOM_IMAGE_PRESETS } from '../../data/mockData';
 import { parseYearPair } from '../../db/mappers';
 import { formatBRL, formatKm } from '../../utils/formatters';
@@ -75,6 +82,11 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
 
+  const [isQueryingFipe, setIsQueryingFipe] = useState(false);
+  const [fipeError, setFipeError] = useState<string | null>(null);
+  const [fipeResult, setFipeResult] = useState<FipeLookupResult | null>(null);
+  const [selectedFipeIndex, setSelectedFipeIndex] = useState(0);
+
   const [formState, setFormState] = useState<Omit<Vehicle, 'id' | 'createdAt'>>({
     brand: '',
     model: '',
@@ -84,6 +96,7 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
     km: 0,
     price: 0,
     fipePrice: 0,
+    fipeCode: '',
     color: '',
     transmission: 'Automático',
     fuel: 'Flex',
@@ -105,6 +118,9 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
   const openCreateModal = () => {
     setEditingVehicle(null);
     setSubmitError(null);
+    setFipeError(null);
+    setFipeResult(null);
+    setSelectedFipeIndex(0);
     setYearFabInput(2024);
     setYearModelInput(2024);
     setFormState({
@@ -116,6 +132,7 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
       km: 0,
       price: 150000,
       fipePrice: 158000,
+      fipeCode: '',
       color: 'Preto',
       transmission: 'Automático',
       fuel: 'Flex',
@@ -132,6 +149,9 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
   const openEditModal = (vehicle: Vehicle) => {
     setEditingVehicle(vehicle);
     setSubmitError(null);
+    setFipeError(null);
+    setFipeResult(null);
+    setSelectedFipeIndex(0);
     const parsedYears = parseYearPair(vehicle.year);
     setYearFabInput(parsedYears.year_fab);
     setYearModelInput(parsedYears.year_model);
@@ -144,6 +164,7 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
       km: vehicle.km,
       price: vehicle.price,
       fipePrice: vehicle.fipePrice,
+      fipeCode: vehicle.fipeCode || '',
       color: vehicle.color,
       transmission: vehicle.transmission,
       fuel: vehicle.fuel,
@@ -155,6 +176,65 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
       optionals: [...vehicle.optionals],
     });
     setIsModalOpen(true);
+  };
+
+  const handleConsultarFipe = async () => {
+    const rawCode = (formState.fipeCode || '').trim();
+    if (!rawCode) {
+      setFipeError('Informe o código FIPE (ex: 001004-9 ou 009222-3) para consultar.');
+      return;
+    }
+
+    setIsQueryingFipe(true);
+    setFipeError(null);
+
+    try {
+      const res = await fetch(
+        `/api/fipe/${encodeURIComponent(rawCode)}?ano=${encodeURIComponent(
+          String(yearModelInput)
+        )}`
+      );
+      const data = (await res.json().catch(() => ({}))) as FipeLookupResult & {
+        error?: string;
+      };
+
+      if (!res.ok || !data.recommended) {
+        throw new Error(
+          data.error || 'Não foi possível consultar o código na Tabela FIPE.'
+        );
+      }
+
+      const recIdx = data.items.findIndex(
+        (item) =>
+          item.anoModelo === data.recommended.anoModelo &&
+          item.combustivel === data.recommended.combustivel
+      );
+      setFipeResult(data);
+      setSelectedFipeIndex(recIdx >= 0 ? recIdx : 0);
+      setFormState((prev) => ({
+        ...prev,
+        fipeCode: data.codigoFipe,
+        fipePrice: data.recommended.valorNumerico || prev.fipePrice,
+      }));
+    } catch (err: unknown) {
+      setFipeResult(null);
+      setFipeError(
+        err instanceof Error ? err.message : 'Erro ao consultar BrasilAPI FIPE.'
+      );
+    } finally {
+      setIsQueryingFipe(false);
+    }
+  };
+
+  const handleSelectFipeYear = (index: number) => {
+    if (!fipeResult || !fipeResult.items[index]) return;
+    const chosen = fipeResult.items[index];
+    setSelectedFipeIndex(index);
+    setFormState((prev) => ({
+      ...prev,
+      fipeCode: chosen.codigoFipe || fipeResult.codigoFipe,
+      fipePrice: chosen.valorNumerico,
+    }));
   };
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -386,11 +466,29 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                       <span className="font-mono text-sm font-semibold text-white tabular-nums block">
                         {formatBRL(vehicle.price)}
                       </span>
-                      {vehicle.fipePrice > 0 && (
-                        <span className="text-[11px] text-zinc-500 font-mono tabular-nums">
-                          FIPE {formatBRL(vehicle.fipePrice)}
-                        </span>
-                      )}
+                      {vehicle.fipePrice > 0 && (() => {
+                        const diff = vehicle.fipePrice - vehicle.price;
+                        const pct = ((Math.abs(diff) / vehicle.fipePrice) * 100).toFixed(1).replace('.', ',');
+                        return (
+                          <div className="mt-0.5 flex flex-col items-end gap-0.5">
+                            <span className="text-[11px] text-zinc-400 font-mono tabular-nums">
+                              FIPE {formatBRL(vehicle.fipePrice)}
+                              {vehicle.fipeCode ? ` · ${vehicle.fipeCode}` : ''}
+                            </span>
+                            {diff !== 0 && (
+                              <span
+                                className={`text-[10px] font-mono tabular-nums font-medium ${
+                                  diff > 0 ? 'text-emerald-400' : 'text-amber-400'
+                                }`}
+                              >
+                                {diff > 0
+                                  ? `${pct}% abaixo da FIPE`
+                                  : `${pct}% acima da FIPE`}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </td>
 
                     <td className="py-3.5 px-4 whitespace-nowrap">
@@ -678,6 +776,114 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                     className="w-full px-3 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white font-mono focus:outline-none"
                   />
                 </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1">
+                    Código FIPE (BrasilAPI)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={formState.fipeCode || ''}
+                      onChange={(e) =>
+                        setFormState((prev) => ({
+                          ...prev,
+                          fipeCode: e.target.value,
+                        }))
+                      }
+                      placeholder="Ex: 009222-3"
+                      className="min-w-0 flex-1 px-3 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white font-mono focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void handleConsultarFipe()}
+                      disabled={isQueryingFipe}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors disabled:opacity-60 whitespace-nowrap shrink-0"
+                    >
+                      {isQueryingFipe ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      )}
+                      <span>Consultar</span>
+                    </button>
+                  </div>
+                </div>
+
+                {(fipeError || fipeResult || (formState.fipePrice > 0 && formState.price > 0)) && (
+                  <div className="sm:col-span-3 p-3.5 rounded-lg bg-[#09090B] border border-white/[0.08] space-y-2.5">
+                    {fipeError && (
+                      <div className="flex items-start gap-2 text-xs text-red-300">
+                        <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                        <span>{fipeError}</span>
+                      </div>
+                    )}
+
+                    {fipeResult && (
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2.5 border-b border-white/[0.06]">
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-white truncate">
+                            {fipeResult.recommended.marca} · {fipeResult.items[selectedFipeIndex]?.modelo}
+                          </p>
+                          <p className="text-[11px] text-zinc-400 mt-0.5">
+                            Tabela oficial BrasilAPI · Cód.{' '}
+                            <span className="font-mono text-zinc-200">{fipeResult.codigoFipe}</span> · Ref.:{' '}
+                            <span className="text-zinc-200">
+                              {fipeResult.items[selectedFipeIndex]?.mesReferencia || fipeResult.recommended.mesReferencia}
+                            </span>
+                          </p>
+                        </div>
+
+                        {fipeResult.items.length > 1 && (
+                          <div className="shrink-0">
+                            <select
+                              aria-label="Ano modelo retornado pela FIPE"
+                              value={selectedFipeIndex}
+                              onChange={(e) => handleSelectFipeYear(Number(e.target.value))}
+                              className="px-2.5 py-1.5 bg-[#111114] border border-white/[0.12] rounded-md text-xs text-zinc-100 font-mono focus:outline-none focus:border-red-600"
+                            >
+                              {fipeResult.items.map((item, idx) => (
+                                <option key={`${item.anoModelo}-${item.combustivel}`} value={idx}>
+                                  {item.anoModelo === 32000 ? 'Zero KM' : item.anoModelo} · {item.combustivel} · {item.valor}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {formState.fipePrice > 0 && formState.price > 0 && (() => {
+                      const diff = formState.fipePrice - formState.price;
+                      const pct = ((Math.abs(diff) / formState.fipePrice) * 100).toFixed(1).replace('.', ',');
+                      return (
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <span className="inline-flex items-center gap-1.5 text-zinc-300">
+                            <BadgePercent className="w-4 h-4 text-red-500 shrink-0" />
+                            <span>
+                              Comparativo com Tabela FIPE ({formatBRL(formState.fipePrice)}):
+                            </span>
+                          </span>
+                          <span
+                            className={`font-mono font-semibold tabular-nums ${
+                              diff > 0
+                                ? 'text-emerald-400'
+                                : diff < 0
+                                  ? 'text-amber-400'
+                                  : 'text-zinc-300'
+                            }`}
+                          >
+                            {diff > 0
+                              ? `${pct}% abaixo da FIPE (economia de ${formatBRL(diff)})`
+                              : diff < 0
+                                ? `${pct}% acima da FIPE (+${formatBRL(Math.abs(diff))})`
+                                : 'Exatamente no valor da Tabela FIPE'}
+                          </span>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
 
                 <div>
                   <label className="block text-xs font-medium text-zinc-300 mb-1">

@@ -70,6 +70,8 @@ interface ChatRequestBody {
     year: string;
     km: number;
     price: number;
+    fipePrice?: number;
+    fipeCode?: string;
     color: string;
     transmission: string;
     fuel: string;
@@ -87,6 +89,257 @@ interface ChatRequestBody {
     hoursSaturday: string;
     aiAssistantName: string;
   };
+}
+
+interface BrasilApiFipeRawItem {
+  valor?: string;
+  marca?: string;
+  modelo?: string;
+  anoModelo?: number;
+  combustivel?: string;
+  codigoFipe?: string;
+  mesReferencia?: string;
+  tipoVeiculo?: number;
+  siglaCombustivel?: string;
+  dataConsulta?: string;
+}
+
+interface FipePriceEntry {
+  valor: string;
+  valorNumerico: number;
+  marca: string;
+  modelo: string;
+  anoModelo: number;
+  combustivel: string;
+  codigoFipe: string;
+  mesReferencia: string;
+  tipoVeiculo: number;
+  siglaCombustivel: string;
+  dataConsulta: string;
+}
+
+interface FipeLookupResult {
+  codigoFipe: string;
+  cached: boolean;
+  items: FipePriceEntry[];
+  recommended: FipePriceEntry;
+}
+
+class FipeServiceError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const FIPE_CACHE_TTL_MS = 30 * 60 * 1000;
+const fipeLookupCache = new Map<
+  string,
+  { expiresAt: number; items: FipePriceEntry[] }
+>();
+
+function normalizeFipeCode(rawCode: string): string | null {
+  const digits = rawCode.replace(/\D/g, '');
+  if (digits.length !== 7) {
+    return null;
+  }
+  return `${digits.slice(0, 6)}-${digits.slice(6)}`;
+}
+
+function parseFipeBrlValue(rawValor: string | undefined): number {
+  if (!rawValor) return 0;
+  const cleaned = rawValor
+    .replace(/R\$/gi, '')
+    .replace(/\s+/g, '')
+    .replace(/\./g, '')
+    .replace(',', '.');
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0;
+}
+
+function selectRecommendedFipeItem(
+  items: FipePriceEntry[],
+  yearHint?: number
+): FipePriceEntry {
+  if (Number.isFinite(yearHint) && (yearHint as number) > 1900) {
+    const exact = items.find((item) => item.anoModelo === yearHint);
+    if (exact) return exact;
+
+    const regularYears = items.filter(
+      (item) => item.anoModelo >= 1950 && item.anoModelo < 30000
+    );
+    if (regularYears.length > 0) {
+      return [...regularYears].sort(
+        (a, b) =>
+          Math.abs(a.anoModelo - (yearHint as number)) -
+          Math.abs(b.anoModelo - (yearHint as number))
+      )[0];
+    }
+  }
+
+  return (
+    items.find((item) => item.anoModelo >= 1950 && item.anoModelo < 30000) ||
+    items[0]
+  );
+}
+
+async function fetchBrasilApiFipe(
+  rawCode: string,
+  yearHint?: number
+): Promise<FipeLookupResult> {
+  const normalizedCode = normalizeFipeCode(rawCode);
+  if (!normalizedCode) {
+    throw new FipeServiceError(
+      400,
+      'Código FIPE inválido. Informe os 7 dígitos do código FIPE (ex: 001004-9 ou 009222-3).'
+    );
+  }
+
+  const cachedEntry = fipeLookupCache.get(normalizedCode);
+  if (cachedEntry && cachedEntry.expiresAt > Date.now()) {
+    return {
+      codigoFipe: normalizedCode,
+      cached: true,
+      items: cachedEntry.items,
+      recommended: selectRecommendedFipeItem(cachedEntry.items, yearHint),
+    };
+  }
+
+  const endpoint = `https://brasilapi.com.br/api/fipe/preco/v1/${encodeURIComponent(
+    normalizedCode
+  )}`;
+
+  let response: globalThis.Response;
+  try {
+    response = await fetch(endpoint, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'ArmazemDoCarro/1.0',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (err: unknown) {
+    if (
+      err instanceof Error &&
+      (err.name === 'TimeoutError' || err.name === 'AbortError')
+    ) {
+      throw new FipeServiceError(
+        504,
+        'Tempo limite excedido ao consultar a Tabela FIPE (BrasilAPI). Tente novamente em instantes.'
+      );
+    }
+    throw new FipeServiceError(
+      502,
+      'Não foi possível conectar ao serviço da BrasilAPI para consultar a Tabela FIPE.'
+    );
+  }
+
+  if (response.status === 404) {
+    throw new FipeServiceError(
+      404,
+      `Código FIPE ${normalizedCode} não encontrado na Tabela FIPE oficial.`
+    );
+  }
+
+  if (response.status === 400) {
+    throw new FipeServiceError(
+      400,
+      `Código FIPE ${normalizedCode} rejeitado pela BrasilAPI.`
+    );
+  }
+
+  if (!response.ok) {
+    const upstreamErr = (await response.json().catch(() => null)) as {
+      message?: string;
+    } | null;
+    const upstreamMsg = upstreamErr?.message?.trim();
+    throw new FipeServiceError(
+      response.status >= 500 ? 503 : 502,
+      upstreamMsg
+        ? `BrasilAPI (${normalizedCode}): ${upstreamMsg}`
+        : `BrasilAPI retornou erro (${response.status}) ao consultar o código FIPE ${normalizedCode}.`
+    );
+  }
+
+  const rawData = (await response.json().catch(() => null)) as
+    | BrasilApiFipeRawItem[]
+    | { message?: string }
+    | null;
+
+  if (!Array.isArray(rawData) || rawData.length === 0) {
+    throw new FipeServiceError(
+      404,
+      `Nenhum valor encontrado na Tabela FIPE para o código ${normalizedCode}.`
+    );
+  }
+
+  const items: FipePriceEntry[] = rawData
+    .map((item) => ({
+      valor: String(item.valor || 'R$ 0,00'),
+      valorNumerico: parseFipeBrlValue(item.valor),
+      marca: String(item.marca || ''),
+      modelo: String(item.modelo || ''),
+      anoModelo: Number(item.anoModelo) || 0,
+      combustivel: String(item.combustivel || ''),
+      codigoFipe: normalizeFipeCode(String(item.codigoFipe || normalizedCode)) || normalizedCode,
+      mesReferencia: String(item.mesReferencia || '').trim(),
+      tipoVeiculo: Number(item.tipoVeiculo) || 1,
+      siglaCombustivel: String(item.siglaCombustivel || ''),
+      dataConsulta: String(item.dataConsulta || ''),
+    }))
+    .sort((a, b) => b.anoModelo - a.anoModelo);
+
+  fipeLookupCache.set(normalizedCode, {
+    expiresAt: Date.now() + FIPE_CACHE_TTL_MS,
+    items,
+  });
+
+  return {
+    codigoFipe: normalizedCode,
+    cached: false,
+    items,
+    recommended: selectRecommendedFipeItem(items, yearHint),
+  };
+}
+
+function buildFipeComparisonSummary(
+  sellingPrice: number,
+  fipePrice?: number | null,
+  fipeCode?: string | null
+): string {
+  const validFipe = Number(fipePrice);
+  const codeTag = fipeCode ? ` (Cód. FIPE ${fipeCode})` : '';
+  if (!Number.isFinite(validFipe) || validFipe <= 0) {
+    return fipeCode ? `Cód. FIPE ${fipeCode} (sem valor salvo)` : '';
+  }
+
+  const formattedFipe = new Intl.NumberFormat('pt-BR', {
+    style: 'currency',
+    currency: 'BRL',
+    maximumFractionDigits: 0,
+  }).format(validFipe);
+
+  if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
+    return `FIPE${codeTag}: ${formattedFipe}`;
+  }
+
+  const diff = validFipe - sellingPrice;
+  const pct = (Math.abs(diff) / validFipe) * 100;
+  const pctLabel = pct.toFixed(1).replace('.', ',');
+  const diffFormatted = new Intl.NumberFormat('pt-BR', {
+    style: 'currency',
+    currency: 'BRL',
+    maximumFractionDigits: 0,
+  }).format(Math.abs(diff));
+
+  if (diff > 0) {
+    return `FIPE${codeTag}: ${formattedFipe} — ${pctLabel}% abaixo da FIPE (economia de ${diffFormatted})`;
+  }
+  if (diff < 0) {
+    return `FIPE${codeTag}: ${formattedFipe} — ${pctLabel}% acima da FIPE (+${diffFormatted} por diferenciais/baixa km)`;
+  }
+  return `FIPE${codeTag}: ${formattedFipe} — exatamente no valor da Tabela FIPE`;
 }
 
 function getGeminiClient(): GoogleGenAI {
@@ -404,6 +657,55 @@ app.patch('/api/public/leads/:id/chat', async (req, res) => {
   }
 });
 
+// ============================================================================
+// Tabela FIPE (BrasilAPI) Consultation Routes
+// ============================================================================
+
+async function handleFipeLookupRequest(
+  rawCode: string,
+  rawYear: unknown,
+  res: Response
+): Promise<void> {
+  if (!rawCode || !rawCode.trim()) {
+    res.status(400).json({
+      error: 'Informe o código FIPE para consulta (ex: 001004-9).',
+    });
+    return;
+  }
+
+  const parsedYear =
+    typeof rawYear === 'string' && rawYear.trim() !== ''
+      ? Number(rawYear.trim())
+      : undefined;
+
+  try {
+    const result = await fetchBrasilApiFipe(rawCode, parsedYear);
+    res.json(result);
+  } catch (err: unknown) {
+    if (err instanceof FipeServiceError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    const message =
+      err instanceof Error ? err.message : 'Erro interno ao consultar Tabela FIPE.';
+    res.status(500).json({ error: message });
+  }
+}
+
+app.get('/api/fipe/consultar', async (req, res) => {
+  const rawCode =
+    typeof req.query.codigo === 'string'
+      ? req.query.codigo
+      : typeof req.query.codigoFipe === 'string'
+        ? req.query.codigoFipe
+        : '';
+  await handleFipeLookupRequest(rawCode, req.query.ano, res);
+});
+
+app.get('/api/fipe/:codigoFipe', async (req, res) => {
+  await handleFipeLookupRequest(req.params.codigoFipe || '', req.query.ano, res);
+});
+
 app.get('/api/vehicles', requireAdminAuth, async (req, res) => {
   try {
     const statusFilter =
@@ -437,6 +739,8 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
       year_model,
       km,
       price,
+      fipe_code,
+      fipe_price,
       status,
       fuel,
       transmission,
@@ -453,6 +757,11 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
     const parsedYearModel = Number(year_model);
     const parsedKm = Number(km);
     const parsedPrice = Number(price);
+    const parsedFipePrice = Number(fipe_price);
+    const normalizedFipeCode =
+      typeof fipe_code === 'string' && fipe_code.trim()
+        ? normalizeFipeCode(fipe_code) || fipe_code.trim()
+        : null;
 
     if (!Number.isFinite(parsedYearFab) || !Number.isFinite(parsedYearModel)) {
       res.status(400).json({ error: 'Ano de fabricação e ano do modelo inválidos.' });
@@ -467,8 +776,8 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
         : 'Disponivel';
 
     const result = await pool.query<DbVehicleRow>(
-      `INSERT INTO vehicles (brand, model, version, year_fab, year_model, km, price, status, fuel, transmission, image_url, options)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO vehicles (brand, model, version, year_fab, year_model, km, price, fipe_code, fipe_price, status, fuel, transmission, image_url, options)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
       [
         String(brand).trim(),
@@ -478,6 +787,10 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
         parsedYearModel,
         Number.isFinite(parsedKm) ? parsedKm : 0,
         Number.isFinite(parsedPrice) ? parsedPrice : 0,
+        normalizedFipeCode,
+        Number.isFinite(parsedFipePrice) && parsedFipePrice > 0
+          ? parsedFipePrice
+          : null,
         vehicleStatus,
         fuel ? String(fuel).trim() : 'Flex',
         transmission ? String(transmission).trim() : 'Automático',
@@ -508,6 +821,8 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
       year_model,
       km,
       price,
+      fipe_code,
+      fipe_price,
       status,
       fuel,
       transmission,
@@ -520,6 +835,20 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
         ? 'Disponivel'
         : status;
 
+    const cleanFipeCode =
+      fipe_code === undefined
+        ? undefined
+        : typeof fipe_code === 'string' && fipe_code.trim()
+          ? normalizeFipeCode(fipe_code) || fipe_code.trim()
+          : null;
+
+    const cleanFipePrice =
+      fipe_price === undefined
+        ? undefined
+        : Number.isFinite(Number(fipe_price)) && Number(fipe_price) > 0
+          ? Number(fipe_price)
+          : null;
+
     const result = await pool.query<DbVehicleRow>(
       `UPDATE vehicles
        SET brand = COALESCE($1, brand),
@@ -529,12 +858,14 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
            year_model = COALESCE($5, year_model),
            km = COALESCE($6, km),
            price = COALESCE($7, price),
-           status = COALESCE($8, status),
-           fuel = COALESCE($9, fuel),
-           transmission = COALESCE($10, transmission),
-           image_url = COALESCE($11, image_url),
-           options = COALESCE($12, options)
-       WHERE id = $13
+           fipe_code = CASE WHEN $8::boolean THEN $9 ELSE fipe_code END,
+           fipe_price = CASE WHEN $10::boolean THEN $11 ELSE fipe_price END,
+           status = COALESCE($12, status),
+           fuel = COALESCE($13, fuel),
+           transmission = COALESCE($14, transmission),
+           image_url = COALESCE($15, image_url),
+           options = COALESCE($16, options)
+       WHERE id = $17
        RETURNING *`,
       [
         brand,
@@ -544,6 +875,10 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
         year_model !== undefined ? Number(year_model) : null,
         km !== undefined ? Number(km) : null,
         price !== undefined ? Number(price) : null,
+        fipe_code !== undefined,
+        cleanFipeCode ?? null,
+        fipe_price !== undefined,
+        cleanFipePrice ?? null,
         normalizedStatus,
         fuel,
         transmission,
@@ -929,7 +1264,7 @@ app.post('/api/ai/chat', async (req, res) => {
     let dbInventoryText = '';
     try {
       const stockRes = await pool.query<DbVehicleRow>(
-        `SELECT brand, model, version, year_fab, year_model, km, price, status, fuel, transmission, options
+        `SELECT brand, model, version, year_fab, year_model, km, price, fipe_code, fipe_price, status, fuel, transmission, options
          FROM vehicles
          WHERE status IN ('Disponivel', 'Disponível', 'Reservado')
          ORDER BY created_at DESC, id DESC`
@@ -937,17 +1272,23 @@ app.post('/api/ai/chat', async (req, res) => {
       if (stockRes.rows.length > 0) {
         dbInventoryText = stockRes.rows
           .map((v) => {
+            const sellingPrice = Number(v.price);
             const formattedPrice = new Intl.NumberFormat('pt-BR', {
               style: 'currency',
               currency: 'BRL',
               maximumFractionDigits: 0,
-            }).format(Number(v.price));
+            }).format(sellingPrice);
             const formattedKm = new Intl.NumberFormat('pt-BR').format(Number(v.km));
             const opts =
               Array.isArray(v.options) && v.options.length > 0
                 ? v.options.join(', ')
                 : 'Pacote de série';
-            return `- ${v.brand} ${v.model} ${v.version || ''} | Ano: ${v.year_fab}/${v.year_model} | Km: ${formattedKm} km | Preço: ${formattedPrice} | Status: ${v.status} | Câmbio: ${v.transmission || 'N/I'} | Combustível: ${v.fuel || 'N/I'} | Opcionais: ${opts}`.trim();
+            const fipeNote = buildFipeComparisonSummary(
+              sellingPrice,
+              v.fipe_price ? Number(v.fipe_price) : null,
+              v.fipe_code
+            );
+            return `- ${v.brand} ${v.model} ${v.version || ''} | Ano: ${v.year_fab}/${v.year_model} | Km: ${formattedKm} km | Preço: ${formattedPrice}${fipeNote ? ` | ${fipeNote}` : ''} | Status: ${v.status} | Câmbio: ${v.transmission || 'N/I'} | Combustível: ${v.fuel || 'N/I'} | Opcionais: ${opts}`.trim();
           })
           .join('\n');
       }
@@ -955,24 +1296,76 @@ app.post('/api/ai/chat', async (req, res) => {
       dbInventoryText = '';
     }
 
+    // Se o cliente ou veículo selecionado informar código FIPE, consulta BrasilAPI ao vivo quando necessário
+    let resolvedSelectedFipePrice = body.vehicle?.fipePrice;
+    let resolvedSelectedFipeRef = '';
+    if (
+      body.vehicle?.fipeCode &&
+      (!resolvedSelectedFipePrice || resolvedSelectedFipePrice <= 0)
+    ) {
+      try {
+        const yearDigits = body.vehicle.year.split('/').pop();
+        const yearNum = yearDigits ? Number(yearDigits) : undefined;
+        const liveFipe = await fetchBrasilApiFipe(body.vehicle.fipeCode, yearNum);
+        resolvedSelectedFipePrice = liveFipe.recommended.valorNumerico;
+        resolvedSelectedFipeRef = ` (Referência BrasilAPI: ${liveFipe.recommended.mesReferencia})`;
+      } catch {
+        // Ignora falha silenciosamente para não interromper o atendimento
+      }
+    }
+
+    // Verifica se o cliente digitou explicitamente um código FIPE na última mensagem (ex: 001004-9)
+    let clientFipeLookupContext = '';
+    const lastUserMessage = [...body.messages]
+      .reverse()
+      .find((m) => m.sender === 'cliente')?.text;
+    const fipeCodeMatch = lastUserMessage?.match(/\b\d{6}-?\d\b/);
+    if (fipeCodeMatch) {
+      try {
+        const liveFipe = await fetchBrasilApiFipe(fipeCodeMatch[0]);
+        const summaryLines = liveFipe.items
+          .slice(0, 6)
+          .map(
+            (item) =>
+              `  * ${item.marca} ${item.modelo} (${item.anoModelo === 32000 ? 'Zero KM' : item.anoModelo}, ${item.combustivel}): ${item.valor} — Ref.: ${item.mesReferencia}`
+          )
+          .join('\n');
+        clientFipeLookupContext = `\nConsulta oficial Tabela FIPE (BrasilAPI) realizada em tempo real para o código **${liveFipe.codigoFipe}**:\n${summaryLines}`;
+      } catch {
+        // Se código digitado não existir na FIPE, segue atendimento normal sem travar
+      }
+    }
+
     const realStockContext =
       dbInventoryText ||
       body.inventorySummary ||
       'Nenhum veículo listado no momento.';
 
+    const selectedVehicleFipeLine = body.vehicle
+      ? buildFipeComparisonSummary(
+          body.vehicle.price,
+          resolvedSelectedFipePrice,
+          body.vehicle.fipeCode
+        )
+      : '';
+
     const vehicleContext = body.vehicle
       ? `Veículo selecionado pelo cliente:
 - Modelo: ${body.vehicle.brand} ${body.vehicle.model} ${body.vehicle.version}
 - Ano: ${body.vehicle.year} | Km: ${new Intl.NumberFormat('pt-BR').format(body.vehicle.km)} km
-- Preço à vista: ${new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL', maximumFractionDigits: 0 }).format(body.vehicle.price)}
+- Preço à vista: ${new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL', maximumFractionDigits: 0 }).format(body.vehicle.price)}${
+          selectedVehicleFipeLine
+            ? `\n- Referência Oficial FIPE: ${selectedVehicleFipeLine}${resolvedSelectedFipeRef}`
+            : ''
+        }
 - Cor: ${body.vehicle.color} | Câmbio: ${body.vehicle.transmission} | Combustível: ${body.vehicle.fuel}
 - Status atual: ${body.vehicle.status}
-- Opcionais: ${Array.isArray(body.vehicle.optionals) && body.vehicle.optionals.length > 0 ? body.vehicle.optionals.join(', ') : 'Padrão de série'}
+- Opcionais: ${Array.isArray(body.vehicle.optionals) && body.vehicle.optionals.length > 0 ? body.vehicle.optionals.join(', ') : 'Padrão de série'}${clientFipeLookupContext}
 
 Estoque completo disponível no banco de dados (caso o cliente pergunte sobre outros veículos):
 ${realStockContext}`
       : `Estoque real disponível no banco de dados (${dealership}):
-${realStockContext}`;
+${realStockContext}${clientFipeLookupContext}`;
 
     const conversationTranscript = body.messages
       .map((m) => `${m.sender === 'cliente' ? 'Cliente' : assistantName}: ${m.text}`)
@@ -989,11 +1382,12 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 - Seja objetivo e direto (idealmente entre 60 e 160 palavras por resposta).
 - Separe seções com linha em branco e use parágrafos curtos (1 frase por parágrafo).
 - Use listas em Markdown com \`- \` para apresentar ficha técnica, diferenciais, opcionais ou opções de estoque.
-- Use negritos estratégicos (\`**texto**\`) para destacar nomes de modelos, anos, quilometragem e preços (ex: **BMW 320i M Sport (2023/2024)** por **R$ 314.900**).
+- Use negritos estratégicos (\`**texto**\`) para destacar nomes de modelos, anos, quilometragem, preços e economia frente à Tabela FIPE (ex: **BMW 320i M Sport (2023/2024)** por **R$ 314.900**).
 
-2. PERSONALIDADE COMERCIAL CONSULTIVA E VERACIDADE:
+2. PERSONALIDADE COMERCIAL CONSULTIVA, FIPE OFICIAL E VERACIDADE:
 - Atue estritamente como o Consultor Oficial do ${dealership}, especialista em seminovos selecionados com procedência garantida, **laudo cautelar 100% aprovado** e **garantia legal de 90 dias (CDC)**.
-- Utilize APENAS os dados reais do estoque fornecidos no contexto do banco de dados. NUNCA invente especificações, preços, anos, versões, taxas exatas de financiamento ou veículos que não constam no estoque. Se uma informação não estiver listada, diga com clareza que confirmará presencialmente ou pelo WhatsApp.
+- Utilize APENAS os dados reais do estoque e os valores oficiais da Tabela FIPE (BrasilAPI) fornecidos no contexto. NUNCA invente especificações, preços, valores FIPE, anos, versões, taxas exatas de financiamento ou veículos que não constam no contexto. Se uma informação não estiver listada, diga com clareza que confirmará presencialmente ou pelo WhatsApp.
+- ARGUMENTAÇÃO COMERCIAL COM TABELA FIPE: Sempre que o contexto trouxer o valor oficial da **Tabela FIPE** (ou consulta ao vivo por código FIPE), use essa referência para valorizar o negócio de forma transparente — destacando o preço FIPE, o **percentual de desconto** e a **economia em reais** quando o veículo estiver abaixo da tabela, ou justificando o valor de mercado pela baixa quilometragem, laudo cautelar e pacote de opcionais.
 - Quando pertinente, destaque que aceitamos veículo usado na troca (mediante avaliação presencial) e trabalhamos com financiamento bancário e carta de crédito contemplada.
 
 3. CHAMADA PARA AÇÃO (CTA) ATIVA:

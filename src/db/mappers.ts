@@ -21,6 +21,8 @@ export interface ApiVehicleRow {
   year_model: number;
   km: number;
   price: string | number;
+  fipe_code?: string | null;
+  fipe_price?: string | number | null;
   status: string | null;
   fuel: string | null;
   transmission: string | null;
@@ -95,6 +97,7 @@ export function mapDbVehicleToFrontend(row: ApiVehicleRow): Vehicle {
   );
 
   const priceNum = Number(row.price) || 0;
+  const dbFipePrice = Number(row.fipe_price);
   const rawStatus = (row.status || '').trim();
   const statusVal: VehicleStatus =
     rawStatus === 'Reservado' || rawStatus === 'Vendido'
@@ -110,7 +113,11 @@ export function mapDbVehicleToFrontend(row: ApiVehicleRow): Vehicle {
     year: `${row.year_fab}/${row.year_model}`,
     km: Number(row.km) || 0,
     price: priceNum,
-    fipePrice: seedMatch?.fipePrice || Math.round(priceNum * 1.04),
+    fipePrice:
+      Number.isFinite(dbFipePrice) && dbFipePrice > 0
+        ? dbFipePrice
+        : seedMatch?.fipePrice || Math.round(priceNum * 1.04),
+    fipeCode: row.fipe_code?.trim() || seedMatch?.fipeCode,
     color: seedMatch?.color || 'Showroom',
     transmission: row.transmission || 'Automático',
     fuel: row.fuel || 'Flex',

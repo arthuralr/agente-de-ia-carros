@@ -383,6 +383,8 @@ export default function App() {
         year_model,
         km: vehicle.km,
         price: vehicle.price,
+        fipe_code: vehicle.fipeCode?.trim() || null,
+        fipe_price: vehicle.fipePrice > 0 ? vehicle.fipePrice : null,
         status: 'Disponivel',
         fuel: vehicle.fuel,
         transmission: vehicle.transmission,
@@ -405,6 +407,7 @@ export default function App() {
     const mapped = mapDbVehicleToFrontend(created);
     mapped.color = vehicle.color || mapped.color;
     mapped.plate = vehicle.plate || mapped.plate;
+    mapped.fipeCode = vehicle.fipeCode || mapped.fipeCode;
     mapped.fipePrice = vehicle.fipePrice || mapped.fipePrice;
     mapped.category = vehicle.category || mapped.category;
 
@@ -441,6 +444,8 @@ export default function App() {
           year_model,
           km: updated.km,
           price: updated.price,
+          fipe_code: updated.fipeCode?.trim() || null,
+          fipe_price: updated.fipePrice > 0 ? updated.fipePrice : null,
           status: updated.status,
           fuel: updated.fuel,
           transmission: updated.transmission,

@@ -30,6 +30,7 @@ export interface Vehicle {
   km: number;
   price: number;
   fipePrice: number;
+  fipeCode?: string;
   color: string;
   transmission: string;
   fuel: string;
@@ -41,6 +42,27 @@ export interface Vehicle {
   gallery?: string[];
   optionals: string[];
   createdAt: string;
+}
+
+export interface FipePriceEntry {
+  valor: string;
+  valorNumerico: number;
+  marca: string;
+  modelo: string;
+  anoModelo: number;
+  combustivel: string;
+  codigoFipe: string;
+  mesReferencia: string;
+  tipoVeiculo: number;
+  siglaCombustivel: string;
+  dataConsulta: string;
+}
+
+export interface FipeLookupResult {
+  codigoFipe: string;
+  cached: boolean;
+  items: FipePriceEntry[];
+  recommended: FipePriceEntry;
 }
 
 export type LeadStage = 'Novo Lead' | 'Em Atendimento' | 'Proposta' | 'Fechado';
