@@ -84,6 +84,7 @@ interface ChatAttachmentPayload {
 interface ChatRequestBody {
   sessionId?: string;
   origem?: string;
+  visitorName?: string;
   messages: { sender: 'ia' | 'cliente'; text: string }[];
   replyTo?: ChatReplyPayload | null;
   audio?: ChatAudioPayload | null;
@@ -300,6 +301,125 @@ async function attachLeadToChatSession(
     );
   } catch (err) {
     console.error('[Chat Audit Lead Attach Error]', err);
+  }
+}
+
+const VISITOR_NAME_STOPWORDS = new Set([
+  'oi', 'ola', 'olá', 'opa', 'eae', 'fala', 'salve', 'bom', 'boa', 'dia', 'tarde', 'noite',
+  'tudo', 'bem', 'obrigado', 'obrigada', 'valeu', 'sim', 'nao', 'não', 'ok', 'blz', 'beleza',
+  'certo', 'show', 'legal', 'perfeito', 'otimo', 'ótimo', 'quero', 'gostaria', 'preciso',
+  'tenho', 'estou', 'queria', 'ver', 'saber', 'falar', 'ajuda', 'info', 'informacao',
+  'informação', 'contato', 'whatsapp', 'zap', 'menu', 'voltar', 'teste', 'testando',
+  'carro', 'carros', 'veiculo', 'veículo', 'veiculos', 'veículos', 'estoque', 'modelo',
+  'modelos', 'oferta', 'ofertas', 'preco', 'preço', 'valor', 'valores', 'fipe', 'tabela',
+  'troca', 'avaliar', 'avaliacao', 'avaliação', 'financiamento', 'financiar', 'parcela',
+  'parcelas', 'simular', 'simulacao', 'simulação', 'visita', 'agendar', 'endereco',
+  'endereço', 'horario', 'horário', 'garantia', 'laudo', 'cautelar', 'suv', 'suvs',
+  'sedan', 'sedans', 'hatch', 'picape', 'automatico', 'automático', 'manual', 'flex',
+  'diesel', 'hibrido', 'híbrido', 'eletrico', 'elétrico', 'zero', 'seminovo', 'seminovos',
+  'usado', 'usados', 'comprar', 'vender', 'consignado', 'consorcio', 'consórcio',
+  'bmw', 'audi', 'mercedes', 'porsche', 'volvo', 'toyota', 'honda', 'jeep', 'volkswagen',
+  'vw', 'chevrolet', 'ford', 'fiat', 'hyundai', 'nissan', 'renault', 'peugeot', 'citroen',
+  'mitsubishi', 'byd', 'gwm', 'corolla', 'civic', 'compass', 'renegade', 'nivus', 'tcross',
+  'taos', 'tracker', 'onix', 'hb20', 'creta', 'kicks', 'hrv', 'hilux', 'sw4', 'ranger',
+  'toro', 'fastback', 'pulse', 'polo', 'virtus', 'tiguan', 'dolphin', 'song',
+  'eu', 'voce', 'você', 'ele', 'ela', 'nos', 'nós', 'meu', 'minha', 'seu', 'sua', 'esse',
+  'essa', 'este', 'esta', 'aqui', 'ali', 'como', 'onde', 'quando', 'qual', 'quais',
+  'quanto', 'quanta', 'para', 'com', 'sem', 'por', 'que', 'um', 'uma', 'uns', 'umas',
+  'os', 'as', 'do', 'da', 'dos', 'das', 'no', 'na', 'de', 'em', 'ou', 'mas', 'porque',
+  'pois', 'tambem', 'também', 'muito', 'mais', 'menos', 'melhor', 'novo', 'nova',
+  'cliente', 'visitante', 'interessado', 'interessada', 'consultor', 'vendedor', 'loja',
+]);
+
+function normalizeCandidateVisitorName(rawCandidate: string): string | null {
+  const cleaned = rawCandidate
+    .replace(/[^A-Za-zÀ-ÿ'\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+
+  const words = cleaned.split(' ').filter(Boolean);
+  if (words.length === 0 || words.length > 2) return null;
+
+  const validated: string[] = [];
+  for (const w of words) {
+    const lower = w.toLowerCase();
+    if (lower.length < 2 || lower.length > 20) return null;
+    if (VISITOR_NAME_STOPWORDS.has(lower)) return null;
+    validated.push(lower.charAt(0).toUpperCase() + lower.slice(1));
+  }
+
+  return validated.length > 0 ? validated.join(' ') : null;
+}
+
+function extractVisitorNameFromMessage(
+  rawText: string,
+  isFirstUserTurn: boolean
+): string | null {
+  const text = (rawText || '').trim();
+  if (!text || text.length > 260) return null;
+
+  // 1. Padrões explícitos de apresentação (ex: "Me chamo Mariana", "Oi, sou o Pedro, quero simular")
+  const explicitPatterns: RegExp[] = [
+    /(?:^|[\s,!.;-])(?:me\s+chamo|meu\s+nome\s+(?:é|e)|pode\s+me\s+chamar\s+de|chamo-me)\s+([A-Za-zÀ-ÿ]{2,20}(?:\s+[A-Za-zÀ-ÿ]{2,20})?)(?=$|[\s,!.;?:-]|(?:\s+(?:e|quero|gostaria|preciso|tenho|estou|tô|to|vim|queria|tudo|bom|boa|sobre|qual|quais|quanto|vocês|voces|vcs|pode|por|para)\b))/i,
+    /(?:^|[\s,!.;-])(?:eu\s+sou\s+(?:o|a)?|sou\s+(?:o|a)|aqui\s+(?:é|e)\s+(?:o|a))\s+([A-Za-zÀ-ÿ]{2,20}(?:\s+[A-Za-zÀ-ÿ]{2,20})?)(?=$|[\s,!.;?:-]|(?:\s+(?:e|quero|gostaria|preciso|tenho|estou|tô|to|vim|queria|tudo|bom|boa|sobre|qual|quais|quanto|vocês|voces|vcs|pode|por|para)\b))/i,
+    /(?:^|[\s,!.;-])(?:prazer|fala|oi|olá|ola)[,!.\s]+(?:sou\s+(?:o|a)?\s*)?([A-Za-zÀ-ÿ]{2,20})(?=\s*[,!.](?:\s|$)|$)/i,
+  ];
+
+  for (const rx of explicitPatterns) {
+    const match = text.match(rx);
+    if (match?.[1]) {
+      // Se o segundo termo capturado for verbo/conector (ex: "Pedro quero"), usa apenas o primeiro nome
+      const parts = match[1].trim().split(/\s+/);
+      const fullCandidate = normalizeCandidateVisitorName(match[1]);
+      if (fullCandidate) return fullCandidate;
+      if (parts.length === 2) {
+        const firstOnly = normalizeCandidateVisitorName(parts[0]);
+        if (firstOnly) return firstOnly;
+      }
+    }
+  }
+
+  // 2. Resposta direta apenas com o nome na primeira mensagem após a saudação ("Lucas", "Oi, Mariana")
+  if (isFirstUserTurn && !text.includes('?') && !/\d/.test(text) && !text.includes('/')) {
+    const strippedGreeting = text
+      .replace(
+        /^(?:(?:oi|olá|ola|opa|bom\s+dia|boa\s+tarde|boa\s+noite|tudo\s+bem|e\s+a[ií]|olá\s+tudo\s+bem|oi\s+tudo\s+bem)[\s,!.-]*)+/i,
+        ''
+      )
+      .replace(/[.!]+$/, '')
+      .trim();
+
+    if (strippedGreeting.length >= 2 && strippedGreeting.length <= 36) {
+      const bareCandidate = normalizeCandidateVisitorName(strippedGreeting);
+      if (bareCandidate) return bareCandidate;
+    }
+  }
+
+  return null;
+}
+
+async function updateChatSessionVisitorName(
+  sessionId: string | null,
+  visitorName: string,
+  origem: string
+): Promise<void> {
+  if (!sessionId || !visitorName.trim()) return;
+  try {
+    await pool.query(
+      `INSERT INTO chat_sessions (session_id, lead_name, origem, created_at, updated_at)
+       VALUES ($1, $2, $3, NOW(), NOW())
+       ON CONFLICT (session_id)
+       DO UPDATE SET lead_name = CASE
+                       WHEN chat_sessions.lead_name IS NULL OR BTRIM(chat_sessions.lead_name) = ''
+                         THEN EXCLUDED.lead_name
+                       ELSE chat_sessions.lead_name
+                     END,
+                     updated_at = NOW()`,
+      [sessionId, visitorName.trim().slice(0, 120), origem]
+    );
+  } catch (err) {
+    console.error('[Chat Audit Visitor Name Error]', err);
   }
 }
 
@@ -813,6 +933,41 @@ app.get('/api/public/config', async (_req, res) => {
     const fallback: OperationMode =
       process.env.OPERATION_MODE === 'agent_only' ? 'agent_only' : 'full';
     res.json({ operationMode: fallback });
+  }
+});
+
+app.get('/api/public/chat-session/:sessionId', async (req, res) => {
+  const cleanSessionId = sanitizeSessionId(req.params.sessionId);
+  if (!cleanSessionId) {
+    res.status(400).json({ error: 'Sessão inválida.' });
+    return;
+  }
+  try {
+    const result = await pool.query<{
+      session_id: string;
+      lead_name: string | null;
+      lead_phone: string | null;
+    }>(
+      `SELECT session_id, lead_name, lead_phone
+       FROM chat_sessions
+       WHERE session_id = $1
+       LIMIT 1`,
+      [cleanSessionId]
+    );
+    const row = result.rows[0];
+    res.json({
+      found: Boolean(row),
+      sessionId: cleanSessionId,
+      leadName: row?.lead_name?.trim() || null,
+      leadPhone: row?.lead_phone?.trim() || null,
+    });
+  } catch {
+    res.json({
+      found: false,
+      sessionId: cleanSessionId,
+      leadName: null,
+      leadPhone: null,
+    });
   }
 });
 
@@ -2218,6 +2373,61 @@ ${realStockContext}${clientFipeLookupContext}`;
         }):\n"${safeReplyToPreview}"\nResponda levando exatamente essa mensagem citada como referência principal.`
       : '';
 
+    const auditSessionId = sanitizeSessionId(body.sessionId);
+    const auditOrigin = sanitizeOrigin(body.origem);
+
+    const clientMessagesOnly = body.messages.filter((m) => m.sender === 'cliente');
+    const isFirstClientTurn = clientMessagesOnly.length <= 1;
+    const latestClientUtterance = audioTranscription
+      ? `${lastUserMessageRaw} ${audioTranscription}`.trim()
+      : lastUserMessageRaw;
+
+    const sanitizedBodyVisitorName =
+      typeof body.visitorName === 'string' && body.visitorName.trim().length >= 2
+        ? body.visitorName.trim().slice(0, 80)
+        : null;
+
+    let detectedVisitorName = extractVisitorNameFromMessage(
+      latestClientUtterance,
+      isFirstClientTurn
+    );
+    if (!detectedVisitorName && !sanitizedBodyVisitorName) {
+      for (let i = 0; i < clientMessagesOnly.length; i++) {
+        const found = extractVisitorNameFromMessage(
+          clientMessagesOnly[i].text,
+          i === 0
+        );
+        if (found) {
+          detectedVisitorName = found;
+          break;
+        }
+      }
+    }
+
+    let dbSessionVisitorName: string | null = null;
+    if (!detectedVisitorName && !sanitizedBodyVisitorName && auditSessionId) {
+      try {
+        const sessionLookup = await pool.query<{ lead_name: string | null }>(
+          'SELECT lead_name FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+          [auditSessionId]
+        );
+        const existingName = sessionLookup.rows[0]?.lead_name?.trim();
+        if (existingName && existingName.length >= 2) {
+          dbSessionVisitorName = existingName.slice(0, 80);
+        }
+      } catch {
+        // Ignore lookup errors so chat never blocks
+      }
+    }
+
+    const resolvedVisitorName =
+      detectedVisitorName || sanitizedBodyVisitorName || dbSessionVisitorName;
+    const visitorNameForClientMeta = detectedVisitorName || dbSessionVisitorName;
+
+    const visitorContextLine = resolvedVisitorName
+      ? `\nNome já cadastrado do cliente nesta conversa: **${resolvedVisitorName}** (trate-o de forma cordial pelo primeiro nome e NÃO pergunte novamente como ele se chama).`
+      : '';
+
     const systemInstruction = `Você é o Consultor Oficial da revenda "${dealership}" (${s?.address || 'Av. Ibirapuera, 2.840 — Moema'}, ${s?.city || 'São Paulo'}/${s?.state || 'SP'}).
 Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursSaturday || '09:00 às 16:00'} | WhatsApp: ${s?.whatsapp || '(11) 99482-1040'}.
 
@@ -2234,11 +2444,14 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 - ARGUMENTAÇÃO COMERCIAL COM TABELA FIPE: Sempre que o contexto trouxer o valor oficial da **Tabela FIPE** (ou consulta ao vivo por código FIPE), use essa referência para valorizar o negócio de forma transparente — destacando o preço FIPE, o **percentual de desconto** e a **economia em reais** quando o veículo estiver abaixo da tabela, ou justificando o valor de mercado pela baixa quilometragem, laudo cautelar e pacote de opcionais.
 - Quando pertinente, destaque que aceitamos veículo usado na troca (mediante avaliação presencial) e trabalhamos com financiamento bancário e carta de crédito contemplada.
 
-3. CHAMADA PARA AÇÃO (CTA) ATIVA:
-- Toda resposta sobre veículos ou estoque DEVE terminar com uma linha separada convidando o cliente a avançar na negociação (ex.: solicitar simulação de financiamento, informar apenas nome e WhatsApp no formulário de atendimento para receber o laudo cautelar completo, ou agendar visita/test-drive no showroom).
+3. IDENTIFICAÇÃO LEVE, VISITANTE RECORRENTE E MOMENTO COMERCIAL (SEM ATRITO):
+- Quando o nome do cliente já estiver informado no contexto (seja por cadastro anterior ou por esta conversa), trate-o naturalmente pelo primeiro nome e NUNCA peça o nome novamente.
+- Quando o cliente informar o nome (ex.: "Lucas", "Me chamo Mariana", "Sou o Pedro, quero simular"), cumprimente-o e passe a chamá-lo naturalmente pelo primeiro nome nas respostas seguintes. Se ele já trouxe uma dúvida junto com o nome, responda imediatamente ao pedido sem repetir perguntas desnecessárias. Se ele respondeu apenas com o nome, dê boas-vindas calorosas pelo nome e pergunte como pode ajudar (ex.: estoque, simulação ou avaliação de troca).
+- Se o cliente for direto à pergunta sem informar o nome, responda normalmente sem insistir ou criar barreiras.
+- Convide o cliente a deixar o **WhatsApp** (com consentimento explícito LGPD no botão "Simulação / Contato") apenas quando avançar para etapas comerciais que exijam envio externo ou agendamento (ex.: simulação detalhada de financiamento, avaliação de troca, envio de laudo cautelar completo ou agendamento de visita/test-drive).
 
 4. MINIMIZAÇÃO DE DADOS E PRIVACIDADE (LGPD):
-- Solicite APENAS os dados estritamente necessários para o atendimento inicial: **Nome** e **WhatsApp**.
+- Solicite APENAS os dados estritamente necessários para o atendimento comercial: **Nome** e **WhatsApp**.
 - É PROIBIDO solicitar CPF, RG, CNH, endereço residencial, comprovante de renda, dados bancários ou número de cartão pelo chat.
 - Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente, NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.
 
@@ -2246,7 +2459,7 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 - Quando a última mensagem do cliente vier de uma transcrição de áudio, responda normalmente ao pedido com base no estoque real e nas diretrizes comerciais acima.
 - Se a transcrição do áudio estiver cortada, fragmentada, sem sentido ou ambígua a ponto de não ser possível entender com segurança o que o cliente pediu, NÃO chute nem invente respostas: peça de forma direta e cordial para o cliente **enviar o áudio novamente** ou **escrever a mensagem por texto**.`;
 
-    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
+    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}${visitorContextLine}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, cordial e em tópicos Markdown quando apropriado.`;
 
     const chatConfig = {
       thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
@@ -2254,8 +2467,6 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       systemInstruction,
     };
 
-    const auditSessionId = sanitizeSessionId(body.sessionId);
-    const auditOrigin = sanitizeOrigin(body.origem);
     if (auditSessionId) {
       const storedUserContent =
         lastUserMessageRaw.trim() ||
@@ -2275,6 +2486,13 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
           transcription: audioTranscription,
         }
       );
+      if (resolvedVisitorName) {
+        await updateChatSessionVisitorName(
+          auditSessionId,
+          resolvedVisitorName,
+          auditOrigin
+        );
+      }
     }
 
     const wantsStream =
@@ -2321,6 +2539,7 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       res.json({
         reply,
         ...(audioTranscription ? { transcription: audioTranscription } : {}),
+        ...(visitorNameForClientMeta ? { visitorName: visitorNameForClientMeta } : {}),
       });
       return;
     }
@@ -2356,9 +2575,13 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
 
-    if (audioTranscription) {
+    if (audioTranscription || visitorNameForClientMeta) {
       res.write(
-        `data: ${JSON.stringify({ type: 'meta', transcription: audioTranscription })}\n\n`
+        `data: ${JSON.stringify({
+          type: 'meta',
+          ...(audioTranscription ? { transcription: audioTranscription } : {}),
+          ...(visitorNameForClientMeta ? { visitorName: visitorNameForClientMeta } : {}),
+        })}\n\n`
       );
     }
 

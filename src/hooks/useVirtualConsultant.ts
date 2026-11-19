@@ -51,9 +51,138 @@ function createWelcomeMessage(tradeName: string): ChatMessage {
     sender: 'ia',
     text: `Olá! Sou o **Consultor Oficial** da **${tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
 
-Como posso ajudar você hoje? Escolha uma opção rápida abaixo ou **envie sua pergunta por texto, áudio ou foto** a qualquer momento:`,
+Antes de começarmos, **como posso te chamar?** Se preferir, já pode tocar em uma opção abaixo ou **enviar sua dúvida por texto, áudio ou foto** direto!`,
     timestamp: now,
   };
+}
+
+function getFirstName(fullName: string): string {
+  const clean = fullName.trim().replace(/\s+/g, ' ');
+  return clean.split(' ')[0] || clean;
+}
+
+function normalizeNameForComparison(name: string): string {
+  return getFirstName(name)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function createReturningWelcomeMessage(
+  tradeName: string,
+  leadName: string
+): ChatMessage {
+  const now = new Date().toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  const firstName = getFirstName(leadName);
+  return {
+    id: `msg-ia-return-welcome-${Date.now()}`,
+    sender: 'ia',
+    text: `Olá novamente, **${firstName}**! Que bom ter você de volta à **${tradeName}**.
+
+Em que posso ajudar hoje? Escolha uma opção rápida abaixo ou **envie sua dúvida por texto, áudio ou foto** direto!`,
+    timestamp: now,
+  };
+}
+
+/**
+ * Adapts restored chat history for a returning identified visitor:
+ * - Removes any previous "como posso te chamar?" prompt from the opening bubble.
+ * - Shows a single personalized returning-visitor greeting with the Quick Menu
+ *   alongside the preserved conversation history (never duplicating on repeated reloads).
+ */
+function personalizeRestoredHistory(
+  history: ChatMessage[],
+  tradeName: string,
+  leadName: string
+): ChatMessage[] {
+  const cleanLead = leadName.trim();
+  if (!cleanLead || history.length === 0) return history;
+
+  const firstName = getFirstName(cleanLead);
+  const returningBubble = createReturningWelcomeMessage(tradeName, cleanLead);
+
+  // Only a welcome bubble existed so far -> replace with personalized returning greeting
+  if (
+    history.length === 1 &&
+    history[0].sender === 'ia' &&
+    (history[0].id.startsWith('msg-ia-welcome') ||
+      history[0].id.startsWith('msg-ia-return-welcome'))
+  ) {
+    return [returningBubble];
+  }
+
+  const updated = history.map((msg, idx) => {
+    if (
+      idx === 0 &&
+      msg.sender === 'ia' &&
+      msg.id.startsWith('msg-ia-welcome') &&
+      msg.text.toLowerCase().includes('como posso te chamar')
+    ) {
+      return {
+        ...msg,
+        text: `Olá, **${firstName}**! Sou o **Consultor Oficial** da **${tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.`,
+      };
+    }
+    return msg;
+  });
+
+  const lastMsg = updated[updated.length - 1];
+  if (lastMsg && lastMsg.id.startsWith('msg-ia-return-welcome')) {
+    updated[updated.length - 1] = {
+      ...returningBubble,
+      id: lastMsg.id,
+    };
+    return updated;
+  }
+
+  return [...updated, returningBubble];
+}
+
+const SWITCH_NAME_BLOCKLIST = new Set([
+  'cliente', 'visitante', 'interessado', 'interessada', 'carro', 'carros',
+  'veiculo', 'veículo', 'estoque', 'financiamento', 'troca', 'visita',
+  'simular', 'quero', 'preciso', 'gostaria', 'obrigado', 'obrigada',
+]);
+
+/**
+ * Detects when a visitor explicitly introduces a DIFFERENT person's name
+ * (e.g., "Me chamo Camila" while browser was linked to "Pedro") so we isolate
+ * the session and never mix conversations of different people.
+ */
+function detectExplicitDifferentUserName(
+  text: string,
+  currentName: string
+): string | null {
+  const currentNorm = normalizeNameForComparison(currentName);
+  if (!currentNorm || !text.trim()) return null;
+
+  const patterns = [
+    /(?:^|[\s,!.;-])(?:me\s+chamo|meu\s+nome\s+(?:é|e)|pode\s+me\s+chamar\s+de|aqui\s+(?:é|e)\s+(?:o|a)|eu\s+sou\s+(?:o|a)|sou\s+(?:o|a))\s+([A-Za-zÀ-ÿ]{2,20}(?:\s+[A-Za-zÀ-ÿ]{2,20})?)(?=$|[\s,!.;?:-]|(?:\s+(?:e|quero|gostaria|preciso|tenho|estou|tô|to|vim|queria|tudo|bom|boa|sobre|qual|quais|quanto|vocês|voces|vcs|pode|por|para)\b))/i,
+  ];
+
+  for (const rx of patterns) {
+    const match = text.match(rx);
+    if (!match?.[1]) continue;
+    const rawWords = match[1].trim().split(/\s+/).filter(Boolean);
+    const firstWord = rawWords[0];
+    if (!firstWord || firstWord.length < 2) continue;
+    const firstLower = firstWord.toLowerCase();
+    if (SWITCH_NAME_BLOCKLIST.has(firstLower)) continue;
+
+    const candidateNorm = normalizeNameForComparison(firstWord);
+    if (candidateNorm && candidateNorm !== currentNorm) {
+      const formatted = rawWords
+        .slice(0, 2)
+        .filter((w) => !SWITCH_NAME_BLOCKLIST.has(w.toLowerCase()))
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ');
+      if (formatted) return formatted;
+    }
+  }
+  return null;
 }
 
 /**
@@ -110,6 +239,7 @@ export function useVirtualConsultant({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const lastTriggerRef = useRef<string | null>(null);
   const persistedLeadIdRef = useRef<string | null>(null);
+  const customerNameRef = useRef<string>('');
   const abortControllerRef = useRef<AbortController | null>(null);
   const sessionIdRef = useRef<string>(createChatSessionId());
   const storageReadyRef = useRef<boolean>(false);
@@ -119,6 +249,10 @@ export function useVirtualConsultant({
   useEffect(() => {
     persistedLeadIdRef.current = persistedLeadId;
   }, [persistedLeadId]);
+
+  useEffect(() => {
+    customerNameRef.current = customerName;
+  }, [customerName]);
 
   useEffect(() => {
     if (!active) {
@@ -189,6 +323,9 @@ export function useVirtualConsultant({
             stream: true,
             sessionId: sessionIdRef.current,
             origem: originLabel,
+            ...(customerNameRef.current.trim()
+              ? { visitorName: customerNameRef.current.trim() }
+              : {}),
             messages: nextMessages.map((m) => ({
               sender: m.sender,
               text:
@@ -295,9 +432,15 @@ export function useVirtualConsultant({
           const data = (await response.json()) as {
             reply: string;
             transcription?: string;
+            visitorName?: string;
           };
           if (data.transcription) {
             applyTranscriptionToUserMsg(data.transcription);
+          }
+          if (data.visitorName?.trim() && !customerNameRef.current.trim()) {
+            const cleanName = data.visitorName.trim();
+            customerNameRef.current = cleanName;
+            setCustomerName(cleanName);
           }
           const aiMsg: ChatMessage = {
             id: aiMsgId,
@@ -360,11 +503,22 @@ export function useVirtualConsultant({
                 text?: string;
                 reply?: string;
                 transcription?: string;
+                visitorName?: string;
                 error?: string;
               };
 
-              if (parsed.type === 'meta' && parsed.transcription) {
-                applyTranscriptionToUserMsg(parsed.transcription);
+              if (parsed.type === 'meta') {
+                if (parsed.transcription) {
+                  applyTranscriptionToUserMsg(parsed.transcription);
+                }
+                if (
+                  parsed.visitorName?.trim() &&
+                  !customerNameRef.current.trim()
+                ) {
+                  const cleanName = parsed.visitorName.trim();
+                  customerNameRef.current = cleanName;
+                  setCustomerName(cleanName);
+                }
               } else if (parsed.type === 'chunk' && parsed.text) {
                 accumulatedText += parsed.text;
                 upsertStreamingMessage(accumulatedText);
@@ -472,26 +626,45 @@ export function useVirtualConsultant({
 
     if (persistStorageKey) {
       const savedSync = loadLocalChatStateSync(persistStorageKey);
+      let activeSessionId: string;
+      let initialKnownName = '';
+
       if (savedSync && savedSync.messages.length > 0) {
+        activeSessionId = savedSync.sessionId;
         sessionIdRef.current = savedSync.sessionId;
-        setMessages(savedSync.messages);
+        initialKnownName = (savedSync.customerName || '').trim();
+
+        const restoredMessages = initialKnownName
+          ? personalizeRestoredHistory(
+              savedSync.messages,
+              settings.tradeName,
+              initialKnownName
+            )
+          : savedSync.messages;
+
+        setMessages(restoredMessages);
         setLeadSaved(Boolean(savedSync.leadSaved));
         setPersistedLeadId(savedSync.persistedLeadId ?? null);
         persistedLeadIdRef.current = savedSync.persistedLeadId ?? null;
-        setCustomerName(savedSync.customerName || '');
+        customerNameRef.current = initialKnownName;
+        setCustomerName(initialKnownName);
         setCustomerWhatsapp(savedSync.customerWhatsapp || '');
         setLeadSaveError(null);
         setReplyingTo(null);
         setErrorMsg(null);
         storageReadyRef.current = true;
       } else {
-        sessionIdRef.current = createChatSessionId();
+        activeSessionId = createChatSessionId();
+        sessionIdRef.current = activeSessionId;
         setLeadSaved(false);
         setLeadSaveError(null);
         setLgpdConsent(false);
         setPersistedLeadId(null);
         setReplyingTo(null);
         persistedLeadIdRef.current = null;
+        customerNameRef.current = '';
+        setCustomerName('');
+        setCustomerWhatsapp('');
         setErrorMsg(null);
         setMessages([createWelcomeMessage(settings.tradeName)]);
         storageReadyRef.current = true;
@@ -507,23 +680,90 @@ export function useVirtualConsultant({
         ) {
           return;
         }
+        const resolvedName = (
+          customerNameRef.current ||
+          savedAsync.customerName ||
+          ''
+        ).trim();
+
         if (savedSync) {
           if (
             savedAsync.sessionId === savedSync.sessionId &&
             savedAsync.messages.length >= savedSync.messages.length
           ) {
-            setMessages(savedAsync.messages);
+            const hydrated = resolvedName
+              ? personalizeRestoredHistory(
+                  savedAsync.messages,
+                  settings.tradeName,
+                  resolvedName
+                )
+              : savedAsync.messages;
+            setMessages(hydrated);
+            if (resolvedName && !customerNameRef.current) {
+              customerNameRef.current = resolvedName;
+              setCustomerName(resolvedName);
+            }
           }
         } else {
           sessionIdRef.current = savedAsync.sessionId;
-          setMessages(savedAsync.messages);
+          const hydrated = resolvedName
+            ? personalizeRestoredHistory(
+                savedAsync.messages,
+                settings.tradeName,
+                resolvedName
+              )
+            : savedAsync.messages;
+          setMessages(hydrated);
           setLeadSaved(Boolean(savedAsync.leadSaved));
           setPersistedLeadId(savedAsync.persistedLeadId ?? null);
           persistedLeadIdRef.current = savedAsync.persistedLeadId ?? null;
-          setCustomerName(savedAsync.customerName || '');
+          customerNameRef.current = resolvedName;
+          setCustomerName(resolvedName);
           setCustomerWhatsapp(savedAsync.customerWhatsapp || '');
         }
       });
+
+      // Sync persisted session identity (lead_name / lead_phone) from Neon chat_sessions
+      if (savedSync?.sessionId) {
+        void fetch(
+          `/api/public/chat-session/${encodeURIComponent(savedSync.sessionId)}`
+        )
+          .then((res) => (res.ok ? res.json() : null))
+          .then(
+            (
+              data: {
+                found?: boolean;
+                leadName?: string | null;
+                leadPhone?: string | null;
+              } | null
+            ) => {
+              if (
+                !data ||
+                !data.found ||
+                storageVersionRef.current !== hydrationVersion ||
+                userMutatedRef.current
+              ) {
+                return;
+              }
+              const serverName = data.leadName?.trim() || '';
+              const serverPhone = data.leadPhone?.trim() || '';
+              if (serverName && !customerNameRef.current.trim()) {
+                customerNameRef.current = serverName;
+                setCustomerName(serverName);
+                setMessages((prev) =>
+                  personalizeRestoredHistory(prev, settings.tradeName, serverName)
+                );
+              }
+              if (serverPhone) {
+                setCustomerWhatsapp((prev) => prev || serverPhone);
+                setLeadSaved(true);
+              }
+            }
+          )
+          .catch(() => {
+            // Silent fallback when offline or unavailable
+          });
+      }
       return;
     }
 
@@ -630,7 +870,47 @@ export function useVirtualConsultant({
         ...(payload.attachment ? { attachment: payload.attachment } : {}),
       };
 
-      const nextMessages = [...messages, userMsg];
+      // If another person explicitly introduces a different name in the same browser,
+      // clear the previous identity link and isolate into a brand-new session_id.
+      const switchedUserName =
+        persistStorageKey && !targetVehicle && trimmedText
+          ? detectExplicitDifferentUserName(trimmedText, customerNameRef.current)
+          : null;
+
+      let nextMessages: ChatMessage[];
+      let effectiveCustomerName = customerNameRef.current;
+      let effectiveLeadSaved = leadSaved;
+      let effectivePersistedLeadId = persistedLeadIdRef.current;
+      let effectiveCustomerWhatsapp = customerWhatsapp;
+
+      if (switchedUserName) {
+        if (persistStorageKey) {
+          clearLocalChatState(persistStorageKey);
+        }
+        storageVersionRef.current += 1;
+        sessionIdRef.current = createChatSessionId();
+        effectiveCustomerName = switchedUserName;
+        effectiveLeadSaved = false;
+        effectivePersistedLeadId = null;
+        effectiveCustomerWhatsapp = '';
+
+        customerNameRef.current = switchedUserName;
+        persistedLeadIdRef.current = null;
+        setCustomerName(switchedUserName);
+        setCustomerWhatsapp('');
+        setLeadSaved(false);
+        setLeadSaveError(null);
+        setLgpdConsent(false);
+        setPersistedLeadId(null);
+
+        nextMessages = [
+          createWelcomeMessage(settings.tradeName),
+          { ...userMsg, replyTo: undefined },
+        ];
+      } else {
+        nextMessages = [...messages, userMsg];
+      }
+
       userMutatedRef.current = true;
       setMessages(nextMessages);
       setInput('');
@@ -641,30 +921,29 @@ export function useVirtualConsultant({
           version: 1,
           sessionId: sessionIdRef.current,
           messages: nextMessages,
-          leadSaved,
-          persistedLeadId: persistedLeadIdRef.current,
-          customerName,
-          customerWhatsapp,
+          leadSaved: effectiveLeadSaved,
+          persistedLeadId: effectivePersistedLeadId,
+          customerName: effectiveCustomerName,
+          customerWhatsapp: effectiveCustomerWhatsapp,
           updatedAt: Date.now(),
         });
       }
 
-      if (persistedLeadIdRef.current && onSyncLeadChat) {
+      if (effectivePersistedLeadId && onSyncLeadChat) {
         void onSyncLeadChat(
-          persistedLeadIdRef.current,
+          effectivePersistedLeadId,
           buildLightweightLeadHistory(nextMessages)
         );
       }
 
       void sendMessageToAi(nextMessages, targetVehicle, {
         userMessageId: userMsgId,
-        replyTo: effectiveReply ?? null,
+        replyTo: switchedUserName ? null : (effectiveReply ?? null),
         audio: payload.audio ?? null,
         attachment: payload.attachment ?? null,
       });
     },
     [
-      customerName,
       customerWhatsapp,
       isSending,
       leadSaved,
@@ -673,6 +952,7 @@ export function useVirtualConsultant({
       persistStorageKey,
       replyingTo,
       sendMessageToAi,
+      settings.tradeName,
       targetVehicle,
     ]
   );

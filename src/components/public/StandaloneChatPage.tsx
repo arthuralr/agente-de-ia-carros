@@ -855,7 +855,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 </button>
 
                 {headerMenuOpen && (
-                  <div className="absolute right-0 top-[46px] z-40 w-52 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
+                  <div className="absolute right-0 top-[46px] z-40 w-56 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
                     <button
                       type="button"
                       onClick={() => {
@@ -865,7 +865,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                       className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors"
                     >
                       <RotateCcw className="w-3.5 h-3.5 text-[#54656F] shrink-0" />
-                      <span>Nova conversa / Limpar</span>
+                      <span>Nova conversa / Trocar usuário</span>
                     </button>
                   </div>
                 )}
@@ -913,14 +913,32 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </p>
             </div>
 
-            {messages.map((msg, index) => {
-              const isAi = msg.sender === 'ia';
-              const isWelcomeBubble =
-                index === 0 && isAi && msg.id.startsWith('msg-ia-welcome');
-              const isImageAttachment =
-                msg.attachment?.mimeType.startsWith('image/');
-              const isPdfAttachment =
-                msg.attachment?.mimeType === 'application/pdf';
+            {(() => {
+              let activeMenuBubbleIdx = -1;
+              for (let i = messages.length - 1; i >= 0; i--) {
+                const candidate = messages[i];
+                if (
+                  candidate.sender === 'ia' &&
+                  candidate.id.startsWith('msg-ia-return-welcome')
+                ) {
+                  activeMenuBubbleIdx = i;
+                  break;
+                }
+              }
+              if (
+                activeMenuBubbleIdx === -1 &&
+                messages[0]?.sender === 'ia' &&
+                messages[0].id.startsWith('msg-ia-welcome')
+              ) {
+                activeMenuBubbleIdx = 0;
+              }
+              return messages.map((msg, index) => {
+                const isAi = msg.sender === 'ia';
+                const isWelcomeBubble = index === activeMenuBubbleIdx;
+                const isImageAttachment =
+                  msg.attachment?.mimeType.startsWith('image/');
+                const isPdfAttachment =
+                  msg.attachment?.mimeType === 'application/pdf';
 
               return (
                 <div key={msg.id} className="space-y-2">
@@ -1223,7 +1241,8 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                   )}
                 </div>
               );
-            })}
+            });
+            })()}
 
             {isSending && !hasStreamFirstToken && (
               <div className="flex justify-start">
@@ -1634,11 +1653,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
           >
             <div className="space-y-1.5">
               <h2 className="font-display text-base font-semibold text-[#111B21]">
-                Iniciar nova conversa?
+                Nova conversa / Trocar usuário?
               </h2>
               <p className="text-xs text-[#54656F] leading-relaxed">
-                O histórico salvo neste navegador será apagado e um novo
-                atendimento limpo será iniciado.
+                O histórico e a identificação salvos neste navegador serão
+                removidos e uma nova sessão limpa será iniciada.
               </p>
             </div>
             <div className="flex items-center justify-end gap-2 pt-1">
@@ -1654,7 +1673,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 onClick={handleConfirmClearConversation}
                 className="min-h-[40px] px-4 rounded-xl text-xs font-semibold text-white bg-[#00A884] hover:bg-[#008F72] transition-colors"
               >
-                Limpar conversa
+                Iniciar nova conversa
               </button>
             </div>
           </div>
