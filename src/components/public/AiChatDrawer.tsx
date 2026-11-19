@@ -68,6 +68,7 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
     targetVehicle,
     vehicles,
     settings,
+    originLabel: 'Vitrine',
     leadSourceLabel: 'Chat IA do Site',
     leadNote: 'Lead capturado pelo botão Tenho Interesse na vitrine pública.',
     onCaptureLead,

@@ -6,6 +6,8 @@ import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { pool, verifyDatabaseConnection } from './src/db/pool';
 import {
+  DbChatMessageRow,
+  DbChatSessionRow,
   DbContractRow,
   DbLeadRow,
   DbVehicleRow,
@@ -62,6 +64,8 @@ interface GeneratePostBody {
 }
 
 interface ChatRequestBody {
+  sessionId?: string;
+  origem?: string;
   messages: { sender: 'ia' | 'cliente'; text: string }[];
   vehicle?: {
     brand: string;
@@ -89,6 +93,85 @@ interface ChatRequestBody {
     hoursSaturday: string;
     aiAssistantName: string;
   };
+}
+
+type OperationMode = 'full' | 'agent_only';
+
+function sanitizeSessionId(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim().slice(0, 120);
+  if (!trimmed) return null;
+  return trimmed;
+}
+
+function sanitizeOrigin(raw: unknown): string {
+  if (typeof raw !== 'string') return '/chat';
+  const trimmed = raw.trim().slice(0, 60);
+  return trimmed || '/chat';
+}
+
+async function recordChatAuditTurn(
+  sessionId: string | null,
+  origem: string,
+  sender: 'user' | 'assistant',
+  content: string
+): Promise<void> {
+  if (!sessionId || !content.trim()) return;
+  try {
+    await pool.query(
+      `INSERT INTO chat_sessions (session_id, origem, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (session_id)
+       DO UPDATE SET updated_at = NOW()`,
+      [sessionId, origem]
+    );
+    await pool.query(
+      `INSERT INTO chat_messages (session_id, sender, content, created_at)
+       VALUES ($1, $2, $3, NOW())`,
+      [sessionId, sender, content.trim()]
+    );
+  } catch (err) {
+    console.error('[Chat Audit Log Error]', err);
+  }
+}
+
+async function attachLeadToChatSession(
+  sessionId: string | null,
+  leadName: string,
+  leadPhone: string,
+  origem: string
+): Promise<void> {
+  if (!sessionId) return;
+  try {
+    await pool.query(
+      `INSERT INTO chat_sessions (session_id, lead_name, lead_phone, origem, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       ON CONFLICT (session_id)
+       DO UPDATE SET lead_name = EXCLUDED.lead_name,
+                     lead_phone = EXCLUDED.lead_phone,
+                     updated_at = NOW()`,
+      [sessionId, leadName, leadPhone, origem]
+    );
+  } catch (err) {
+    console.error('[Chat Audit Lead Attach Error]', err);
+  }
+}
+
+async function getPersistedOperationMode(): Promise<OperationMode> {
+  const envDefault: OperationMode =
+    process.env.OPERATION_MODE === 'agent_only' ? 'agent_only' : 'full';
+  try {
+    const res = await pool.query<{ value: string }>(
+      "SELECT value FROM app_settings WHERE key = 'operation_mode' LIMIT 1"
+    );
+    const val = res.rows[0]?.value?.trim();
+    if (val === 'agent_only' || val === 'full') {
+      return val;
+    }
+    return envDefault;
+  } catch {
+    return envDefault;
+  }
 }
 
 interface BrasilApiFipeRawItem {
@@ -576,9 +659,171 @@ app.get('/api/public/vehicles', async (_req, res) => {
   }
 });
 
+app.get('/api/public/config', async (_req, res) => {
+  try {
+    const operationMode = await getPersistedOperationMode();
+    res.json({ operationMode });
+  } catch {
+    const fallback: OperationMode =
+      process.env.OPERATION_MODE === 'agent_only' ? 'agent_only' : 'full';
+    res.json({ operationMode: fallback });
+  }
+});
+
+app.patch('/api/admin/settings/operation-mode', requireAdminAuth, async (req, res) => {
+  try {
+    const requested =
+      typeof req.body?.operationMode === 'string'
+        ? req.body.operationMode.trim()
+        : '';
+    if (requested !== 'full' && requested !== 'agent_only') {
+      res.status(400).json({
+        error: "Modo de operação inválido. Utilize 'full' ou 'agent_only'.",
+      });
+      return;
+    }
+
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ('operation_mode', $1, NOW())
+       ON CONFLICT (key)
+       DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [requested]
+    );
+
+    res.json({ operationMode: requested });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao salvar modo de operação no banco.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
+  try {
+    const result = await pool.query<DbChatSessionRow>(
+      `SELECT
+         s.id,
+         s.session_id,
+         s.lead_name,
+         s.lead_phone,
+         s.origem,
+         s.created_at,
+         s.updated_at,
+         COALESCE(m_agg.message_count, 0)::int AS message_count,
+         m_last.content AS last_message,
+         m_last.sender AS last_sender
+       FROM chat_sessions s
+       LEFT JOIN (
+         SELECT session_id, COUNT(*)::int AS message_count
+         FROM chat_messages
+         GROUP BY session_id
+       ) m_agg ON m_agg.session_id = s.session_id
+       LEFT JOIN LATERAL (
+         SELECT content, sender
+         FROM chat_messages
+         WHERE session_id = s.session_id
+         ORDER BY id DESC
+         LIMIT 1
+       ) m_last ON true
+       ORDER BY s.updated_at DESC, s.id DESC
+       LIMIT 200`
+    );
+
+    res.json(
+      result.rows.map((row) => ({
+        id: row.id,
+        sessionId: row.session_id,
+        leadName: row.lead_name,
+        leadPhone: row.lead_phone,
+        origem: row.origem,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        messageCount: Number(row.message_count) || 0,
+        lastMessage: row.last_message ?? null,
+        lastSender: row.last_sender ?? null,
+      }))
+    );
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao listar histórico de conversas da IA.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get(
+  '/api/admin/chat-sessions/:sessionId/messages',
+  requireAdminAuth,
+  async (req, res) => {
+    const sessionId = sanitizeSessionId(req.params.sessionId);
+    if (!sessionId) {
+      res.status(400).json({ error: 'Identificador de sessão inválido.' });
+      return;
+    }
+
+    try {
+      const sessionRes = await pool.query<DbChatSessionRow>(
+        'SELECT * FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+        [sessionId]
+      );
+
+      if (sessionRes.rowCount === 0) {
+        res.status(404).json({ error: 'Sessão de conversa não encontrada.' });
+        return;
+      }
+
+      const msgRes = await pool.query<DbChatMessageRow>(
+        `SELECT id, session_id, sender, content, created_at
+         FROM chat_messages
+         WHERE session_id = $1
+         ORDER BY id ASC`,
+        [sessionId]
+      );
+
+      const s = sessionRes.rows[0];
+      res.json({
+        session: {
+          id: s.id,
+          sessionId: s.session_id,
+          leadName: s.lead_name,
+          leadPhone: s.lead_phone,
+          origem: s.origem,
+          createdAt: s.created_at,
+          updatedAt: s.updated_at,
+        },
+        messages: msgRes.rows.map((m) => ({
+          id: m.id,
+          sessionId: m.session_id,
+          sender: m.sender,
+          content: m.content,
+          createdAt: m.created_at,
+        })),
+      });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Erro ao carregar mensagens da sessão.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
 app.post('/api/public/leads', async (req, res) => {
   try {
-    const { name, phone, vehicle_interest, chat_history, lgpd_consent } = req.body;
+    const {
+      name,
+      phone,
+      vehicle_interest,
+      chat_history,
+      lgpd_consent,
+      session_id,
+      origem,
+    } = req.body;
     const cleanName = typeof name === 'string' ? name.trim() : '';
     const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
 
@@ -608,6 +853,16 @@ app.post('/api/public/leads', async (req, res) => {
           : JSON.stringify(chat_history || []),
       ]
     );
+
+    const safeSessionId = sanitizeSessionId(session_id);
+    if (safeSessionId) {
+      await attachLeadToChatSession(
+        safeSessionId,
+        cleanName,
+        cleanPhone,
+        sanitizeOrigin(origem)
+      );
+    }
 
     const created = result.rows[0];
     const chatToken = signPublicLeadChatToken(created.id);
@@ -1401,6 +1656,12 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 
     const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
 
+    const auditSessionId = sanitizeSessionId(body.sessionId);
+    const auditOrigin = sanitizeOrigin(body.origem);
+    if (auditSessionId && lastUserMessage) {
+      await recordChatAuditTurn(auditSessionId, auditOrigin, 'user', lastUserMessage);
+    }
+
     const wantsStream =
       (req.body as { stream?: boolean }).stream !== false &&
       (req.headers.accept?.includes('text/event-stream') ||
@@ -1419,6 +1680,10 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       if (!reply) {
         res.status(502).json({ error: 'O assistente não retornou uma resposta válida.' });
         return;
+      }
+
+      if (auditSessionId) {
+        await recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', reply);
       }
 
       res.json({ reply });
@@ -1465,9 +1730,14 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
             })}\n\n`
           );
         } else {
+          if (auditSessionId) {
+            void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', trimmed);
+          }
           res.write(`data: ${JSON.stringify({ type: 'done', reply: trimmed })}\n\n`);
         }
         res.end();
+      } else if (auditSessionId && fullText.trim()) {
+        void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', fullText.trim());
       }
     } catch (streamErr: unknown) {
       const formatted = formatGeminiError(streamErr);

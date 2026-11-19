@@ -8,10 +8,13 @@ export interface AdminUser {
   avatarUrl: string | null;
 }
 
+export type OperationMode = 'full' | 'agent_only';
+
 export type NavModule =
   | 'dashboard'
   | 'inventory'
   | 'crm'
+  | 'chat_audit'
   | 'contracts'
   | 'social_ai'
   | 'settings';
@@ -94,7 +97,29 @@ export interface Lead {
   notes: string;
   lgpdConsent?: boolean;
   lgpdConsentAt?: string;
+  chatSessionId?: string;
   chatHistory: ChatMessage[];
+}
+
+export interface ChatSessionSummary {
+  id: number;
+  sessionId: string;
+  leadName: string | null;
+  leadPhone: string | null;
+  origem: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  lastMessage: string | null;
+  lastSender: 'user' | 'assistant' | null;
+}
+
+export interface ChatAuditMessage {
+  id: number;
+  sessionId: string;
+  sender: 'user' | 'assistant';
+  content: string;
+  createdAt: string;
 }
 
 export type DocumentType = 'contrato' | 'recibo' | 'vistoria' | 'garantia';

@@ -1,19 +1,64 @@
-import React, { useState } from 'react';
-import { Check, RotateCcw, Save } from 'lucide-react';
-import { DealershipSettings } from '../../types';
+import React, { useEffect, useState } from 'react';
+import {
+  AlertCircle,
+  Check,
+  LayoutGrid,
+  Loader2,
+  MessageCircle,
+  RotateCcw,
+  Save,
+} from 'lucide-react';
+import { DealershipSettings, OperationMode } from '../../types';
 import { INITIAL_SETTINGS } from '../../data/mockData';
 
 interface SettingsModuleProps {
   settings: DealershipSettings;
+  operationMode: OperationMode;
+  onChangeOperationMode: (mode: OperationMode) => Promise<void>;
   onSaveSettings: (next: DealershipSettings) => void;
 }
 
 export const SettingsModule: React.FC<SettingsModuleProps> = ({
   settings,
+  operationMode,
+  onChangeOperationMode,
   onSaveSettings,
 }) => {
   const [form, setForm] = useState<DealershipSettings>(settings);
+  const [selectedMode, setSelectedMode] = useState<OperationMode>(operationMode);
+  const [savingMode, setSavingMode] = useState(false);
+  const [modeSavedNotice, setModeSavedNotice] = useState(false);
+  const [modeError, setModeError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState(false);
+
+  useEffect(() => {
+    setSelectedMode(operationMode);
+  }, [operationMode]);
+
+  const handleModeSelect = async (nextMode: OperationMode) => {
+    if (nextMode === operationMode && !modeError) {
+      setSelectedMode(nextMode);
+      return;
+    }
+    setSelectedMode(nextMode);
+    setSavingMode(true);
+    setModeError(null);
+    setModeSavedNotice(false);
+    try {
+      await onChangeOperationMode(nextMode);
+      setModeSavedNotice(true);
+      setTimeout(() => setModeSavedNotice(false), 3000);
+    } catch (err: unknown) {
+      setSelectedMode(operationMode);
+      setModeError(
+        err instanceof Error
+          ? err.message
+          : 'Erro ao atualizar modo de operação no banco Neon.'
+      );
+    } finally {
+      setSavingMode(false);
+    }
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -31,6 +76,91 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
 
   return (
     <form onSubmit={handleSubmit} className="max-w-4xl space-y-6">
+      {/* Dual Operation Mode (Persisted in Neon PostgreSQL) */}
+      <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="font-display text-base font-semibold text-white">
+              Modo de Operação da Plataforma
+            </h2>
+            <p className="text-xs text-zinc-400 mt-0.5">
+              Defina como a rota principal (<span className="font-mono text-zinc-300">/</span>) se
+              comporta para visitantes públicos. A alteração é salva imediatamente no banco Neon.
+            </p>
+          </div>
+
+          {savingMode && (
+            <span className="inline-flex items-center gap-1.5 text-xs text-zinc-300">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-red-500" />
+              <span>Salvando modo...</span>
+            </span>
+          )}
+          {!savingMode && modeSavedNotice && (
+            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400">
+              <Check className="w-4 h-4" />
+              <span>Modo atualizado</span>
+            </span>
+          )}
+        </div>
+
+        {modeError && (
+          <div className="p-3 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center gap-2 text-xs text-red-200">
+            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>{modeError}</span>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <button
+            type="button"
+            disabled={savingMode}
+            onClick={() => void handleModeSelect('full')}
+            className={`text-left p-4 rounded-xl border transition-colors ${
+              selectedMode === 'full'
+                ? 'bg-red-600/12 border-red-600/50'
+                : 'bg-[#09090B] border-white/[0.08] hover:border-white/[0.18]'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-2 text-sm font-semibold text-white">
+                <LayoutGrid className="w-4 h-4 text-red-500" />
+                <span>Modo Completo (Vitrine + IA)</span>
+              </span>
+              <span className="text-[11px] font-mono text-zinc-400">full</span>
+            </div>
+            <p className="text-xs text-zinc-400 mt-2 leading-relaxed">
+              A rota raiz <span className="font-mono text-zinc-300">/</span> exibe a Vitrine de
+              Veículos normalmente e a página <span className="font-mono text-zinc-300">/chat</span>{' '}
+              mantém o botão de retorno para o catálogo.
+            </p>
+          </button>
+
+          <button
+            type="button"
+            disabled={savingMode}
+            onClick={() => void handleModeSelect('agent_only')}
+            className={`text-left p-4 rounded-xl border transition-colors ${
+              selectedMode === 'agent_only'
+                ? 'bg-emerald-600/12 border-emerald-500/50'
+                : 'bg-[#09090B] border-white/[0.08] hover:border-white/[0.18]'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-2 text-sm font-semibold text-white">
+                <MessageCircle className="w-4 h-4 text-emerald-400" />
+                <span>Apenas Agente de IA (WhatsApp)</span>
+              </span>
+              <span className="text-[11px] font-mono text-zinc-400">agent_only</span>
+            </div>
+            <p className="text-xs text-zinc-400 mt-2 leading-relaxed">
+              A rota raiz <span className="font-mono text-zinc-300">/</span> abre diretamente o
+              Consultor Virtual estilo WhatsApp em tela cheia, ocultando links para a vitrine —
+              ideal para Link na Bio do Instagram e anúncios.
+            </p>
+          </button>
+        </div>
+      </div>
+
       {/* Dealership Data */}
       <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-5">
         <div>

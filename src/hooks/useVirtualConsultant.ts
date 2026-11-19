@@ -12,10 +12,16 @@ interface UseVirtualConsultantParams {
   targetVehicle: Vehicle | null;
   vehicles: Vehicle[];
   settings: DealershipSettings;
+  originLabel?: string;
   leadSourceLabel?: Lead['source'];
   leadNote?: string;
   onCaptureLead: (lead: Lead) => Promise<Lead>;
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
+}
+
+function createChatSessionId(): string {
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `sess-${Date.now().toString(36)}-${rand}`;
 }
 
 export function useVirtualConsultant({
@@ -23,6 +29,7 @@ export function useVirtualConsultant({
   targetVehicle,
   vehicles,
   settings,
+  originLabel = 'Vitrine',
   leadSourceLabel = 'Chat IA do Site',
   leadNote = 'Lead capturado pelo Consultor Virtual de IA.',
   onCaptureLead,
@@ -46,6 +53,7 @@ export function useVirtualConsultant({
   const lastTriggerRef = useRef<string | null>(null);
   const persistedLeadIdRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const sessionIdRef = useRef<string>(createChatSessionId());
 
   useEffect(() => {
     persistedLeadIdRef.current = persistedLeadId;
@@ -93,6 +101,8 @@ export function useVirtualConsultant({
           signal: controller.signal,
           body: JSON.stringify({
             stream: true,
+            sessionId: sessionIdRef.current,
+            origem: originLabel,
             messages: nextMessages.map((m) => ({
               sender: m.sender,
               text: m.text,
@@ -248,7 +258,7 @@ export function useVirtualConsultant({
         setHasStreamFirstToken(false);
       }
     },
-    [onSyncLeadChat, settings, vehicles]
+    [onSyncLeadChat, originLabel, settings, vehicles]
   );
 
   // Initialize greeting or auto-inquiry when opened
@@ -261,6 +271,7 @@ export function useVirtualConsultant({
     }
 
     lastTriggerRef.current = triggerKey;
+    sessionIdRef.current = createChatSessionId();
     setLeadSaved(false);
     setLeadSaveError(null);
     setLgpdConsent(false);
@@ -383,6 +394,7 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
         lastActivity: 'Agora',
         notes: leadNote,
         lgpdConsent: true,
+        chatSessionId: sessionIdRef.current,
         chatHistory: messages,
       };
 

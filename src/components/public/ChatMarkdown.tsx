@@ -3,17 +3,21 @@ import React from 'react';
 interface ChatMarkdownProps {
   content: string;
   variant?: 'ai' | 'user';
+  theme?: 'dark' | 'whatsapp';
 }
 
 function renderInlineFormatting(
   text: string,
-  variant: 'ai' | 'user'
+  variant: 'ai' | 'user',
+  theme: 'dark' | 'whatsapp'
 ): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
   const tokenRegex = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   let keyIdx = 0;
+
+  const isWa = theme === 'whatsapp';
 
   while ((match = tokenRegex.exec(text)) !== null) {
     if (match.index > lastIndex) {
@@ -26,9 +30,11 @@ function renderInlineFormatting(
         <strong
           key={`b-${keyIdx++}`}
           className={
-            variant === 'ai'
-              ? 'font-semibold text-white'
-              : 'font-semibold text-white'
+            isWa
+              ? 'font-semibold text-[#111B21]'
+              : variant === 'ai'
+                ? 'font-semibold text-white'
+                : 'font-semibold text-white'
           }
         >
           {token.slice(2, -2)}
@@ -36,7 +42,10 @@ function renderInlineFormatting(
       );
     } else if (token.startsWith('*') && token.endsWith('*')) {
       nodes.push(
-        <em key={`i-${keyIdx++}`} className="italic text-zinc-100">
+        <em
+          key={`i-${keyIdx++}`}
+          className={isWa ? 'italic text-[#111B21]' : 'italic text-zinc-100'}
+        >
           {token.slice(1, -1)}
         </em>
       );
@@ -44,7 +53,11 @@ function renderInlineFormatting(
       nodes.push(
         <code
           key={`c-${keyIdx++}`}
-          className="px-1.5 py-0.5 rounded bg-black/40 font-mono text-[11px] text-zinc-100"
+          className={
+            isWa
+              ? 'px-1.5 py-0.5 rounded bg-black/[0.06] font-mono text-[12px] text-[#111B21]'
+              : 'px-1.5 py-0.5 rounded bg-black/40 font-mono text-[11px] text-zinc-100'
+          }
         >
           {token.slice(1, -1)}
         </code>
@@ -145,40 +158,60 @@ function parseMarkdownBlocks(raw: string): ParsedBlock[] {
 export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
   content,
   variant = 'ai',
+  theme = 'dark',
 }) => {
   const blocks = parseMarkdownBlocks(content);
+  const isWa = theme === 'whatsapp';
 
   if (blocks.length === 0) {
     return <span>{content}</span>;
   }
 
   return (
-    <div className="space-y-2.5 text-[13px] leading-relaxed">
+    <div
+      className={
+        isWa
+          ? 'space-y-2 text-[14px] leading-[1.45] text-[#111B21]'
+          : 'space-y-2.5 text-[13px] leading-relaxed'
+      }
+    >
       {blocks.map((block, idx) => {
         if (block.type === 'heading') {
           return (
             <p
               key={idx}
-              className="font-display font-semibold text-white text-[13px] pt-0.5"
+              className={
+                isWa
+                  ? 'font-semibold text-[#111B21] text-[14px] pt-0.5'
+                  : 'font-display font-semibold text-white text-[13px] pt-0.5'
+              }
             >
-              {renderInlineFormatting(block.text, variant)}
+              {renderInlineFormatting(block.text, variant, theme)}
             </p>
           );
         }
 
         if (block.type === 'ul') {
           return (
-            <ul key={idx} className="space-y-1.5 pl-1">
+            <ul key={idx} className="space-y-1 pl-0.5">
               {block.items.map((item, itemIdx) => (
                 <li key={itemIdx} className="flex items-start gap-2">
                   <span
                     aria-hidden="true"
                     className={`mt-2 w-1.5 h-1.5 rounded-full shrink-0 ${
-                      variant === 'ai' ? 'bg-red-500' : 'bg-white/75'
+                      isWa
+                        ? 'bg-[#008069]'
+                        : variant === 'ai'
+                          ? 'bg-red-500'
+                          : 'bg-white/75'
                     }`}
                   />
-                  <span className="flex-1 text-zinc-200">
-                    {renderInlineFormatting(item, variant)}
+                  <span
+                    className={
+                      isWa ? 'flex-1 text-[#111B21]' : 'flex-1 text-zinc-200'
+                    }
+                  >
+                    {renderInlineFormatting(item, variant, theme)}
                   </span>
                 </li>
               ))}
@@ -188,14 +221,22 @@ export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
 
         if (block.type === 'ol') {
           return (
-            <ol key={idx} className="space-y-1.5 pl-1">
+            <ol key={idx} className="space-y-1 pl-0.5">
               {block.items.map((item, itemIdx) => (
                 <li key={itemIdx} className="flex items-start gap-2">
-                  <span className="font-mono text-[11px] font-semibold text-red-400 mt-0.5 shrink-0 tabular-nums">
+                  <span
+                    className={`font-mono text-[12px] font-semibold mt-0.5 shrink-0 tabular-nums ${
+                      isWa ? 'text-[#008069]' : 'text-red-400'
+                    }`}
+                  >
                     {itemIdx + 1}.
                   </span>
-                  <span className="flex-1 text-zinc-200">
-                    {renderInlineFormatting(item, variant)}
+                  <span
+                    className={
+                      isWa ? 'flex-1 text-[#111B21]' : 'flex-1 text-zinc-200'
+                    }
+                  >
+                    {renderInlineFormatting(item, variant, theme)}
                   </span>
                 </li>
               ))}
@@ -206,12 +247,18 @@ export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
         return (
           <p
             key={idx}
-            className={variant === 'ai' ? 'text-zinc-200' : 'text-zinc-100'}
+            className={
+              isWa
+                ? 'text-[#111B21]'
+                : variant === 'ai'
+                  ? 'text-zinc-200'
+                  : 'text-zinc-100'
+            }
           >
             {block.lines.map((line, lineIdx) => (
               <React.Fragment key={lineIdx}>
                 {lineIdx > 0 && <br />}
-                {renderInlineFormatting(line, variant)}
+                {renderInlineFormatting(line, variant, theme)}
               </React.Fragment>
             ))}
           </p>

@@ -7,6 +7,7 @@ import {
   DealershipSettings,
   Lead,
   NavModule,
+  OperationMode,
   Vehicle,
 } from './types';
 import {
@@ -26,6 +27,7 @@ import { TopBar } from './components/TopBar';
 import { DashboardModule } from './components/modules/DashboardModule';
 import { InventoryModule } from './components/modules/InventoryModule';
 import { CrmModule } from './components/modules/CrmModule';
+import { ChatAuditModule } from './components/modules/ChatAuditModule';
 import { ContractsModule } from './components/modules/ContractsModule';
 import { SocialAiModule } from './components/modules/SocialAiModule';
 import { SettingsModule } from './components/modules/SettingsModule';
@@ -52,6 +54,7 @@ const MODULE_PATH_MAP: Record<NavModule, string> = {
   dashboard: '/admin/visao-geral',
   inventory: '/admin/estoque',
   crm: '/admin/crm',
+  chat_audit: '/admin/conversas',
   contracts: '/admin/contratos',
   social_ai: '/admin/ia',
   settings: '/admin/configuracoes',
@@ -81,6 +84,9 @@ function parseRouteFromPathname(pathname: string): {
       return { viewMode: 'admin', module: 'dashboard' };
     }
     if (sub === '/crm') return { viewMode: 'admin', module: 'crm' };
+    if (sub === '/conversas' || sub === '/chat-audit') {
+      return { viewMode: 'admin', module: 'chat_audit' };
+    }
     if (sub === '/contratos') return { viewMode: 'admin', module: 'contracts' };
     if (sub === '/ia' || sub === '/posts-ia') {
       return { viewMode: 'admin', module: 'social_ai' };
@@ -128,6 +134,7 @@ export default function App() {
   const [settings, setSettings] = useState<DealershipSettings>(() =>
     loadStored('armazem_settings_v1', INITIAL_SETTINGS)
   );
+  const [operationMode, setOperationMode] = useState<OperationMode>('full');
   const [activities, setActivities] = useState<ActivityLog[]>(INITIAL_ACTIVITY);
 
   // Public Chat Lead Token Store (allows public visitors to append chat turns without admin auth)
@@ -232,6 +239,18 @@ export default function App() {
 
     async function initApp() {
       void hydratePublicVehicles();
+
+      try {
+        const cfgRes = await fetch('/api/public/config');
+        if (active && cfgRes.ok) {
+          const cfg = (await cfgRes.json()) as { operationMode?: OperationMode };
+          if (cfg.operationMode === 'agent_only' || cfg.operationMode === 'full') {
+            setOperationMode(cfg.operationMode);
+          }
+        }
+      } catch {
+        // Keep default 'full' mode if offline
+      }
 
       try {
         const res = await adminFetch('/api/auth/me');
@@ -625,6 +644,8 @@ export default function App() {
         vehicle_interest: lead.vehicleInterestLabel,
         chat_history: JSON.stringify(lead.chatHistory),
         lgpd_consent: lead.lgpdConsent === true,
+        session_id: lead.chatSessionId || undefined,
+        origem: lead.notes.includes('/chat') ? '/chat' : 'Vitrine',
       }),
     });
 
@@ -728,23 +749,57 @@ export default function App() {
     setChatOpen(true);
   };
 
+  const handleUpdateOperationMode = async (nextMode: OperationMode) => {
+    const res = await adminFetch('/api/admin/settings/operation-mode', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operationMode: nextMode }),
+    });
+    if (res.status === 401) {
+      handleUnauthorizedSession();
+      throw new Error('Sessão administrativa expirada.');
+    }
+    if (!res.ok) {
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(
+        errData.error || 'Falha ao salvar modo de operação no Neon PostgreSQL.'
+      );
+    }
+    const saved = (await res.json()) as { operationMode: OperationMode };
+    setOperationMode(saved.operationMode);
+    pushActivity(
+      'Modo de operação atualizado',
+      saved.operationMode === 'agent_only'
+        ? 'Sistema alterado para Apenas Agente de IA na rota raiz (/)'
+        : 'Sistema alterado para Modo Completo (Vitrine + Agente de IA)',
+      'estoque'
+    );
+  };
+
   // 1A. Public LGPD Privacy Policy Page (/privacidade)
   if (viewMode === 'privacy') {
     return (
       <PrivacyPolicyPage
         settings={settings}
-        onBack={() => navigateTo('catalog')}
+        onBack={() =>
+          navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog')
+        }
         onOpenChat={() => navigateTo('chat')}
       />
     );
   }
 
-  // 1B. Public Standalone Mobile-First Agent Page (/chat or /atendimento)
-  if (viewMode === 'chat') {
+  // 1B. Public Standalone WhatsApp-Style Agent Page (/chat or /atendimento, OR root / when operationMode === 'agent_only')
+  if (
+    viewMode === 'chat' ||
+    (operationMode === 'agent_only' &&
+      (viewMode === 'catalog' || viewMode === 'home'))
+  ) {
     return (
       <StandaloneChatPage
         vehicles={vehicles}
         settings={settings}
+        showBackToCatalog={operationMode === 'full'}
         onCaptureLead={handleCapturePublicLead}
         onSyncLeadChat={handleSyncPublicLeadChat}
         onOpenCatalog={() => {
@@ -756,7 +811,7 @@ export default function App() {
     );
   }
 
-  // 1C. Public Storefront Views (Always accessible without authentication)
+  // 1C. Public Storefront Views (Always accessible without authentication in 'full' mode)
   if (viewMode === 'catalog' || viewMode === 'home') {
     return (
       <>
@@ -830,7 +885,7 @@ export default function App() {
         onLoginSuccess={handleLoginSuccess}
         onBackToCatalog={() => {
           setLoginRedirectNotice(null);
-          navigateTo('catalog');
+          navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog');
         }}
       />
     );
@@ -857,11 +912,12 @@ export default function App() {
       <div className="flex-1 min-w-0 flex flex-col min-h-screen">
         <TopBar
           activeModule={activeModule}
+          operationMode={operationMode}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           onQuickNewVehicle={handleQuickNewVehicle}
           onOpenPublicCatalog={() => {
             void hydratePublicVehicles();
-            navigateTo('catalog');
+            navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog');
           }}
         />
 
@@ -912,6 +968,13 @@ export default function App() {
             />
           )}
 
+          {activeModule === 'chat_audit' && (
+            <ChatAuditModule
+              settings={settings}
+              onUnauthorized={() => handleUnauthorizedSession()}
+            />
+          )}
+
           {activeModule === 'contracts' && (
             <ContractsModule
               leads={leads}
@@ -946,6 +1009,8 @@ export default function App() {
           {activeModule === 'settings' && (
             <SettingsModule
               settings={settings}
+              operationMode={operationMode}
+              onChangeOperationMode={handleUpdateOperationMode}
               onSaveSettings={(next) => {
                 setSettings(next);
                 pushActivity(

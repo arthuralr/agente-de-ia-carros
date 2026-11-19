@@ -1,9 +1,10 @@
 import React from 'react';
 import { Menu, Plus, ExternalLink } from 'lucide-react';
-import { NavModule } from '../types';
+import { NavModule, OperationMode } from '../types';
 
 interface TopBarProps {
   activeModule: NavModule;
+  operationMode?: OperationMode;
   onOpenMobileMenu: () => void;
   onQuickNewVehicle: () => void;
   onOpenPublicCatalog: () => void;
@@ -22,6 +23,10 @@ const MODULE_META: Record<NavModule, { title: string; subtitle: string }> = {
     title: 'CRM de Atendimento & Leads',
     subtitle: 'Funil comercial · Captura via Chat IA e histórico de conversas',
   },
+  chat_audit: {
+    title: 'Conversas & Atendimentos IA',
+    subtitle: 'Auditoria em tempo real · Histórico gravado no Neon e transição para WhatsApp',
+  },
   contracts: {
     title: 'Gerador de Contratos & Documentos',
     subtitle: 'Emissão jurídica · Compra e venda, ATPV-e, vistoria e garantia CDC',
@@ -32,12 +37,13 @@ const MODULE_META: Record<NavModule, { title: string; subtitle: string }> = {
   },
   settings: {
     title: 'Configurações da Revenda',
-    subtitle: 'Parâmetros institucionais · Dados fiscais, horários e regras do sistema',
+    subtitle: 'Parâmetros institucionais · Modo de operação, horários e regras do sistema',
   },
 };
 
 export const TopBar: React.FC<TopBarProps> = ({
   activeModule,
+  operationMode = 'full',
   onOpenMobileMenu,
   onQuickNewVehicle,
   onOpenPublicCatalog,
@@ -73,7 +79,11 @@ export const TopBar: React.FC<TopBarProps> = ({
           className="hidden sm:inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium text-zinc-200 bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
         >
           <ExternalLink className="w-3.5 h-3.5 text-zinc-400" />
-          <span>Ver Estoque Público</span>
+          <span>
+            {operationMode === 'agent_only'
+              ? 'Abrir Agente Público (/chat)'
+              : 'Ver Estoque Público'}
+          </span>
         </button>
 
         <button

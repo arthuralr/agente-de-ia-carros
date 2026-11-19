@@ -39,6 +39,27 @@ export interface DbContractRow {
   created_at: Date;
 }
 
+export interface DbChatSessionRow {
+  id: number;
+  session_id: string;
+  lead_name: string | null;
+  lead_phone: string | null;
+  origem: string;
+  created_at: Date;
+  updated_at: Date;
+  message_count?: number;
+  last_message?: string | null;
+  last_sender?: 'user' | 'assistant' | null;
+}
+
+export interface DbChatMessageRow {
+  id: number;
+  session_id: string;
+  sender: 'user' | 'assistant';
+  content: string;
+  created_at: Date;
+}
+
 export async function seedNeonDatabaseIfEmpty(): Promise<void> {
   const client = await pool.connect();
   try {
@@ -54,6 +75,37 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
       ALTER TABLE leads
       ADD COLUMN IF NOT EXISTS lgpd_consent BOOLEAN NOT NULL DEFAULT true,
       ADD COLUMN IF NOT EXISTS lgpd_consent_at TIMESTAMPTZ
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        id SERIAL PRIMARY KEY,
+        session_id VARCHAR(128) UNIQUE NOT NULL,
+        lead_name VARCHAR(255),
+        lead_phone VARCHAR(64),
+        origem VARCHAR(64) NOT NULL DEFAULT '/chat',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        session_id VARCHAR(128) NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+        sender VARCHAR(32) NOT NULL CHECK (sender IN ('user', 'assistant')),
+        content TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id
+      ON chat_messages(session_id, id)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key VARCHAR(64) PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
     `);
     const vehCount = await client.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM vehicles'
