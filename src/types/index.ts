@@ -150,6 +150,7 @@ export interface ChatAuditMessage {
   attachmentUrl?: string | null;
   attachmentName?: string | null;
   attachmentMime?: string | null;
+  attachmentDownloadUrl?: string | null;
   createdAt: string;
 }
 

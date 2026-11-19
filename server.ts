@@ -914,6 +914,9 @@ app.get(
           attachmentUrl: m.attachment_url ?? null,
           attachmentName: m.attachment_name ?? null,
           attachmentMime: m.attachment_mime ?? null,
+          attachmentDownloadUrl: m.attachment_url
+            ? `/api/admin/chat-messages/${m.id}/attachment`
+            : null,
           createdAt: m.created_at,
         })),
       });
@@ -922,6 +925,69 @@ app.get(
         err instanceof Error
           ? err.message
           : 'Erro ao carregar mensagens da sessão.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
+app.get(
+  '/api/admin/chat-messages/:messageId/attachment',
+  requireAdminAuth,
+  async (req, res) => {
+    const messageId = Number(req.params.messageId);
+    if (!Number.isInteger(messageId) || messageId <= 0) {
+      res.status(400).json({ error: 'ID de mensagem inválido.' });
+      return;
+    }
+
+    try {
+      const msgRes = await pool.query<{
+        attachment_url: string | null;
+        attachment_name: string | null;
+        attachment_mime: string | null;
+      }>(
+        `SELECT attachment_url, attachment_name, attachment_mime
+         FROM chat_messages
+         WHERE id = $1
+         LIMIT 1`,
+        [messageId]
+      );
+
+      const row = msgRes.rows[0];
+      if (!row || !row.attachment_url) {
+        res.status(404).json({ error: 'Anexo não encontrado para esta mensagem.' });
+        return;
+      }
+
+      const rawName = (row.attachment_name || 'anexo').replace(/["\r\n\\]/g, '_');
+      const wantsDownload = req.query.download === '1' || req.query.download === 'true';
+
+      if (row.attachment_url.startsWith('data:')) {
+        const parsed = parseDataUrlMedia(
+          row.attachment_url,
+          row.attachment_mime || undefined
+        );
+        if (!parsed) {
+          res.status(422).json({ error: 'Conteúdo do anexo inválido ou corrompido.' });
+          return;
+        }
+        const buffer = Buffer.from(parsed.base64, 'base64');
+        const mimeType = row.attachment_mime || parsed.mimeType || 'application/octet-stream';
+        res.setHeader('Content-Type', mimeType);
+        res.setHeader('Content-Length', String(buffer.length));
+        res.setHeader(
+          'Content-Disposition',
+          `${wantsDownload ? 'attachment' : 'inline'}; filename="${rawName}"`
+        );
+        res.setHeader('Cache-Control', 'private, max-age=300');
+        res.send(buffer);
+        return;
+      }
+
+      res.redirect(row.attachment_url);
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'Erro ao carregar anexo da mensagem.';
       res.status(500).json({ error: message });
     }
   }

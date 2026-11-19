@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Bot,
@@ -6,12 +6,15 @@ import {
   ChevronUp,
   Clock,
   Download,
+  ExternalLink,
+  Eye,
   FileText,
   Image as ImageIcon,
   Loader2,
   MessageCircle,
   MessageSquareText,
   Mic,
+  Paperclip,
   Phone,
   RefreshCw,
   Reply,
@@ -31,6 +34,13 @@ import { ChatMarkdown } from '../public/ChatMarkdown';
 interface ChatAuditModuleProps {
   settings: DealershipSettings;
   onUnauthorized: () => void;
+}
+
+interface AttachmentPreviewModalState {
+  type: 'pdf' | 'image' | 'other';
+  blobUrl: string;
+  name: string;
+  mimeType: string;
 }
 
 function formatDateTimePt(iso: string): string {
@@ -58,6 +68,52 @@ function formatTimePt(iso: string): string {
   }
 }
 
+function detectAttachmentKind(
+  msg: ChatAuditMessage
+): 'image' | 'pdf' | 'other' | null {
+  if (!msg.attachmentUrl && !msg.attachmentDownloadUrl) return null;
+  const mime = (msg.attachmentMime || '').toLowerCase();
+  const name = (msg.attachmentName || '').toLowerCase();
+  const url = msg.attachmentUrl || '';
+
+  if (
+    mime.startsWith('image/') ||
+    url.startsWith('data:image/') ||
+    /\.(jpe?g|png|webp|gif)$/i.test(name)
+  ) {
+    return 'image';
+  }
+  if (
+    mime === 'application/pdf' ||
+    url.startsWith('data:application/pdf') ||
+    name.endsWith('.pdf')
+  ) {
+    return 'pdf';
+  }
+  return 'other';
+}
+
+function dataUrlToBlob(dataUrl: string, fallbackMime?: string): Blob | null {
+  if (!dataUrl.startsWith('data:')) return null;
+  const commaIdx = dataUrl.indexOf(',');
+  if (commaIdx === -1) return null;
+  const header = dataUrl.slice(5, commaIdx);
+  const base64 = dataUrl.slice(commaIdx + 1).replace(/\s+/g, '');
+  const mime =
+    header.split(';')[0]?.trim() || fallbackMime || 'application/octet-stream';
+
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mime });
+  } catch {
+    return null;
+  }
+}
+
 export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
   settings,
   onUnauthorized,
@@ -80,10 +136,125 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
   const [collapsedTranscriptions, setCollapsedTranscriptions] = useState<
     Record<number, boolean>
   >({});
-  const [lightboxImage, setLightboxImage] = useState<{
-    url: string;
-    name: string;
-  } | null>(null);
+  const [previewModal, setPreviewModal] =
+    useState<AttachmentPreviewModalState | null>(null);
+  const [busyAttachmentId, setBusyAttachmentId] = useState<number | null>(null);
+  const [attachmentActionError, setAttachmentActionError] = useState<
+    string | null
+  >(null);
+
+  const createdBlobUrlsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    return () => {
+      createdBlobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      createdBlobUrlsRef.current = [];
+    };
+  }, []);
+
+  const registerBlobUrl = (blob: Blob): string => {
+    const blobUrl = URL.createObjectURL(blob);
+    createdBlobUrlsRef.current.push(blobUrl);
+    return blobUrl;
+  };
+
+  const resolveMessageAttachmentBlob = useCallback(
+    async (
+      msg: ChatAuditMessage
+    ): Promise<{ blobUrl: string; name: string; mimeType: string }> => {
+      const kind = detectAttachmentKind(msg);
+      const defaultName =
+        msg.attachmentName?.trim() ||
+        (kind === 'pdf'
+          ? `documento-${msg.id}.pdf`
+          : kind === 'image'
+            ? `foto-${msg.id}.jpg`
+            : `anexo-${msg.id}`);
+      const defaultMime =
+        msg.attachmentMime ||
+        (kind === 'pdf'
+          ? 'application/pdf'
+          : kind === 'image'
+            ? 'image/jpeg'
+            : 'application/octet-stream');
+
+      if (msg.attachmentUrl?.startsWith('data:')) {
+        const blob = dataUrlToBlob(msg.attachmentUrl, defaultMime);
+        if (blob) {
+          return {
+            blobUrl: registerBlobUrl(blob),
+            name: defaultName,
+            mimeType: blob.type || defaultMime,
+          };
+        }
+      }
+
+      const fetchUrl =
+        msg.attachmentDownloadUrl ||
+        `/api/admin/chat-messages/${msg.id}/attachment`;
+      const res = await adminFetch(fetchUrl);
+      if (res.status === 401) {
+        onUnauthorized();
+        throw new Error('Sessão administrativa expirada.');
+      }
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(
+          err.error || 'Não foi possível carregar o anexo no servidor.'
+        );
+      }
+      const blob = await res.blob();
+      return {
+        blobUrl: registerBlobUrl(blob),
+        name: defaultName,
+        mimeType: blob.type || defaultMime,
+      };
+    },
+    [onUnauthorized]
+  );
+
+  const handleViewAttachment = async (msg: ChatAuditMessage) => {
+    setAttachmentActionError(null);
+    setBusyAttachmentId(msg.id);
+    try {
+      const kind = detectAttachmentKind(msg) || 'other';
+      const resolved = await resolveMessageAttachmentBlob(msg);
+      setPreviewModal({
+        type: kind,
+        blobUrl: resolved.blobUrl,
+        name: resolved.name,
+        mimeType: resolved.mimeType,
+      });
+    } catch (err: unknown) {
+      setAttachmentActionError(
+        err instanceof Error
+          ? err.message
+          : 'Erro ao abrir visualização do anexo.'
+      );
+    } finally {
+      setBusyAttachmentId(null);
+    }
+  };
+
+  const handleDownloadAttachment = async (msg: ChatAuditMessage) => {
+    setAttachmentActionError(null);
+    setBusyAttachmentId(msg.id);
+    try {
+      const resolved = await resolveMessageAttachmentBlob(msg);
+      const link = document.createElement('a');
+      link.href = resolved.blobUrl;
+      link.download = resolved.name;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (err: unknown) {
+      setAttachmentActionError(
+        err instanceof Error ? err.message : 'Erro ao baixar anexo.'
+      );
+    } finally {
+      setBusyAttachmentId(null);
+    }
+  };
 
   const fetchSessions = useCallback(async () => {
     setLoadingSessions(true);
@@ -124,6 +295,7 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
     async (sessionId: string) => {
       setLoadingMessages(true);
       setMessagesError(null);
+      setAttachmentActionError(null);
       try {
         const res = await adminFetch(
           `/api/admin/chat-sessions/${encodeURIComponent(sessionId)}/messages`
@@ -339,7 +511,7 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
           </div>
         </section>
 
-        {/* Right Detail: Full Transcript (with Replies, Audio Player + Transcription, Photos & PDFs) */}
+        {/* Right Detail: Full Transcript */}
         <section className="lg:col-span-8 bg-[#111114] border border-white/[0.08] rounded-xl flex flex-col overflow-hidden max-h-[72vh]">
           {!activeSession ? (
             <div className="flex-1 flex flex-col items-center justify-center p-10 text-center space-y-2">
@@ -408,6 +580,23 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                 )}
               </div>
 
+              {attachmentActionError && (
+                <div className="mx-5 mt-3 p-2.5 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center justify-between gap-2 text-xs text-red-200">
+                  <span className="inline-flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                    <span>{attachmentActionError}</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setAttachmentActionError(null)}
+                    aria-label="Fechar erro"
+                    className="text-red-300 hover:text-white"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
               {/* Transcript Feed */}
               <div className="flex-1 overflow-y-auto p-5 space-y-4 bg-[#09090B]">
                 {loadingMessages ? (
@@ -427,12 +616,8 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                 ) : (
                   messages.map((msg) => {
                     const isAssistant = msg.sender === 'assistant';
-                    const isImageAttachment =
-                      Boolean(msg.attachmentUrl) &&
-                      (msg.attachmentMime || '').startsWith('image/');
-                    const isPdfAttachment =
-                      Boolean(msg.attachmentUrl) &&
-                      msg.attachmentMime === 'application/pdf';
+                    const attachmentKind = detectAttachmentKind(msg);
+                    const isBusy = busyAttachmentId === msg.id;
                     const isTranscriptionHidden = Boolean(
                       collapsedTranscriptions[msg.id]
                     );
@@ -442,7 +627,7 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                         msg.content.trim() === 'Mensagem de áudio' ||
                         msg.content.trim() === (msg.transcription || '').trim());
                     const hideDefaultAttachmentPlaceholder =
-                      Boolean(msg.attachmentUrl) &&
+                      Boolean(attachmentKind) &&
                       msg.content.trim().startsWith('Anexo enviado:');
 
                     return (
@@ -536,61 +721,122 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                             </div>
                           )}
 
-                          {/* Image Attachment Thumbnail */}
-                          {isImageAttachment && msg.attachmentUrl && (
-                            <div className="space-y-1.5">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setLightboxImage({
-                                    url: msg.attachmentUrl!,
-                                    name: msg.attachmentName || 'imagem.jpg',
-                                  })
-                                }
-                                className="block rounded-lg overflow-hidden border border-white/10 hover:opacity-95 transition-opacity max-w-[280px]"
-                              >
-                                <img
-                                  src={msg.attachmentUrl}
-                                  alt={msg.attachmentName || 'Foto enviada'}
-                                  className="w-full max-h-[240px] object-cover block"
-                                />
-                              </button>
-                              <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
-                                <span className="truncate max-w-[200px]">
-                                  {msg.attachmentName || 'Foto anexada'}
-                                </span>
-                                <a
-                                  href={msg.attachmentUrl}
-                                  download={msg.attachmentName || 'foto.jpg'}
-                                  className="inline-flex items-center gap-1 text-emerald-400 hover:underline shrink-0"
+                          {/* Image Attachment Block with Visualizar & Baixar */}
+                          {attachmentKind === 'image' && (
+                            <div className="rounded-lg bg-black/30 border border-white/[0.1] p-2.5 space-y-2.5 max-w-[320px]">
+                              {msg.attachmentUrl && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleViewAttachment(msg)}
+                                  className="block w-full rounded-md overflow-hidden border border-white/10 hover:opacity-95 transition-opacity"
                                 >
-                                  <Download className="w-3 h-3" />
+                                  <img
+                                    src={msg.attachmentUrl}
+                                    alt={msg.attachmentName || 'Foto enviada'}
+                                    className="w-full max-h-[220px] object-cover block"
+                                  />
+                                </button>
+                              )}
+                              <div className="flex items-center gap-2 min-w-0">
+                                <ImageIcon className="w-4 h-4 text-emerald-400 shrink-0" />
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-medium text-white truncate">
+                                    {msg.attachmentName || 'imagem.jpg'}
+                                  </p>
+                                  <p className="text-[11px] text-zinc-400">
+                                    Imagem anexada
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => void handleViewAttachment(msg)}
+                                  className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-white bg-zinc-800 hover:bg-zinc-700 border border-white/[0.1] transition-colors disabled:opacity-50"
+                                >
+                                  {isBusy ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <Eye className="w-3.5 h-3.5" />
+                                  )}
+                                  <span>Visualizar</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() =>
+                                    void handleDownloadAttachment(msg)
+                                  }
+                                  className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 transition-colors disabled:opacity-50"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
                                   <span>Baixar</span>
-                                </a>
+                                </button>
                               </div>
                             </div>
                           )}
 
-                          {/* PDF Document Attachment Card */}
-                          {isPdfAttachment && msg.attachmentUrl && (
-                            <a
-                              href={msg.attachmentUrl}
-                              download={msg.attachmentName || 'documento.pdf'}
-                              className="flex items-center gap-3 p-3 rounded-lg bg-black/30 hover:bg-black/45 border border-white/[0.1] transition-colors max-w-[320px]"
-                            >
-                              <div className="w-9 h-9 rounded-lg bg-red-600/20 border border-red-500/30 text-red-400 flex items-center justify-center shrink-0">
-                                <FileText className="w-4 h-4" />
+                          {/* PDF or Generic Document Attachment Block with Visualizar & Baixar */}
+                          {(attachmentKind === 'pdf' ||
+                            attachmentKind === 'other') && (
+                            <div className="rounded-lg bg-black/35 border border-white/[0.12] p-3 space-y-3 min-w-[250px] max-w-[360px]">
+                              <div className="flex items-center gap-3 min-w-0">
+                                <div
+                                  className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${
+                                    attachmentKind === 'pdf'
+                                      ? 'bg-red-600/20 border border-red-500/30 text-red-400'
+                                      : 'bg-zinc-800 border border-white/10 text-zinc-300'
+                                  }`}
+                                >
+                                  {attachmentKind === 'pdf' ? (
+                                    <FileText className="w-5 h-5" />
+                                  ) : (
+                                    <Paperclip className="w-5 h-5" />
+                                  )}
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-semibold text-white truncate">
+                                    {msg.attachmentName ||
+                                      (attachmentKind === 'pdf'
+                                        ? 'documento.pdf'
+                                        : 'arquivo-anexado')}
+                                  </p>
+                                  <p className="text-[11px] text-zinc-400 mt-0.5">
+                                    {attachmentKind === 'pdf'
+                                      ? 'Documento PDF'
+                                      : msg.attachmentMime || 'Arquivo anexado'}
+                                  </p>
+                                </div>
                               </div>
-                              <div className="min-w-0 flex-1">
-                                <p className="text-xs font-medium text-white truncate">
-                                  {msg.attachmentName || 'documento.pdf'}
-                                </p>
-                                <p className="text-[11px] text-zinc-400">
-                                  Documento PDF · Clique para baixar
-                                </p>
+
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => void handleViewAttachment(msg)}
+                                  className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-white bg-zinc-800 hover:bg-zinc-700 border border-white/[0.1] transition-colors disabled:opacity-50"
+                                >
+                                  {isBusy ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <Eye className="w-3.5 h-3.5" />
+                                  )}
+                                  <span>Visualizar</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() =>
+                                    void handleDownloadAttachment(msg)
+                                  }
+                                  className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 transition-colors disabled:opacity-50"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                  <span>Baixar</span>
+                                </button>
                               </div>
-                              <Download className="w-4 h-4 text-emerald-400 shrink-0" />
-                            </a>
+                            </div>
                           )}
 
                           {/* Text Message Body */}
@@ -613,45 +859,85 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
         </section>
       </div>
 
-      {/* Admin Image Lightbox Modal */}
-      {lightboxImage && (
+      {/* Admin Attachment Viewer Modal (Supports PDF inline iframe + Image Lightbox + New Tab + Direct Download) */}
+      {previewModal && (
         <div
           className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-4"
-          onClick={() => setLightboxImage(null)}
+          onClick={() => setPreviewModal(null)}
         >
           <div
-            className="max-w-3xl w-full flex flex-col items-center gap-3"
+            className="max-w-4xl w-full bg-[#111114] border border-white/[0.12] rounded-xl overflow-hidden flex flex-col max-h-[90dvh] shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="w-full flex items-center justify-between text-white">
-              <span className="text-xs font-medium truncate inline-flex items-center gap-2">
-                <ImageIcon className="w-4 h-4 text-emerald-400" />
-                {lightboxImage.name}
+            <div className="px-4 py-3 border-b border-white/[0.08] flex flex-wrap items-center justify-between gap-3 bg-[#0D0D10]">
+              <span className="text-xs font-semibold text-white truncate inline-flex items-center gap-2 min-w-0">
+                {previewModal.type === 'pdf' ? (
+                  <FileText className="w-4 h-4 text-red-400 shrink-0" />
+                ) : (
+                  <ImageIcon className="w-4 h-4 text-emerald-400 shrink-0" />
+                )}
+                <span className="truncate">{previewModal.name}</span>
               </span>
-              <div className="flex items-center gap-2">
+
+              <div className="flex items-center gap-2 shrink-0">
                 <a
-                  href={lightboxImage.url}
-                  download={lightboxImage.name}
-                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold inline-flex items-center gap-1.5"
+                  href={previewModal.blobUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 border border-white/[0.1] text-xs font-medium text-zinc-100 inline-flex items-center gap-1.5"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Abrir em nova aba</span>
+                </a>
+                <a
+                  href={previewModal.blobUrl}
+                  download={previewModal.name}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white inline-flex items-center gap-1.5"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>Baixar imagem</span>
+                  <span>Baixar</span>
                 </a>
                 <button
                   type="button"
-                  onClick={() => setLightboxImage(null)}
+                  onClick={() => setPreviewModal(null)}
                   aria-label="Fechar visualização"
-                  className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center"
+                  className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 text-white flex items-center justify-center"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
             </div>
-            <img
-              src={lightboxImage.url}
-              alt={lightboxImage.name}
-              className="max-h-[82dvh] max-w-full rounded-lg object-contain shadow-2xl border border-white/10"
-            />
+
+            <div className="flex-1 bg-[#09090B] p-3 flex items-center justify-center overflow-auto min-h-[420px]">
+              {previewModal.type === 'image' ? (
+                <img
+                  src={previewModal.blobUrl}
+                  alt={previewModal.name}
+                  className="max-h-[75dvh] max-w-full rounded-lg object-contain"
+                />
+              ) : previewModal.type === 'pdf' ? (
+                <iframe
+                  src={previewModal.blobUrl}
+                  title={previewModal.name}
+                  className="w-full h-[74dvh] rounded-lg bg-white border border-white/10"
+                />
+              ) : (
+                <div className="text-center space-y-3 py-12">
+                  <Paperclip className="w-8 h-8 text-zinc-500 mx-auto" />
+                  <p className="text-sm text-zinc-200">
+                    Pré-visualização direta indisponível para este formato.
+                  </p>
+                  <a
+                    href={previewModal.blobUrl}
+                    download={previewModal.name}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>Baixar {previewModal.name}</span>
+                  </a>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

@@ -1209,28 +1209,31 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
             {/* Composer Bar: Recording State vs Normal Input State */}
             {isRecording ? (
-              <div className="px-3 sm:px-4 py-2.5 flex items-center gap-2.5">
+              <div className="w-full max-w-full px-2.5 sm:px-4 py-2.5 flex flex-nowrap items-center gap-2 overflow-hidden">
                 <button
                   type="button"
                   onClick={cancelAudioRecording}
-                  aria-label="Cancelar gravação de áudio"
-                  title="Descartar áudio"
-                  className="w-[44px] h-[44px] rounded-full bg-white hover:bg-red-50 text-red-600 border border-red-200 shadow-xs transition-colors shrink-0 inline-flex items-center justify-center"
+                  aria-label="Cancelar e excluir gravação de áudio"
+                  title="Cancelar áudio"
+                  className="w-[44px] h-[44px] rounded-full bg-white hover:bg-red-50 text-red-600 border border-red-200 shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
                 >
                   <Trash2 className="w-5 h-5" />
                 </button>
 
-                <div className="flex-1 min-h-[44px] px-4 py-2 bg-white rounded-full shadow-[0_1px_1px_rgba(11,20,26,0.08)] flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2.5 min-w-0">
+                <div className="flex-1 min-w-0 overflow-hidden min-h-[44px] px-3 sm:px-4 py-2 bg-white rounded-full shadow-[0_1px_1px_rgba(11,20,26,0.08)] flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
                     <span className="w-2.5 h-2.5 rounded-full bg-red-600 animate-pulse shrink-0" />
-                    <span className="font-mono text-sm font-semibold tabular-nums text-[#111B21]">
+                    <span className="font-mono text-sm font-semibold tabular-nums text-[#111B21] shrink-0">
                       {formatDurationSeconds(recordingSec)}
                     </span>
-                    <span className="text-xs text-[#54656F] truncate">
+                    <span className="sm:hidden text-xs text-[#54656F] truncate">
+                      Gravando...
+                    </span>
+                    <span className="hidden sm:inline text-xs text-[#54656F] truncate">
                       Gravando áudio... fale sua dúvida
                     </span>
                   </div>
-                  <span className="text-[11px] font-mono text-[#8696A0] shrink-0">
+                  <span className="hidden sm:inline text-[11px] font-mono text-[#8696A0] shrink-0">
                     máx {formatDurationSeconds(MAX_AUDIO_DURATION_SEC)}
                   </span>
                 </div>
@@ -1238,11 +1241,12 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 <button
                   type="button"
                   onClick={finishAndSendAudioRecording}
-                  aria-label="Enviar áudio gravado"
-                  title="Enviar áudio"
-                  className="w-[44px] h-[44px] rounded-full bg-[#00A884] hover:bg-[#008F72] text-white shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
+                  aria-label="Parar e enviar áudio gravado"
+                  title="Parar e enviar áudio"
+                  className="h-[44px] px-3 sm:px-4 rounded-full bg-[#00A884] hover:bg-[#008F72] text-white text-xs font-semibold shadow-sm transition-colors shrink-0 inline-flex items-center justify-center gap-1.5 whitespace-nowrap active:scale-95"
                 >
-                  <Send className="w-4 h-4 translate-x-[1px]" />
+                  <Send className="w-4 h-4 shrink-0" />
+                  <span>Enviar</span>
                 </button>
               </div>
             ) : (
