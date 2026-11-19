@@ -96,13 +96,16 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
   // Audio recording state
   const [isRecording, setIsRecording] = useState(false);
+  const [isFinalizingAudio, setIsFinalizingAudio] = useState(false);
   const [recordingSec, setRecordingSec] = useState(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const audioMimeRef = useRef<string>('audio/webm');
   const recordingTimerRef = useRef<number | null>(null);
   const recordingStartRef = useRef<number>(0);
   const discardAudioRef = useRef<boolean>(false);
+  const finalizedAudioRef = useRef<boolean>(false);
 
   // Refs for inputs & swipe-to-reply
   const textInputRef = useRef<HTMLInputElement>(null);
@@ -146,6 +149,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     onCaptureLead,
     onSyncLeadChat,
   });
+
+  const sendRichMessageRef = useRef(sendRichMessage);
+  useEffect(() => {
+    sendRichMessageRef.current = sendRichMessage;
+  }, [sendRichMessage]);
 
   // Clean up audio streams and timers on unmount
   useEffect(() => {
@@ -255,37 +263,38 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       const recorder = new MediaRecorder(stream, recorderOptions);
       mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
+      audioMimeRef.current = recorder.mimeType || mimeType || 'audio/webm';
       discardAudioRef.current = false;
+      finalizedAudioRef.current = false;
       recordingStartRef.current = Date.now();
+      setIsFinalizingAudio(false);
       setRecordingSec(0);
       setIsRecording(true);
 
-      recorder.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) {
-          audioChunksRef.current.push(ev.data);
-        }
-      };
+      const finalizeAndDispatchAudio = async (resolvedMime: string) => {
+        if (finalizedAudioRef.current) return;
+        finalizedAudioRef.current = true;
 
-      recorder.onstop = async () => {
         const shouldDiscard = discardAudioRef.current;
         const durationSec = Math.max(
           1,
           Math.round((Date.now() - recordingStartRef.current) / 1000)
         );
-        const chunks = audioChunksRef.current;
-        const resolvedMime =
-          recorder.mimeType || mimeType || 'audio/webm';
+        const chunks = [...audioChunksRef.current];
+        audioChunksRef.current = [];
+        mediaRecorderRef.current = null;
 
         stopRecordingHardware();
         setIsRecording(false);
+        setIsFinalizingAudio(false);
         setRecordingSec(0);
 
         if (shouldDiscard || chunks.length === 0) return;
 
         const blob = new Blob(chunks, { type: resolvedMime });
-        if (blob.size < 400) {
+        if (blob.size < 100) {
           setMediaError(
-            'Áudio muito curto. Segure ou fale por pelo menos 1 segundo.'
+            'Áudio muito curto. Fale por pelo menos 1 segundo antes de enviar.'
           );
           return;
         }
@@ -298,7 +307,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
         try {
           const dataUrl = await blobToDataUrl(blob);
-          sendRichMessage({
+          sendRichMessageRef.current({
             text: '',
             audio: {
               url: dataUrl,
@@ -313,6 +322,18 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               : 'Erro ao preparar o áudio gravado.'
           );
         }
+      };
+
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          audioChunksRef.current.push(ev.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const resolvedMime =
+          recorder.mimeType || audioMimeRef.current || 'audio/webm';
+        void finalizeAndDispatchAudio(resolvedMime);
       };
 
       recorder.start(250);
@@ -330,6 +351,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     } catch {
       stopRecordingHardware();
       setIsRecording(false);
+      setIsFinalizingAudio(false);
       setMediaError(
         'Não foi possível acessar o microfone. Verifique a permissão no navegador ou envie sua dúvida por texto.'
       );
@@ -338,19 +360,85 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
   const cancelAudioRecording = () => {
     discardAudioRef.current = true;
-    if (mediaRecorderRef.current?.state === 'recording') {
-      mediaRecorderRef.current.stop();
+    if (recordingTimerRef.current) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      try {
+        recorder.stop();
+      } catch {
+        stopRecordingHardware();
+        setIsRecording(false);
+        setIsFinalizingAudio(false);
+        setRecordingSec(0);
+      }
     } else {
       stopRecordingHardware();
       setIsRecording(false);
+      setIsFinalizingAudio(false);
       setRecordingSec(0);
     }
   };
 
   const finishAndSendAudioRecording = () => {
+    if (isFinalizingAudio) return;
     discardAudioRef.current = false;
-    if (mediaRecorderRef.current?.state === 'recording') {
-      mediaRecorderRef.current.stop();
+    setIsFinalizingAudio(true);
+
+    if (recordingTimerRef.current) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      try {
+        if (recorder.state === 'recording') {
+          recorder.requestData();
+        }
+      } catch {
+        // Some browsers flush data automatically on stop()
+      }
+      try {
+        recorder.stop();
+        return;
+      } catch {
+        // Fallback handled below
+      }
+    }
+
+    // Fallback if recorder already became inactive so the user is never stuck
+    const chunks = [...audioChunksRef.current];
+    audioChunksRef.current = [];
+    const durationSec = Math.max(
+      1,
+      Math.round((Date.now() - recordingStartRef.current) / 1000)
+    );
+    const resolvedMime = audioMimeRef.current || 'audio/webm';
+    stopRecordingHardware();
+    setIsRecording(false);
+    setIsFinalizingAudio(false);
+    setRecordingSec(0);
+
+    if (chunks.length > 0 && !finalizedAudioRef.current) {
+      finalizedAudioRef.current = true;
+      const blob = new Blob(chunks, { type: resolvedMime });
+      void blobToDataUrl(blob)
+        .then((dataUrl) => {
+          sendRichMessageRef.current({
+            text: '',
+            audio: {
+              url: dataUrl,
+              mimeType: resolvedMime.split(';')[0] || 'audio/webm',
+              durationSec,
+            },
+          });
+        })
+        .catch(() => {
+          setMediaError('Erro ao finalizar o áudio gravado. Tente novamente.');
+        });
     }
   };
 
@@ -1121,7 +1209,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                       </p>
                       <p className="text-[11px] text-[#54656F]">
                         {pendingAttachment.mimeType === 'application/pdf'
-                          ? 'Documento PDF pronto para análise'
+                          ? 'Documento PDF pronto para envio'
                           : 'Foto otimizada pronta para envio'}
                         {pendingAttachment.sizeBytes
                           ? ` · ${formatBytesCompact(pendingAttachment.sizeBytes)}`
@@ -1209,43 +1297,46 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
             {/* Composer Bar: Recording State vs Normal Input State */}
             {isRecording ? (
-              <div className="w-full max-w-full px-2.5 sm:px-4 py-2.5 flex flex-nowrap items-center gap-2 overflow-hidden">
+              <div className="relative z-20 w-full max-w-full box-border px-2.5 sm:px-4 py-2.5 flex flex-nowrap items-center gap-2 overflow-hidden">
                 <button
                   type="button"
                   onClick={cancelAudioRecording}
+                  disabled={isFinalizingAudio}
                   aria-label="Cancelar e excluir gravação de áudio"
                   title="Cancelar áudio"
-                  className="w-[44px] h-[44px] rounded-full bg-white hover:bg-red-50 text-red-600 border border-red-200 shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
+                  className="w-[44px] h-[44px] rounded-full bg-white hover:bg-red-50 text-red-600 border border-red-200 shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95 cursor-pointer touch-manipulation disabled:opacity-50"
                 >
                   <Trash2 className="w-5 h-5" />
                 </button>
 
-                <div className="flex-1 min-w-0 overflow-hidden min-h-[44px] px-3 sm:px-4 py-2 bg-white rounded-full shadow-[0_1px_1px_rgba(11,20,26,0.08)] flex items-center justify-between gap-2">
+                <div className="flex-1 min-w-0 overflow-hidden h-[44px] px-3 sm:px-4 bg-white rounded-full shadow-[0_1px_1px_rgba(11,20,26,0.08)] flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="w-2.5 h-2.5 rounded-full bg-red-600 animate-pulse shrink-0" />
                     <span className="font-mono text-sm font-semibold tabular-nums text-[#111B21] shrink-0">
                       {formatDurationSeconds(recordingSec)}
                     </span>
-                    <span className="sm:hidden text-xs text-[#54656F] truncate">
-                      Gravando...
+                    <span className="font-mono text-[11px] tabular-nums text-[#8696A0] shrink-0">
+                      / {formatDurationSeconds(MAX_AUDIO_DURATION_SEC)}
                     </span>
-                    <span className="hidden sm:inline text-xs text-[#54656F] truncate">
-                      Gravando áudio... fale sua dúvida
+                    <span className="hidden md:inline text-xs text-[#54656F] truncate ml-1">
+                      Gravando áudio... clique em Enviar ao terminar
                     </span>
                   </div>
-                  <span className="hidden sm:inline text-[11px] font-mono text-[#8696A0] shrink-0">
-                    máx {formatDurationSeconds(MAX_AUDIO_DURATION_SEC)}
-                  </span>
                 </div>
 
                 <button
                   type="button"
                   onClick={finishAndSendAudioRecording}
+                  disabled={isFinalizingAudio}
                   aria-label="Parar e enviar áudio gravado"
-                  title="Parar e enviar áudio"
-                  className="h-[44px] px-3 sm:px-4 rounded-full bg-[#00A884] hover:bg-[#008F72] text-white text-xs font-semibold shadow-sm transition-colors shrink-0 inline-flex items-center justify-center gap-1.5 whitespace-nowrap active:scale-95"
+                  title="Parar e enviar áudio agora"
+                  className="h-[44px] px-3.5 sm:px-4 rounded-full bg-[#00A884] hover:bg-[#008F72] text-white text-xs sm:text-sm font-semibold shadow-md transition-colors shrink-0 inline-flex items-center justify-center gap-1.5 whitespace-nowrap active:scale-95 cursor-pointer touch-manipulation disabled:opacity-70"
                 >
-                  <Send className="w-4 h-4 shrink-0" />
+                  {isFinalizingAudio ? (
+                    <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                  ) : (
+                    <Send className="w-4 h-4 shrink-0" />
+                  )}
                   <span>Enviar</span>
                 </button>
               </div>

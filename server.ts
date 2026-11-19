@@ -1690,7 +1690,6 @@ app.post('/api/ai/chat', async (req, res) => {
   }
 
   try {
-    const ai = getGeminiClient();
     const s = body.settings;
     const dealership = s?.tradeName || 'Armazém do Carro';
     const assistantName = s?.aiAssistantName || 'Consultor Virtual Armazém';
@@ -1753,6 +1752,107 @@ app.post('/api/ai/chat', async (req, res) => {
         return;
       }
     }
+
+    // Economia de tokens: quando o visitante envia anexo (foto/PDF), salva no Neon para o Admin
+    // e responde diretamente perguntando do que se trata, SEM enviar o arquivo para análise da IA.
+    if (parsedAttachment && !parsedAudio) {
+      const auditSessionId = sanitizeSessionId(body.sessionId);
+      const auditOrigin = sanitizeOrigin(body.origem);
+      const lastUserMessageRaw =
+        [...body.messages].reverse().find((m) => m.sender === 'cliente')?.text ||
+        '';
+      const safeAttachmentName =
+        typeof body.attachment?.name === 'string' && body.attachment.name.trim()
+          ? body.attachment.name.trim().slice(0, 250)
+          : parsedAttachment.mimeType === 'application/pdf'
+            ? 'documento.pdf'
+            : 'imagem.jpg';
+
+      const safeReplyToId =
+        typeof body.replyTo?.id === 'string'
+          ? body.replyTo.id.trim().slice(0, 120)
+          : null;
+      const safeReplyToPreview =
+        typeof body.replyTo?.preview === 'string'
+          ? body.replyTo.preview.trim().slice(0, 400)
+          : null;
+      const safeReplyToSender: 'user' | 'assistant' | null =
+        body.replyTo?.sender === 'ia'
+          ? 'assistant'
+          : body.replyTo?.sender === 'cliente'
+            ? 'user'
+            : null;
+
+      const isPdf = parsedAttachment.mimeType === 'application/pdf';
+      const attachmentAckReply = isPdf
+        ? `Recebi o seu anexo PDF (**${safeAttachmentName}**) e ele já foi registrado no seu atendimento!
+
+Sobre o que ele se trata?
+- É uma **proposta, simulação ou carta de crédito**?
+- É o **documento de um veículo** para avaliação na troca?
+- Ou alguma outra informação para a nossa equipe?
+
+Pode me explicar aqui por texto (ou áudio) que eu já continuo o seu atendimento!`
+        : `Recebi a sua foto (**${safeAttachmentName}**) e ela já foi registrada no seu atendimento!
+
+Sobre o que ela se trata?
+- É foto do seu **carro usado para avaliação na troca**? (Se sim, me informe **modelo, ano, versão e km**)
+- É referência de algum **veículo que você procura**?
+- Ou alguma outra dúvida sobre nosso estoque?
+
+Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você!`;
+
+      if (auditSessionId) {
+        const storedUserContent =
+          lastUserMessageRaw.trim() || `Anexo enviado: ${safeAttachmentName}`;
+        await recordChatAuditTurn(
+          auditSessionId,
+          auditOrigin,
+          'user',
+          storedUserContent,
+          {
+            replyToId: safeReplyToId,
+            replyToPreview: safeReplyToPreview,
+            replyToSender: safeReplyToSender,
+            attachmentUrl: parsedAttachment.cleanDataUrl,
+            attachmentName: safeAttachmentName,
+            attachmentMime: parsedAttachment.mimeType,
+          }
+        );
+        await recordChatAuditTurn(
+          auditSessionId,
+          auditOrigin,
+          'assistant',
+          attachmentAckReply
+        );
+      }
+
+      const wantsStreamForAttachment =
+        (req.body as { stream?: boolean }).stream !== false &&
+        (req.headers.accept?.includes('text/event-stream') ||
+          (req.body as { stream?: boolean }).stream === true);
+
+      if (!wantsStreamForAttachment) {
+        res.json({ reply: attachmentAckReply });
+        return;
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+      res.write(
+        `data: ${JSON.stringify({ type: 'chunk', text: attachmentAckReply })}\n\n`
+      );
+      res.write(
+        `data: ${JSON.stringify({ type: 'done', reply: attachmentAckReply })}\n\n`
+      );
+      res.end();
+      return;
+    }
+
+    const ai = getGeminiClient();
 
     // Se o cliente enviou áudio, realiza a transcrição oficial via Gemini antes da resposta consultiva
     let audioTranscription: string | null = null;
@@ -1937,12 +2037,6 @@ ${realStockContext}${clientFipeLookupContext}`;
         }):\n"${safeReplyToPreview}"\nResponda levando exatamente essa mensagem citada como referência principal.`
       : '';
 
-    const mediaInstructionPrompt = parsedAttachment
-      ? parsedAttachment.mimeType === 'application/pdf'
-        ? `\n\n[ANEXO PDF RECEBIDO: ${body.attachment?.name || 'documento.pdf'}]\nAnalise o PDF anexado (ex.: CRLV, ficha técnica, proposta ou simulação). Extraia apenas dados comerciais úteis do veículo (marca, modelo, ano, versão, condições) para orientar o cliente. Por LGPD, NUNCA repita dados pessoais sensíveis (CPF, RG, endereço, RENAVAM completo ou dados bancários) eventualmente presentes no documento.`
-        : `\n\n[FOTO/IMAGEM RECEBIDA: ${body.attachment?.name || 'imagem.jpg'}]\nAnalise atentamente a imagem enviada pelo cliente. Se for um veículo (por exemplo, o carro usado do cliente para avaliação na troca), identifique o que for visível (modelo/carroceria aproximada, cor, estado aparente de lataria/rodas/interior ou painel), elogie ou comente objetivamente o que observou sem inventar defeitos ou detalhes não visíveis, peça apenas ano/versão/km caso ainda não tenha sido informado e convide para pré-avaliação/visita no showroom.`
-      : '';
-
     const systemInstruction = `Você é o Consultor Oficial da revenda "${dealership}" (${s?.address || 'Av. Ibirapuera, 2.840 — Moema'}, ${s?.city || 'São Paulo'}/${s?.state || 'SP'}).
 Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursSaturday || '09:00 às 16:00'} | WhatsApp: ${s?.whatsapp || '(11) 99482-1040'}.
 
@@ -1965,40 +2059,15 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 4. MINIMIZAÇÃO DE DADOS E PRIVACIDADE (LGPD):
 - Solicite APENAS os dados estritamente necessários para o atendimento inicial: **Nome** e **WhatsApp**.
 - É PROIBIDO solicitar CPF, RG, CNH, endereço residencial, comprovante de renda, dados bancários ou número de cartão pelo chat.
-- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente (inclusive em fotos ou PDFs), NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.`;
+- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente, NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.`;
 
-    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}${mediaInstructionPrompt}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
+    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
 
-    // Para anexos visuais/PDF, usa gemini-4-hydrogen multimodal; para texto/áudio já transcrito, mantém gemini-3.1-flash-lite ultrarrápido
-    const usesMultimodalAttachment = Boolean(parsedAttachment);
-    const selectedModel = usesMultimodalAttachment
-      ? 'gemini-4-hydrogen'
-      : 'gemini-3.1-flash-lite';
-
-    const chatConfig = usesMultimodalAttachment
-      ? {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          systemInstruction,
-        }
-      : {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-          maxOutputTokens: 500,
-          systemInstruction,
-        };
-
-    const geminiContents = parsedAttachment
-      ? {
-          parts: [
-            {
-              inlineData: {
-                mimeType: parsedAttachment.mimeType,
-                data: parsedAttachment.base64,
-              },
-            },
-            { text: contentsPrompt },
-          ],
-        }
-      : contentsPrompt;
+    const chatConfig = {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+      maxOutputTokens: 500,
+      systemInstruction,
+    };
 
     const auditSessionId = sanitizeSessionId(body.sessionId);
     const auditOrigin = sanitizeOrigin(body.origem);
@@ -2007,9 +2076,7 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
         lastUserMessageRaw.trim() ||
         (parsedAudio
           ? audioTranscription || 'Mensagem de áudio'
-          : parsedAttachment
-            ? `Anexo enviado: ${body.attachment?.name || 'arquivo'}`
-            : '');
+          : '');
       await recordChatAuditTurn(
         auditSessionId,
         auditOrigin,
@@ -2021,12 +2088,6 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
           replyToSender: safeReplyToSender,
           audioUrl: parsedAudio?.cleanDataUrl ?? null,
           transcription: audioTranscription,
-          attachmentUrl: parsedAttachment?.cleanDataUrl ?? null,
-          attachmentName:
-            typeof body.attachment?.name === 'string'
-              ? body.attachment.name.trim().slice(0, 250)
-              : null,
-          attachmentMime: parsedAttachment?.mimeType ?? null,
         }
       );
     }
@@ -2039,8 +2100,8 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
     if (!wantsStream) {
       const response = await callGeminiWithRetry(() =>
         ai.models.generateContent({
-          model: selectedModel,
-          contents: geminiContents,
+          model: 'gemini-3.1-flash-lite',
+          contents: contentsPrompt,
           config: chatConfig,
         })
       );
@@ -2064,8 +2125,8 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 
     const stream = await callGeminiWithRetry(() =>
       ai.models.generateContentStream({
-        model: selectedModel,
-        contents: geminiContents,
+        model: 'gemini-3.1-flash-lite',
+        contents: contentsPrompt,
         config: chatConfig,
       })
     );
