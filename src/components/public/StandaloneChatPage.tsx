@@ -24,6 +24,7 @@ import {
   Send,
   ShieldCheck,
   Trash2,
+  User,
   UserCheck,
   UserPlus,
   Wallet,
@@ -38,6 +39,7 @@ import {
   Vehicle,
 } from '../../types';
 import { formatWhatsAppLink } from '../../utils/formatters';
+import { formatBrazilianPhone } from '../../utils/chatTags';
 import {
   AUDIO_CAPTURE_CONSTRAINTS,
   AUDIO_RECORDING_BITRATE,
@@ -101,6 +103,9 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
+  const [introName, setIntroName] = useState('');
+  const [introPhone, setIntroPhone] = useState('');
+  const [introError, setIntroError] = useState<string | null>(null);
 
   // Attachment state
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
@@ -151,6 +156,9 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setCustomerName,
     customerWhatsapp,
     setCustomerWhatsapp,
+    needsInitialIdentification,
+    isIdentifying,
+    completeInitialIdentification,
     lgpdConsent,
     setLgpdConsent,
     isSavingLead,
@@ -209,7 +217,35 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setLightboxImage(null);
     setHeaderMenuOpen(false);
     setConfirmClearOpen(false);
+    setIntroName('');
+    setIntroPhone('');
+    setIntroError(null);
     resetConversation();
+  };
+
+  const handleInitialIdentificationSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isIdentifying) return;
+    const cleanName = introName.replace(/\s+/g, ' ').trim();
+    if (cleanName.length < 2) {
+      setIntroError('Por favor, informe seu nome para iniciarmos.');
+      return;
+    }
+    const phoneDigits = introPhone.replace(/\D/g, '');
+    if (phoneDigits.length > 0 && phoneDigits.length < 10) {
+      setIntroError(
+        'Telefone incompleto. Preencha com DDD ou deixe em branco (opcional).'
+      );
+      return;
+    }
+    setIntroError(null);
+    await completeInitialIdentification(
+      cleanName,
+      phoneDigits.length >= 10 ? formatBrazilianPhone(introPhone) : undefined
+    );
+    window.setTimeout(() => {
+      textInputRef.current?.focus();
+    }, 80);
   };
 
   const buildReplyPreviewForMessage = (msg: ChatMessage): string => {
@@ -624,9 +660,12 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               type="tel"
               required
               value={customerWhatsapp}
-              onChange={(e) => setCustomerWhatsapp(e.target.value)}
+              onChange={(e) =>
+                setCustomerWhatsapp(formatBrazilianPhone(e.target.value))
+              }
               placeholder="(11) 99999-9999"
               disabled={isSavingLead}
+              maxLength={15}
               className="w-full min-h-[44px] px-3.5 py-2 bg-white border border-[#D1D7DB] focus:border-[#00A884] rounded-xl text-sm text-[#111B21] font-mono placeholder:text-[#8696A0] focus:outline-none"
             />
           </div>
@@ -1495,7 +1534,9 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 {/* Attachment Clip Button */}
                 <button
                   type="button"
-                  disabled={isSending || isProcessingFile}
+                  disabled={
+                    isSending || isProcessingFile || needsInitialIdentification
+                  }
                   onClick={() => setAttachMenuOpen((prev) => !prev)}
                   aria-label="Anexar foto ou documento PDF"
                   title="Anexar foto ou PDF"
@@ -1516,19 +1557,26 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                   ref={textInputRef}
                   type="text"
                   value={input}
+                  disabled={needsInitialIdentification}
                   onChange={(e) => setInput(e.target.value)}
                   placeholder={
-                    pendingAttachment
-                      ? 'Adicione uma legenda opcional ou envie...'
-                      : 'Mensagem'
+                    needsInitialIdentification
+                      ? 'Informe seu nome para começar...'
+                      : pendingAttachment
+                        ? 'Adicione uma legenda opcional ou envie...'
+                        : 'Mensagem'
                   }
-                  className="flex-1 min-h-[44px] px-4 py-2 bg-white border border-transparent focus:border-[#00A884]/50 rounded-full text-[15px] text-[#111B21] placeholder:text-[#667781] shadow-[0_1px_1px_rgba(11,20,26,0.08)] focus:outline-none"
+                  className="flex-1 min-h-[44px] px-4 py-2 bg-white border border-transparent focus:border-[#00A884]/50 rounded-full text-[15px] text-[#111B21] placeholder:text-[#667781] shadow-[0_1px_1px_rgba(11,20,26,0.08)] focus:outline-none disabled:bg-[#F5F6F7] disabled:cursor-not-allowed"
                 />
 
                 {canSendTextOrAttachment ? (
                   <button
                     type="submit"
-                    disabled={isSending || isProcessingFile}
+                    disabled={
+                      isSending ||
+                      isProcessingFile ||
+                      needsInitialIdentification
+                    }
                     aria-label="Enviar mensagem"
                     className="w-[44px] h-[44px] rounded-full bg-[#00A884] hover:bg-[#008F72] disabled:bg-[#8696A0] text-white shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
                   >
@@ -1537,7 +1585,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 ) : (
                   <button
                     type="button"
-                    disabled={isSending || isProcessingFile}
+                    disabled={
+                      isSending ||
+                      isProcessingFile ||
+                      needsInitialIdentification
+                    }
                     onClick={() => void startAudioRecording()}
                     aria-label="Gravar mensagem de áudio"
                     title="Gravar áudio"
@@ -1676,6 +1728,151 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 Iniciar nova conversa
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Initial Identification Popup (First Visit / Unidentified Session) */}
+      {needsInitialIdentification && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="intro-identify-title"
+          className="fixed inset-0 z-50 bg-[#0B141A]/65 backdrop-blur-[2px] flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-[400px] bg-white rounded-2xl shadow-2xl border border-[#D1D7DB] overflow-hidden">
+            {/* Friendly WhatsApp-harmonized top bar */}
+            <div className="bg-[#075E54] px-5 py-4 text-white flex items-center gap-3">
+              <div className="w-11 h-11 rounded-full bg-[#111B21] border border-white/25 flex items-center justify-center shrink-0 relative">
+                <User className="w-5 h-5 text-[#25D366]" />
+                <span className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-[#25D366] ring-2 ring-[#075E54]" />
+              </div>
+              <div className="min-w-0">
+                <h2
+                  id="intro-identify-title"
+                  className="font-display text-base font-semibold leading-tight text-white truncate"
+                >
+                  {effectiveSettings.tradeName}
+                </h2>
+                <p className="text-xs text-[#D9FDD3] mt-0.5">
+                  Consultor Virtual · Atendimento imediato
+                </p>
+              </div>
+            </div>
+
+            <form
+              onSubmit={(e) => void handleInitialIdentificationSubmit(e)}
+              className="p-5 space-y-4"
+            >
+              <div className="space-y-1">
+                <p className="text-sm font-semibold text-[#111B21]">
+                  Olá! Como podemos te chamar?
+                </p>
+                <p className="text-xs text-[#54656F] leading-relaxed">
+                  Informe seu nome para iniciarmos um atendimento personalizado
+                  sobre nosso estoque, FIPE, trocas e financiamento.
+                </p>
+              </div>
+
+              {introError && (
+                <div className="p-2.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{introError}</span>
+                </div>
+              )}
+
+              <div className="space-y-3">
+                <div>
+                  <label
+                    htmlFor="intro-visitor-name"
+                    className="block text-xs font-semibold text-[#3B4A54] mb-1"
+                  >
+                    Seu Nome <span className="text-red-600">*</span>
+                  </label>
+                  <input
+                    id="intro-visitor-name"
+                    type="text"
+                    required
+                    autoFocus
+                    autoComplete="name"
+                    value={introName}
+                    onChange={(e) => {
+                      setIntroName(e.target.value);
+                      if (introError) setIntroError(null);
+                    }}
+                    placeholder="Ex: João Silva"
+                    disabled={isIdentifying}
+                    className="w-full min-h-[46px] px-3.5 py-2.5 bg-[#F8F9FA] border border-[#D1D7DB] focus:bg-white focus:border-[#00A884] rounded-xl text-sm text-[#111B21] placeholder:text-[#8696A0] focus:outline-none transition-colors"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label
+                      htmlFor="intro-visitor-phone"
+                      className="block text-xs font-semibold text-[#3B4A54]"
+                    >
+                      Seu WhatsApp / Telefone
+                    </label>
+                    <span className="text-[11px] font-medium text-[#667781]">
+                      Opcional
+                    </span>
+                  </div>
+                  <input
+                    id="intro-visitor-phone"
+                    type="tel"
+                    inputMode="tel"
+                    autoComplete="tel"
+                    value={introPhone}
+                    onChange={(e) => {
+                      setIntroPhone(formatBrazilianPhone(e.target.value));
+                      if (introError) setIntroError(null);
+                    }}
+                    placeholder="(00) 00000-0000"
+                    maxLength={15}
+                    disabled={isIdentifying}
+                    className="w-full min-h-[46px] px-3.5 py-2.5 bg-[#F8F9FA] border border-[#D1D7DB] focus:bg-white focus:border-[#00A884] rounded-xl text-sm text-[#111B21] font-mono placeholder:text-[#8696A0] focus:outline-none transition-colors"
+                  />
+                  <p className="mt-1.5 text-[11px] text-[#667781] leading-relaxed flex items-start gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-[#008069] shrink-0 mt-0.5" />
+                    <span>
+                      Caso informado, seu número será usado apenas para retorno
+                      deste atendimento, conforme nossa{' '}
+                      {onOpenPrivacy ? (
+                        <button
+                          type="button"
+                          onClick={onOpenPrivacy}
+                          className="text-[#008069] hover:underline font-medium"
+                        >
+                          Política de Privacidade (LGPD)
+                        </button>
+                      ) : (
+                        <span>Política de Privacidade (LGPD)</span>
+                      )}
+                      .
+                    </span>
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isIdentifying || introName.trim().length < 2}
+                className="w-full min-h-[48px] px-4 py-3 rounded-xl text-sm font-semibold text-white bg-[#00A884] hover:bg-[#008F72] disabled:opacity-50 transition-colors inline-flex items-center justify-center gap-2 shadow-sm active:scale-[0.99] cursor-pointer"
+              >
+                {isIdentifying ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Iniciando atendimento...</span>
+                  </>
+                ) : (
+                  <>
+                    <MessageCircle className="w-4 h-4" />
+                    <span>Iniciar Atendimento</span>
+                  </>
+                )}
+              </button>
+            </form>
           </div>
         </div>
       )}

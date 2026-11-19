@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import { Lead, LeadStage, Vehicle } from '../../types';
+import { getChatTagConfig } from '../../utils/chatTags';
 import { formatBRL, formatWhatsAppLink } from '../../utils/formatters';
 import { ChatMarkdown } from '../public/ChatMarkdown';
 
@@ -107,7 +108,7 @@ export const CrmModule: React.FC<CrmModuleProps> = ({
   const filteredLeads = leads.filter((lead) => {
     const term = search.trim().toLowerCase();
     if (!term) return true;
-    return `${lead.name} ${lead.whatsapp} ${lead.vehicleInterestLabel} ${lead.source}`
+    return `${lead.name} ${lead.whatsapp} ${lead.vehicleInterestLabel} ${lead.source} ${lead.tag || ''}`
       .toLowerCase()
       .includes(term);
   });
@@ -425,8 +426,21 @@ export const CrmModule: React.FC<CrmModuleProps> = ({
                           {lead.vehicleInterestLabel}
                         </p>
 
-                        <p className="text-xs text-zinc-400 mt-1.5 font-mono tabular-nums">
-                          {lead.whatsapp} · {lead.source}
+                        {(() => {
+                          const tagCfg = getChatTagConfig(lead.tag);
+                          return tagCfg ? (
+                            <div className="mt-1.5">
+                              <span
+                                className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10.5px] font-medium ${tagCfg.badgeClass}`}
+                              >
+                                {tagCfg.label}
+                              </span>
+                            </div>
+                          ) : null;
+                        })()}
+
+                        <p className="text-xs text-zinc-400 mt-1.5 font-mono tabular-nums truncate">
+                          {lead.whatsapp || 'Sem WhatsApp'} · {lead.source}
                         </p>
 
                         {lead.visitScheduled && (
@@ -504,11 +518,23 @@ export const CrmModule: React.FC<CrmModuleProps> = ({
                     className="hover:bg-white/[0.02] cursor-pointer transition-colors"
                   >
                     <td className="py-3.5 px-5">
-                      <p className="font-medium text-white">{lead.name}</p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-medium text-white">{lead.name}</p>
+                        {(() => {
+                          const tagCfg = getChatTagConfig(lead.tag);
+                          return tagCfg ? (
+                            <span
+                              className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10.5px] font-medium ${tagCfg.badgeClass}`}
+                            >
+                              {tagCfg.label}
+                            </span>
+                          ) : null;
+                        })()}
+                      </div>
                       <p className="text-xs text-zinc-500">{lead.city}</p>
                     </td>
                     <td className="py-3.5 px-4 font-mono text-xs text-zinc-300 tabular-nums whitespace-nowrap">
-                      {lead.whatsapp}
+                      {lead.whatsapp || 'Sem WhatsApp'}
                     </td>
                     <td className="py-3.5 px-4 text-xs text-zinc-200">
                       {lead.vehicleInterestLabel}
@@ -558,9 +584,21 @@ export const CrmModule: React.FC<CrmModuleProps> = ({
           <div className="w-full max-w-xl bg-[#111114] border-l border-white/[0.1] h-full flex flex-col">
             <div className="px-6 py-4 border-b border-white/[0.08] flex items-center justify-between gap-4">
               <div className="min-w-0">
-                <h2 className="font-display text-base font-semibold text-white truncate">
-                  {selectedLead.name}
-                </h2>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="font-display text-base font-semibold text-white truncate">
+                    {selectedLead.name}
+                  </h2>
+                  {(() => {
+                    const tagCfg = getChatTagConfig(selectedLead.tag);
+                    return tagCfg ? (
+                      <span
+                        className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium ${tagCfg.badgeClass}`}
+                      >
+                        {tagCfg.label}
+                      </span>
+                    ) : null;
+                  })()}
+                </div>
                 <p className="text-xs text-zinc-400 truncate mt-0.5">
                   {selectedLead.source} · Capturado {selectedLead.createdAt}
                 </p>
@@ -577,18 +615,24 @@ export const CrmModule: React.FC<CrmModuleProps> = ({
             <div className="flex-1 overflow-y-auto p-6 space-y-6">
               {/* Quick Actions & Contact */}
               <div className="flex flex-wrap items-center gap-3">
-                <a
-                  href={formatWhatsAppLink(
-                    selectedLead.whatsapp,
-                    `Olá ${selectedLead.name.split(' ')[0]}, sou da Armazém do Carro e estou continuando seu atendimento sobre o ${selectedLead.vehicleInterestLabel}.`
-                  )}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 transition-colors whitespace-nowrap"
-                >
-                  <MessageCircle className="w-3.5 h-3.5" />
-                  <span>Chamar no WhatsApp ({selectedLead.whatsapp})</span>
-                </a>
+                {selectedLead.whatsapp.replace(/\D/g, '').length >= 8 ? (
+                  <a
+                    href={formatWhatsAppLink(
+                      selectedLead.whatsapp,
+                      `Olá ${selectedLead.name.split(' ')[0]}, sou da Armazém do Carro e estou continuando seu atendimento sobre o ${selectedLead.vehicleInterestLabel}.`
+                    )}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 transition-colors whitespace-nowrap"
+                  >
+                    <MessageCircle className="w-3.5 h-3.5" />
+                    <span>Chamar no WhatsApp ({selectedLead.whatsapp})</span>
+                  </a>
+                ) : (
+                  <span className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs text-zinc-400 bg-white/[0.04] border border-white/[0.08]">
+                    Sem telefone cadastrado nesta sessão
+                  </span>
+                )}
 
                 <button
                   type="button"
@@ -610,7 +654,7 @@ export const CrmModule: React.FC<CrmModuleProps> = ({
                 <div>
                   <span className="text-zinc-500 block">Telefone / WhatsApp</span>
                   <span className="font-mono text-white font-medium tabular-nums">
-                    {selectedLead.whatsapp}
+                    {selectedLead.whatsapp || 'Não informado'}
                   </span>
                 </div>
                 <div>
@@ -675,11 +719,11 @@ export const CrmModule: React.FC<CrmModuleProps> = ({
                   </button>
                 </div>
                 <textarea
-                  rows={2}
+                  rows={5}
                   value={notesDraft}
                   onChange={(e) => setNotesDraft(e.target.value)}
                   onBlur={() => void handleSaveDetails()}
-                  className="w-full px-3 py-2 bg-[#09090B] border border-white/[0.1] rounded-lg text-xs text-zinc-200 focus:outline-none focus:border-red-600"
+                  className="w-full px-3 py-2 bg-[#09090B] border border-white/[0.1] rounded-lg text-xs text-zinc-200 leading-relaxed focus:outline-none focus:border-red-600"
                 />
               </div>
 

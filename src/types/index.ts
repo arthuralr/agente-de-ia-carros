@@ -121,6 +121,7 @@ export interface Lead {
   lgpdConsent?: boolean;
   lgpdConsentAt?: string;
   chatSessionId?: string;
+  tag?: string | null;
   chatHistory: ChatMessage[];
 }
 
@@ -130,6 +131,9 @@ export interface ChatSessionSummary {
   leadName: string | null;
   leadPhone: string | null;
   origem: string;
+  tag?: string | null;
+  aiSummary?: string | null;
+  aiSummaryUpdatedAt?: string | null;
   createdAt: string;
   updatedAt: string;
   messageCount: number;

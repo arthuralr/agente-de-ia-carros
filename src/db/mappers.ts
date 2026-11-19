@@ -40,6 +40,9 @@ export interface ApiLeadRow {
   chat_history: string | null;
   lgpd_consent?: boolean | null;
   lgpd_consent_at?: string | null;
+  chat_session_id?: string | null;
+  tag?: string | null;
+  notes?: string | null;
   created_at: string;
 }
 
@@ -207,7 +210,7 @@ export function mapDbLeadToFrontend(row: ApiLeadRow): Lead {
     lastActivity: seedMatch?.lastActivity || formattedCreatedAt,
     visitScheduled: seedMatch?.visitScheduled,
     proposalValue: seedMatch?.proposalValue,
-    notes: seedMatch?.notes || '',
+    notes: row.notes?.trim() ? row.notes : seedMatch?.notes || '',
     lgpdConsent: row.lgpd_consent ?? true,
     lgpdConsentAt: row.lgpd_consent_at
       ? new Date(row.lgpd_consent_at).toLocaleString('pt-BR', {
@@ -218,6 +221,8 @@ export function mapDbLeadToFrontend(row: ApiLeadRow): Lead {
           minute: '2-digit',
         })
       : undefined,
+    chatSessionId: row.chat_session_id || undefined,
+    tag: row.tag || null,
     chatHistory,
   };
 }

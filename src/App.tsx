@@ -534,6 +534,8 @@ export default function App() {
           phone: updated.whatsapp,
           vehicle_interest: updated.vehicleInterestLabel,
           stage: updated.stage,
+          notes: updated.notes,
+          tag: updated.tag,
           chat_history: JSON.stringify(updated.chatHistory),
         }),
       });
@@ -972,6 +974,30 @@ export default function App() {
             <ChatAuditModule
               settings={settings}
               onUnauthorized={() => handleUnauthorizedSession()}
+              onLeadSyncedFromChat={(syncedLead, action) => {
+                setLeads((prev) => {
+                  const exists = prev.some((l) => l.id === syncedLead.id);
+                  if (exists) {
+                    return prev.map((l) =>
+                      l.id === syncedLead.id ? syncedLead : l
+                    );
+                  }
+                  return [syncedLead, ...prev];
+                });
+                pushActivity(
+                  action === 'created'
+                    ? 'Card criado automaticamente no CRM'
+                    : 'Card atualizado automaticamente no CRM',
+                  `${syncedLead.name}${syncedLead.tag ? ` · ${syncedLead.tag}` : ''}`,
+                  'crm'
+                );
+              }}
+              onOpenCrm={(leadId) => {
+                if (leadId) {
+                  setPreselectedLeadId(leadId);
+                }
+                handleSelectAdminModule('crm');
+              }}
             />
           )}
 

@@ -971,6 +971,62 @@ app.get('/api/public/chat-session/:sessionId', async (req, res) => {
   }
 });
 
+app.post('/api/public/chat-session/identify', async (req, res) => {
+  try {
+    const cleanSessionId = sanitizeSessionId(req.body?.sessionId);
+    const rawName =
+      typeof req.body?.leadName === 'string'
+        ? req.body.leadName.replace(/\s+/g, ' ').trim()
+        : '';
+    const rawPhone =
+      typeof req.body?.leadPhone === 'string'
+        ? req.body.leadPhone.trim().slice(0, 40)
+        : '';
+    const cleanOrigin = sanitizeOrigin(req.body?.origem);
+
+    if (!cleanSessionId) {
+      res.status(400).json({ error: 'Sessão inválida.' });
+      return;
+    }
+    if (rawName.length < 2) {
+      res.status(400).json({ error: 'Informe seu nome para iniciar o atendimento.' });
+      return;
+    }
+
+    const safeName = rawName.slice(0, 120);
+    const phoneDigits = rawPhone.replace(/\D/g, '');
+    const safePhone = phoneDigits.length >= 8 ? rawPhone : null;
+
+    const result = await pool.query<{
+      session_id: string;
+      lead_name: string | null;
+      lead_phone: string | null;
+    }>(
+      `INSERT INTO chat_sessions (session_id, lead_name, lead_phone, origem, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       ON CONFLICT (session_id)
+       DO UPDATE SET lead_name = EXCLUDED.lead_name,
+                     lead_phone = COALESCE(NULLIF(BTRIM(EXCLUDED.lead_phone), ''), chat_sessions.lead_phone),
+                     updated_at = NOW()
+       RETURNING session_id, lead_name, lead_phone`,
+      [cleanSessionId, safeName, safePhone, cleanOrigin]
+    );
+
+    const row = result.rows[0];
+    res.json({
+      sessionId: row?.session_id ?? cleanSessionId,
+      leadName: row?.lead_name ?? safeName,
+      leadPhone: row?.lead_phone ?? safePhone,
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao salvar identificação do visitante.';
+    res.status(500).json({ error: message });
+  }
+});
+
 app.patch('/api/admin/settings/operation-mode', requireAdminAuth, async (req, res) => {
   try {
     const requested =
@@ -1009,34 +1065,37 @@ app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
          s.id,
          s.session_id,
          s.lead_name,
-         s.lead_phone,
-         s.origem,
-         s.created_at,
-         s.updated_at,
-         COALESCE(m_agg.message_count, 0)::int AS message_count,
-         CASE
-           WHEN m_last.audio_url IS NOT NULL THEN
-             COALESCE(NULLIF(TRIM(m_last.transcription), ''), NULLIF(TRIM(m_last.content), ''), '[Mensagem de áudio]')
-           WHEN m_last.attachment_url IS NOT NULL THEN
-             COALESCE(NULLIF(TRIM(m_last.content), ''), CONCAT('[Anexo: ', COALESCE(m_last.attachment_name, 'arquivo'), ']'))
-           ELSE m_last.content
-         END AS last_message,
-         m_last.sender AS last_sender
-       FROM chat_sessions s
-       LEFT JOIN (
-         SELECT session_id, COUNT(*)::int AS message_count
-         FROM chat_messages
-         GROUP BY session_id
-       ) m_agg ON m_agg.session_id = s.session_id
-       LEFT JOIN LATERAL (
-         SELECT content, sender, audio_url, transcription, attachment_url, attachment_name
-         FROM chat_messages
-         WHERE session_id = s.session_id
-         ORDER BY id DESC
-         LIMIT 1
-       ) m_last ON true
-       ORDER BY s.updated_at DESC, s.id DESC
-       LIMIT 200`
+          s.lead_phone,
+          s.origem,
+          s.tag,
+          s.ai_summary,
+          s.ai_summary_updated_at,
+          s.created_at,
+          s.updated_at,
+          COALESCE(m_agg.message_count, 0)::int AS message_count,
+          CASE
+            WHEN m_last.audio_url IS NOT NULL THEN
+              COALESCE(NULLIF(TRIM(m_last.transcription), ''), NULLIF(TRIM(m_last.content), ''), '[Mensagem de áudio]')
+            WHEN m_last.attachment_url IS NOT NULL THEN
+              COALESCE(NULLIF(TRIM(m_last.content), ''), CONCAT('[Anexo: ', COALESCE(m_last.attachment_name, 'arquivo'), ']'))
+            ELSE m_last.content
+          END AS last_message,
+          m_last.sender AS last_sender
+        FROM chat_sessions s
+        LEFT JOIN (
+          SELECT session_id, COUNT(*)::int AS message_count
+          FROM chat_messages
+          GROUP BY session_id
+        ) m_agg ON m_agg.session_id = s.session_id
+        LEFT JOIN LATERAL (
+          SELECT content, sender, audio_url, transcription, attachment_url, attachment_name
+          FROM chat_messages
+          WHERE session_id = s.session_id
+          ORDER BY id DESC
+          LIMIT 1
+        ) m_last ON true
+        ORDER BY s.updated_at DESC, s.id DESC
+        LIMIT 200`
     );
 
     res.json(
@@ -1046,6 +1105,9 @@ app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
         leadName: row.lead_name,
         leadPhone: row.lead_phone,
         origem: row.origem,
+        tag: row.tag ?? null,
+        aiSummary: row.ai_summary ?? null,
+        aiSummaryUpdatedAt: row.ai_summary_updated_at ?? null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         messageCount: Number(row.message_count) || 0,
@@ -1112,6 +1174,9 @@ app.get(
           leadName: s.lead_name,
           leadPhone: s.lead_phone,
           origem: s.origem,
+          tag: s.tag ?? null,
+          aiSummary: s.ai_summary ?? null,
+          aiSummaryUpdatedAt: s.ai_summary_updated_at ?? null,
           createdAt: s.created_at,
           updatedAt: s.updated_at,
         },
@@ -1139,6 +1204,579 @@ app.get(
         err instanceof Error
           ? err.message
           : 'Erro ao carregar mensagens da sessão.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
+const ALLOWED_CHAT_SESSION_TAGS: Record<string, string> = {
+  'Lead Quente': '🔥 Lead Quente',
+  Financiamento: '💰 Financiamento',
+  Troca: '🔄 Troca',
+  'Agendar Visita': '📅 Agendar Visita',
+  'Frio / Dúvida': '❄️ Frio / Dúvida',
+};
+
+app.patch(
+  '/api/admin/chat-sessions/:sessionId/tag',
+  requireAdminAuth,
+  async (req, res) => {
+    const sessionId = sanitizeSessionId(req.params.sessionId);
+    if (!sessionId) {
+      res.status(400).json({ error: 'Identificador de sessão inválido.' });
+      return;
+    }
+
+    const rawTag =
+      typeof req.body?.tag === 'string' ? req.body.tag.trim() : '';
+    const nextTag = rawTag.length > 0 ? rawTag : null;
+
+    if (nextTag && !ALLOWED_CHAT_SESSION_TAGS[nextTag]) {
+      res.status(400).json({
+        error: 'Etiqueta de classificação inválida.',
+      });
+      return;
+    }
+
+    try {
+      const sessionRes = await pool.query<DbChatSessionRow>(
+        `UPDATE chat_sessions
+         SET tag = $1, updated_at = NOW()
+         WHERE session_id = $2
+         RETURNING *`,
+        [nextTag, sessionId]
+      );
+
+      if (sessionRes.rowCount === 0) {
+        res.status(404).json({ error: 'Sessão de conversa não encontrada.' });
+        return;
+      }
+
+      const session = sessionRes.rows[0];
+
+      if (!nextTag) {
+        res.json({
+          sessionId: session.session_id,
+          tag: null,
+          crmAction: 'none',
+          lead: null,
+        });
+        return;
+      }
+
+      const tagLabel = ALLOWED_CHAT_SESSION_TAGS[nextTag];
+
+      // Carrega histórico recente da sessão para compor resumo e transcript do CRM
+      const msgRes = await pool.query<{
+        id: number;
+        sender: 'user' | 'assistant';
+        content: string;
+        transcription: string | null;
+        attachment_name: string | null;
+        created_at: Date;
+      }>(
+        `SELECT id, sender, content, transcription, attachment_name, created_at
+         FROM chat_messages
+         WHERE session_id = $1
+         ORDER BY id ASC
+         LIMIT 60`,
+        [sessionId]
+      );
+
+      const lightweightChatHistory = msgRes.rows.map((m) => {
+        const text =
+          m.content?.trim() ||
+          (m.transcription?.trim()
+            ? `[Áudio] ${m.transcription.trim()}`
+            : m.attachment_name
+              ? `[Anexo: ${m.attachment_name}]`
+              : '');
+        const timestamp = m.created_at
+          ? new Date(m.created_at).toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit',
+            })
+          : 'Hoje';
+        return {
+          id: `audit-${m.id}`,
+          sender: m.sender === 'user' ? 'cliente' : 'ia',
+          text,
+          timestamp,
+        };
+      });
+
+      const lastUserMsg = [...msgRes.rows]
+        .reverse()
+        .find((m) => m.sender === 'user');
+      const lastAnyMsg = msgRes.rows[msgRes.rows.length - 1];
+      const rawSnippet =
+        lastUserMsg?.transcription?.trim() ||
+        lastUserMsg?.content?.trim() ||
+        (lastUserMsg?.attachment_name
+          ? `Anexo enviado: ${lastUserMsg.attachment_name}`
+          : '') ||
+        lastAnyMsg?.content?.trim() ||
+        '';
+      const cleanSnippet = rawSnippet.replace(/\s+/g, ' ').trim().slice(0, 180);
+
+      const leadName =
+        session.lead_name?.trim() || `Visitante #${session.id}`;
+      const leadPhone = session.lead_phone?.trim() || '';
+      const normalizedPhoneDigits = leadPhone.replace(/\D/g, '');
+      const autoSummary = `[${tagLabel}] Origem: Chat IA (${session.origem})${
+        cleanSnippet ? `\nÚltima interação: "${cleanSnippet}"` : ''
+      }`;
+      const defaultInterest = `${tagLabel} · Chat IA (${session.origem})`;
+
+      // Busca lead existente por chat_session_id ou telefone normalizado para evitar duplicidade
+      let existingLead: DbLeadRow | null = null;
+      const bySessionRes = await pool.query<DbLeadRow>(
+        'SELECT * FROM leads WHERE chat_session_id = $1 ORDER BY id DESC LIMIT 1',
+        [sessionId]
+      );
+      if (bySessionRes.rows[0]) {
+        existingLead = bySessionRes.rows[0];
+      } else if (normalizedPhoneDigits.length >= 8) {
+        const byPhoneRes = await pool.query<DbLeadRow>(
+          `SELECT *
+           FROM leads
+           WHERE REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g') = $1
+           ORDER BY id DESC
+           LIMIT 1`,
+          [normalizedPhoneDigits]
+        );
+        if (byPhoneRes.rows[0]) {
+          existingLead = byPhoneRes.rows[0];
+        }
+      }
+
+      if (existingLead) {
+        const shouldUpgradeName =
+          Boolean(session.lead_name?.trim()) &&
+          /^Visitante/i.test(existingLead.name || '');
+        const resolvedName = shouldUpgradeName
+          ? session.lead_name!.trim()
+          : existingLead.name;
+        const resolvedPhone = existingLead.phone?.trim()
+          ? existingLead.phone
+          : leadPhone;
+
+        const existingInterest = (existingLead.vehicle_interest || '').trim();
+        const isGenericInterest =
+          !existingInterest ||
+          /^(Atendimento|Consultoria|🔥|💰|🔄|📅|❄️)/i.test(existingInterest);
+        const resolvedInterest = isGenericInterest
+          ? defaultInterest
+          : existingInterest;
+
+        // Preserva anotações manuais anteriores do vendedor e atualiza o cabeçalho automático
+        const prevNotes = (existingLead.notes || '').trim();
+        const cleanedManualNotes = prevNotes
+          .replace(/^\[[^\]]+\]\s*Origem:[^\n]*(?:\nÚltima interação:[^\n]*)?\n*/m, '')
+          .trim();
+        const mergedNotes = cleanedManualNotes
+          ? `${autoSummary}\n\n${cleanedManualNotes}`
+          : autoSummary;
+
+        const updatedRes = await pool.query<DbLeadRow>(
+          `UPDATE leads
+           SET name = $1,
+               phone = $2,
+               vehicle_interest = $3,
+               tag = $4,
+               chat_session_id = COALESCE(chat_session_id, $5),
+               notes = $6,
+               chat_history = CASE
+                 WHEN $7::text <> '[]' THEN $7
+                 ELSE chat_history
+               END
+           WHERE id = $8
+           RETURNING *`,
+          [
+            resolvedName,
+            resolvedPhone,
+            resolvedInterest,
+            nextTag,
+            sessionId,
+            mergedNotes,
+            JSON.stringify(lightweightChatHistory),
+            existingLead.id,
+          ]
+        );
+
+        res.json({
+          sessionId: session.session_id,
+          tag: nextTag,
+          crmAction: 'updated',
+          lead: updatedRes.rows[0],
+        });
+        return;
+      }
+
+      const insertedRes = await pool.query<DbLeadRow>(
+        `INSERT INTO leads (
+           name,
+           phone,
+           vehicle_interest,
+           stage,
+           chat_history,
+           lgpd_consent,
+           lgpd_consent_at,
+           chat_session_id,
+           tag,
+           notes
+         )
+         VALUES ($1, $2, $3, 'Novo Lead', $4, $5, $6, $7, $8, $9)
+         RETURNING *`,
+        [
+          leadName,
+          leadPhone,
+          defaultInterest,
+          JSON.stringify(lightweightChatHistory),
+          Boolean(leadPhone),
+          leadPhone ? new Date() : null,
+          sessionId,
+          nextTag,
+          autoSummary,
+        ]
+      );
+
+      res.json({
+        sessionId: session.session_id,
+        tag: nextTag,
+        crmAction: 'created',
+        lead: insertedRes.rows[0],
+      });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Erro ao salvar etiqueta e sincronizar com o CRM.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
+app.post(
+  '/api/admin/chat-sessions/:sessionId/summary',
+  requireAdminAuth,
+  async (req, res) => {
+    const sessionId = sanitizeSessionId(req.params.sessionId);
+    if (!sessionId) {
+      res.status(400).json({ error: 'Identificador de sessão inválido.' });
+      return;
+    }
+
+    try {
+      const sessionRes = await pool.query<DbChatSessionRow>(
+        'SELECT * FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+        [sessionId]
+      );
+      if (sessionRes.rowCount === 0) {
+        res.status(404).json({ error: 'Sessão de conversa não encontrada.' });
+        return;
+      }
+      const session = sessionRes.rows[0];
+
+      const msgRes = await pool.query<{
+        id: number;
+        sender: 'user' | 'assistant';
+        content: string;
+        transcription: string | null;
+        attachment_name: string | null;
+        created_at: Date;
+      }>(
+        `SELECT id, sender, content, transcription, attachment_name, created_at
+         FROM chat_messages
+         WHERE session_id = $1
+         ORDER BY id ASC
+         LIMIT 80`,
+        [sessionId]
+      );
+
+      if (msgRes.rows.length === 0) {
+        res.status(400).json({
+          error:
+            'Esta sessão ainda não possui mensagens suficientes para gerar um resumo comercial.',
+        });
+        return;
+      }
+
+      // Monta transcrição estritamente textual (incluindo transcrições de áudio) sem enviar binários
+      const transcriptLines: string[] = [];
+      for (const m of msgRes.rows) {
+        const speaker = m.sender === 'user' ? 'Cliente' : 'Consultor IA';
+        const parts: string[] = [];
+        if (m.transcription?.trim()) {
+          parts.push(`[Áudio transcrito]: ${m.transcription.trim()}`);
+        }
+        if (m.content?.trim()) {
+          parts.push(m.content.trim());
+        }
+        if (m.attachment_name?.trim()) {
+          parts.push(`[Anexo enviado: ${m.attachment_name.trim()}]`);
+        }
+        const lineText = parts.join(' ').replace(/\s+/g, ' ').trim();
+        if (lineText) {
+          transcriptLines.push(`${speaker}: ${lineText.slice(0, 900)}`);
+        }
+      }
+
+      if (transcriptLines.length === 0) {
+        res.status(400).json({
+          error: 'Não há conteúdo textual nesta conversa para resumir.',
+        });
+        return;
+      }
+
+      const ai = getGeminiClient();
+      const summaryPrompt = `Gere um resumo comercial objetivo e escaneável em Português do Brasil para o vendedor de concessionária de seminovos (CRM), baseado exclusivamente no histórico abaixo.
+
+Dados da sessão:
+- Nome do visitante: ${session.lead_name?.trim() || 'Não informado'}
+- Telefone/WhatsApp: ${session.lead_phone?.trim() || 'Não informado'}
+- Origem: ${session.origem}
+- Etiqueta atual: ${session.tag || 'Sem etiqueta'}
+
+Histórico da conversa:
+${transcriptLines.join('\n').slice(0, 12000)}
+
+Regras obrigatórias de formato:
+- Responda APENAS com 4 tópicos curtos em bullet points (use "-" no início de cada linha), sem título introdutório e sem inventar dados que não estejam na conversa:
+- **Veículo / Interesse:** <modelo, versão ou categoria mencionada; se não informado, diga "Não especificado">
+- **Orçamento / Pagamento:** <faixa de valor, entrada, à vista, financiamento ou consórcio; se não mencionado, diga "Não informado">
+- **Veículo na Troca:** <modelo, ano, km ou condição citada; se não mencionado, diga "Não mencionado">
+- **Temperatura & Próximo Passo:** <Quente / Morno / Frio + ação prática e objetiva para o vendedor>`;
+
+      const summaryModelCandidates = [
+        'gemini-3.1-flash-lite',
+        'gemini-2.5-flash',
+        'gemini-4-hydrogen',
+      ] as const;
+
+      let summaryText = '';
+      let lastGeminiErr: unknown = null;
+
+      for (const modelName of summaryModelCandidates) {
+        try {
+          const response = await callGeminiWithRetry(
+            () =>
+              ai.models.generateContent({
+                model: modelName,
+                contents: summaryPrompt,
+                config: {
+                  systemInstruction:
+                    'Você é um gerente comercial automotivo sênior. Produz resumos ultraconcisos em tópicos para CRM de vendas de seminovos em pt-BR, sem alucinar fatos.',
+                  temperature: 0.2,
+                  maxOutputTokens: 480,
+                },
+              }),
+            1
+          );
+          const candidate = response.text?.trim() || '';
+          if (candidate) {
+            summaryText = candidate;
+            break;
+          }
+        } catch (err: unknown) {
+          lastGeminiErr = err;
+        }
+      }
+
+      if (!summaryText) {
+        const errDetail =
+          lastGeminiErr instanceof Error
+            ? lastGeminiErr.message
+            : 'Serviço de IA indisponível no momento.';
+        throw new Error(`Não foi possível gerar o resumo com a IA: ${errDetail}`);
+      }
+
+      const updatedSessionRes = await pool.query<DbChatSessionRow>(
+        `UPDATE chat_sessions
+         SET ai_summary = $1,
+             ai_summary_updated_at = NOW(),
+             updated_at = NOW()
+         WHERE session_id = $2
+         RETURNING *`,
+        [summaryText, sessionId]
+      );
+      const updatedSession = updatedSessionRes.rows[0];
+
+      const lightweightChatHistory = msgRes.rows.map((m) => {
+        const text =
+          m.content?.trim() ||
+          (m.transcription?.trim()
+            ? `[Áudio] ${m.transcription.trim()}`
+            : m.attachment_name
+              ? `[Anexo: ${m.attachment_name}]`
+              : '');
+        const timestamp = m.created_at
+          ? new Date(m.created_at).toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit',
+            })
+          : 'Hoje';
+        return {
+          id: `audit-${m.id}`,
+          sender: m.sender === 'user' ? 'cliente' : 'ia',
+          text,
+          timestamp,
+        };
+      });
+
+      const formattedDate = new Date().toLocaleString('pt-BR', {
+        day: '2-digit',
+        month: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const summaryBlock = `--- Resumo Comercial IA (${formattedDate}) ---\n${summaryText}\n--- Fim Resumo IA ---`;
+
+      const leadName =
+        session.lead_name?.trim() || `Visitante #${session.id}`;
+      const leadPhone = session.lead_phone?.trim() || '';
+      const normalizedPhoneDigits = leadPhone.replace(/\D/g, '');
+
+      // Busca lead existente no CRM por chat_session_id ou telefone normalizado
+      let existingLead: DbLeadRow | null = null;
+      const bySessionRes = await pool.query<DbLeadRow>(
+        'SELECT * FROM leads WHERE chat_session_id = $1 ORDER BY id DESC LIMIT 1',
+        [sessionId]
+      );
+      if (bySessionRes.rows[0]) {
+        existingLead = bySessionRes.rows[0];
+      } else if (normalizedPhoneDigits.length >= 8) {
+        const byPhoneRes = await pool.query<DbLeadRow>(
+          `SELECT *
+           FROM leads
+           WHERE REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g') = $1
+           ORDER BY id DESC
+           LIMIT 1`,
+          [normalizedPhoneDigits]
+        );
+        if (byPhoneRes.rows[0]) {
+          existingLead = byPhoneRes.rows[0];
+        }
+      }
+
+      if (existingLead) {
+        const prevNotes = (existingLead.notes || '').trim();
+        const withoutOldSummary = prevNotes
+          .replace(
+            /\n*--- Resumo Comercial IA \([^)]*\) ---[\s\S]*?--- Fim Resumo IA ---\n*/g,
+            '\n\n'
+          )
+          .trim();
+        const mergedNotes = withoutOldSummary
+          ? `${withoutOldSummary}\n\n${summaryBlock}`
+          : summaryBlock;
+
+        const shouldUpgradeName =
+          Boolean(session.lead_name?.trim()) &&
+          /^Visitante/i.test(existingLead.name || '');
+        const resolvedName = shouldUpgradeName
+          ? session.lead_name!.trim()
+          : existingLead.name;
+        const resolvedPhone = existingLead.phone?.trim()
+          ? existingLead.phone
+          : leadPhone;
+
+        const updatedLeadRes = await pool.query<DbLeadRow>(
+          `UPDATE leads
+           SET name = $1,
+               phone = $2,
+               chat_session_id = COALESCE(chat_session_id, $3),
+               tag = COALESCE(tag, $4),
+               notes = $5,
+               chat_history = CASE
+                 WHEN $6::text <> '[]' THEN $6
+                 ELSE chat_history
+               END
+           WHERE id = $7
+           RETURNING *`,
+          [
+            resolvedName,
+            resolvedPhone,
+            sessionId,
+            session.tag ?? null,
+            mergedNotes,
+            JSON.stringify(lightweightChatHistory),
+            existingLead.id,
+          ]
+        );
+
+        res.json({
+          sessionId: updatedSession.session_id,
+          aiSummary: updatedSession.ai_summary,
+          aiSummaryUpdatedAt: updatedSession.ai_summary_updated_at,
+          crmAction: 'updated',
+          lead: updatedLeadRes.rows[0],
+        });
+        return;
+      }
+
+      // Extrai interesse resumido da primeira linha do resumo se útil, senão usa padrão limpo
+      const interestLineMatch = summaryText.match(
+        /Ve[íi]culo\s*\/\s*Interesse:\*?\*?\s*([^\n]+)/i
+      );
+      const extractedInterest = interestLineMatch?.[1]
+        ?.replace(/\*\*/g, '')
+        .trim();
+      const validExtractedInterest =
+        extractedInterest &&
+        !/^n[ãa]o\s+(especificado|informado|mencionado)/i.test(
+          extractedInterest
+        )
+          ? extractedInterest.slice(0, 90)
+          : null;
+
+      const tagPrefix =
+        session.tag && ALLOWED_CHAT_SESSION_TAGS[session.tag]
+          ? `${ALLOWED_CHAT_SESSION_TAGS[session.tag]} · `
+          : '';
+      const resolvedInterest =
+        validExtractedInterest || `${tagPrefix}Resumo IA · Chat (${session.origem})`;
+
+      const insertedLeadRes = await pool.query<DbLeadRow>(
+        `INSERT INTO leads (
+           name,
+           phone,
+           vehicle_interest,
+           stage,
+           chat_history,
+           lgpd_consent,
+           lgpd_consent_at,
+           chat_session_id,
+           tag,
+           notes
+         )
+         VALUES ($1, $2, $3, 'Novo Lead', $4, $5, $6, $7, $8, $9)
+         RETURNING *`,
+        [
+          leadName,
+          leadPhone,
+          resolvedInterest,
+          JSON.stringify(lightweightChatHistory),
+          Boolean(leadPhone),
+          leadPhone ? new Date() : null,
+          sessionId,
+          session.tag ?? null,
+          summaryBlock,
+        ]
+      );
+
+      res.json({
+        sessionId: updatedSession.session_id,
+        aiSummary: updatedSession.ai_summary,
+        aiSummaryUpdatedAt: updatedSession.ai_summary_updated_at,
+        crmAction: 'created',
+        lead: insertedLeadRes.rows[0],
+      });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Erro ao gerar resumo comercial para o CRM.';
       res.status(500).json({ error: message });
     }
   }
@@ -1234,21 +1872,63 @@ app.post('/api/public/leads', async (req, res) => {
       return;
     }
 
-    const result = await pool.query<DbLeadRow>(
-      `INSERT INTO leads (name, phone, vehicle_interest, stage, chat_history, lgpd_consent, lgpd_consent_at)
-       VALUES ($1, $2, $3, 'Novo Lead', $4, true, NOW())
-       RETURNING *`,
-      [
-        cleanName,
-        cleanPhone,
-        vehicle_interest ? String(vehicle_interest).trim() : 'Atendimento Geral',
-        typeof chat_history === 'string'
-          ? chat_history
-          : JSON.stringify(chat_history || []),
-      ]
-    );
-
     const safeSessionId = sanitizeSessionId(session_id);
+    const serializedChatHistory =
+      typeof chat_history === 'string'
+        ? chat_history
+        : JSON.stringify(chat_history || []);
+    const resolvedVehicleInterest = vehicle_interest
+      ? String(vehicle_interest).trim()
+      : 'Atendimento Geral';
+
+    let created: DbLeadRow;
+    const existingBySession = safeSessionId
+      ? await pool.query<DbLeadRow>(
+          'SELECT * FROM leads WHERE chat_session_id = $1 ORDER BY id DESC LIMIT 1',
+          [safeSessionId]
+        )
+      : null;
+
+    if (existingBySession?.rows[0]) {
+      const updated = await pool.query<DbLeadRow>(
+        `UPDATE leads
+         SET name = $1,
+             phone = $2,
+             vehicle_interest = CASE
+               WHEN vehicle_interest IS NULL OR BTRIM(vehicle_interest) = '' OR vehicle_interest LIKE '%Chat IA%'
+                 THEN $3
+               ELSE vehicle_interest
+             END,
+             chat_history = $4,
+             lgpd_consent = true,
+             lgpd_consent_at = COALESCE(lgpd_consent_at, NOW())
+         WHERE id = $5
+         RETURNING *`,
+        [
+          cleanName,
+          cleanPhone,
+          resolvedVehicleInterest,
+          serializedChatHistory,
+          existingBySession.rows[0].id,
+        ]
+      );
+      created = updated.rows[0];
+    } else {
+      const result = await pool.query<DbLeadRow>(
+        `INSERT INTO leads (name, phone, vehicle_interest, stage, chat_history, lgpd_consent, lgpd_consent_at, chat_session_id)
+         VALUES ($1, $2, $3, 'Novo Lead', $4, true, NOW(), $5)
+         RETURNING *`,
+        [
+          cleanName,
+          cleanPhone,
+          resolvedVehicleInterest,
+          serializedChatHistory,
+          safeSessionId,
+        ]
+      );
+      created = result.rows[0];
+    }
+
     if (safeSessionId) {
       await attachLeadToChatSession(
         safeSessionId,
@@ -1258,7 +1938,6 @@ app.post('/api/public/leads', async (req, res) => {
       );
     }
 
-    const created = result.rows[0];
     const chatToken = signPublicLeadChatToken(created.id);
     res.status(201).json({ ...created, chatToken });
   } catch (err: unknown) {
@@ -1636,7 +2315,8 @@ app.patch('/api/leads/:id', requireAdminAuth, async (req, res) => {
   }
 
   try {
-    const { name, phone, vehicle_interest, stage, chat_history } = req.body;
+    const { name, phone, vehicle_interest, stage, chat_history, notes, tag } =
+      req.body;
 
     if (
       stage !== undefined &&
@@ -1653,8 +2333,10 @@ app.patch('/api/leads/:id', requireAdminAuth, async (req, res) => {
            phone = COALESCE($2, phone),
            vehicle_interest = COALESCE($3, vehicle_interest),
            stage = COALESCE($4, stage),
-           chat_history = COALESCE($5, chat_history)
-       WHERE id = $6
+           chat_history = COALESCE($5, chat_history),
+           notes = COALESCE($6, notes),
+           tag = CASE WHEN $7::boolean THEN $8 ELSE tag END
+       WHERE id = $9
        RETURNING *`,
       [
         name !== undefined ? String(name).trim() : null,
@@ -1665,6 +2347,11 @@ app.patch('/api/leads/:id', requireAdminAuth, async (req, res) => {
           ? typeof chat_history === 'string'
             ? chat_history
             : JSON.stringify(chat_history)
+          : null,
+        notes !== undefined ? String(notes) : null,
+        tag !== undefined,
+        tag !== undefined && tag !== null && String(tag).trim()
+          ? String(tag).trim()
           : null,
         id,
       ]

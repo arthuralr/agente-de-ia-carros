@@ -26,6 +26,11 @@ export interface DbLeadRow {
   vehicle_interest: string | null;
   stage: string | null;
   chat_history: string | null;
+  lgpd_consent?: boolean | null;
+  lgpd_consent_at?: Date | null;
+  chat_session_id?: string | null;
+  tag?: string | null;
+  notes?: string | null;
   created_at: Date;
 }
 
@@ -45,6 +50,9 @@ export interface DbChatSessionRow {
   lead_name: string | null;
   lead_phone: string | null;
   origem: string;
+  tag?: string | null;
+  ai_summary?: string | null;
+  ai_summary_updated_at?: Date | null;
   created_at: Date;
   updated_at: Date;
   message_count?: number;
@@ -82,7 +90,10 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
     await client.query(`
       ALTER TABLE leads
       ADD COLUMN IF NOT EXISTS lgpd_consent BOOLEAN NOT NULL DEFAULT true,
-      ADD COLUMN IF NOT EXISTS lgpd_consent_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS lgpd_consent_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS chat_session_id VARCHAR(128),
+      ADD COLUMN IF NOT EXISTS tag VARCHAR(64),
+      ADD COLUMN IF NOT EXISTS notes TEXT
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -94,6 +105,12 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+    await client.query(`
+      ALTER TABLE chat_sessions
+      ADD COLUMN IF NOT EXISTS tag VARCHAR(64),
+      ADD COLUMN IF NOT EXISTS ai_summary TEXT,
+      ADD COLUMN IF NOT EXISTS ai_summary_updated_at TIMESTAMPTZ
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS chat_messages (

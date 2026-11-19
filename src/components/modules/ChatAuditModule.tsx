@@ -2,14 +2,18 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertCircle,
   Bot,
+  Check,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
+  Copy,
   Download,
   ExternalLink,
   Eye,
   FileText,
   Image as ImageIcon,
+  Kanban,
   Loader2,
   MessageCircle,
   MessageSquareText,
@@ -19,6 +23,8 @@ import {
   RefreshCw,
   Reply,
   Search,
+  Sparkles,
+  Tag,
   User,
   X,
 } from 'lucide-react';
@@ -26,14 +32,23 @@ import {
   ChatAuditMessage,
   ChatSessionSummary,
   DealershipSettings,
+  Lead,
 } from '../../types';
+import { ApiLeadRow, mapDbLeadToFrontend } from '../../db/mappers';
 import { adminFetch } from '../../utils/authSession';
+import {
+  CHAT_LEAD_TAGS,
+  ChatLeadTagId,
+  getChatTagConfig,
+} from '../../utils/chatTags';
 import { formatWhatsAppLink } from '../../utils/formatters';
 import { ChatMarkdown } from '../public/ChatMarkdown';
 
 interface ChatAuditModuleProps {
   settings: DealershipSettings;
   onUnauthorized: () => void;
+  onLeadSyncedFromChat?: (lead: Lead, action: 'created' | 'updated') => void;
+  onOpenCrm?: (leadId?: string) => void;
 }
 
 interface AttachmentPreviewModalState {
@@ -117,6 +132,8 @@ function dataUrlToBlob(dataUrl: string, fallbackMime?: string): Blob | null {
 export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
   settings,
   onUnauthorized,
+  onLeadSyncedFromChat,
+  onOpenCrm,
 }) => {
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(true);
@@ -142,6 +159,21 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
   const [attachmentActionError, setAttachmentActionError] = useState<
     string | null
   >(null);
+  const [savingTagSessionId, setSavingTagSessionId] = useState<string | null>(
+    null
+  );
+  const [generatingSummarySessionId, setGeneratingSummarySessionId] = useState<
+    string | null
+  >(null);
+  const [copiedSummarySessionId, setCopiedSummarySessionId] = useState<
+    string | null
+  >(null);
+  const [tagFeedback, setTagFeedback] = useState<{
+    sessionId: string;
+    type: 'success' | 'error';
+    message: string;
+    leadId?: string;
+  } | null>(null);
 
   const createdBlobUrlsRef = useRef<string[]>([]);
 
@@ -351,6 +383,7 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
       return (
         (s.leadName || '').toLowerCase().includes(q) ||
         (s.leadPhone || '').toLowerCase().includes(q) ||
+        (s.tag || '').toLowerCase().includes(q) ||
         s.sessionId.toLowerCase().includes(q) ||
         String(s.id).includes(q) ||
         (s.lastMessage || '').toLowerCase().includes(q)
@@ -362,6 +395,173 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
     () => sessions.find((s) => s.sessionId === selectedSessionId) || null,
     [selectedSessionId, sessions]
   );
+
+  const handleSelectSessionTag = async (
+    sessionId: string,
+    nextTag: ChatLeadTagId | null
+  ) => {
+    if (savingTagSessionId === sessionId) return;
+    setSavingTagSessionId(sessionId);
+    setTagFeedback(null);
+    try {
+      const res = await adminFetch(
+        `/api/admin/chat-sessions/${encodeURIComponent(sessionId)}/tag`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tag: nextTag }),
+        }
+      );
+      if (res.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(
+          err.error || 'Não foi possível salvar a etiqueta da conversa.'
+        );
+      }
+
+      const data = (await res.json()) as {
+        sessionId: string;
+        tag: string | null;
+        crmAction: 'created' | 'updated' | 'none';
+        lead: ApiLeadRow | null;
+      };
+
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.sessionId === sessionId ? { ...s, tag: data.tag } : s
+        )
+      );
+
+      let syncedLeadId: string | undefined;
+      if (data.lead && (data.crmAction === 'created' || data.crmAction === 'updated')) {
+        const mappedLead = mapDbLeadToFrontend(data.lead);
+        syncedLeadId = mappedLead.id;
+        onLeadSyncedFromChat?.(mappedLead, data.crmAction);
+      }
+
+      if (data.crmAction === 'created') {
+        setTagFeedback({
+          sessionId,
+          type: 'success',
+          message: 'Etiqueta salva e card criado automaticamente no CRM!',
+          leadId: syncedLeadId,
+        });
+      } else if (data.crmAction === 'updated') {
+        setTagFeedback({
+          sessionId,
+          type: 'success',
+          message: 'Etiqueta salva e card atualizado no CRM!',
+          leadId: syncedLeadId,
+        });
+      } else {
+        setTagFeedback({
+          sessionId,
+          type: 'success',
+          message: 'Etiqueta removida desta conversa.',
+        });
+      }
+    } catch (err: unknown) {
+      setTagFeedback({
+        sessionId,
+        type: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Falha ao salvar etiqueta no servidor.',
+      });
+    } finally {
+      setSavingTagSessionId(null);
+    }
+  };
+
+  const handleGenerateCrmSummary = async (sessionId: string) => {
+    if (generatingSummarySessionId === sessionId) return;
+    setGeneratingSummarySessionId(sessionId);
+    setTagFeedback(null);
+    try {
+      const res = await adminFetch(
+        `/api/admin/chat-sessions/${encodeURIComponent(sessionId)}/summary`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      if (res.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(
+          err.error || 'Não foi possível gerar o resumo comercial desta conversa.'
+        );
+      }
+
+      const data = (await res.json()) as {
+        sessionId: string;
+        aiSummary: string;
+        aiSummaryUpdatedAt: string | null;
+        crmAction: 'created' | 'updated';
+        lead: ApiLeadRow | null;
+      };
+
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.sessionId === sessionId
+            ? {
+                ...s,
+                aiSummary: data.aiSummary,
+                aiSummaryUpdatedAt: data.aiSummaryUpdatedAt,
+              }
+            : s
+        )
+      );
+
+      let syncedLeadId: string | undefined;
+      if (data.lead) {
+        const mappedLead = mapDbLeadToFrontend(data.lead);
+        syncedLeadId = mappedLead.id;
+        onLeadSyncedFromChat?.(mappedLead, data.crmAction);
+      }
+
+      setTagFeedback({
+        sessionId,
+        type: 'success',
+        message:
+          data.crmAction === 'created'
+            ? 'Resumo gerado e novo card criado no CRM!'
+            : 'Resumo gerado e anexado ao card existente no CRM!',
+        leadId: syncedLeadId,
+      });
+    } catch (err: unknown) {
+      setTagFeedback({
+        sessionId,
+        type: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Falha ao gerar resumo comercial com a IA.',
+      });
+    } finally {
+      setGeneratingSummarySessionId(null);
+    }
+  };
+
+  const handleCopySummary = async (sessionId: string, summaryText: string) => {
+    try {
+      await navigator.clipboard.writeText(summaryText);
+      setCopiedSummarySessionId(sessionId);
+      window.setTimeout(() => {
+        setCopiedSummarySessionId((prev) => (prev === sessionId ? null : prev));
+      }, 2200);
+    } catch {
+      // Ignore clipboard permission errors
+    }
+  };
 
   const toggleTranscription = (msgId: number) => {
     setCollapsedTranscriptions((prev) => ({
@@ -460,11 +660,17 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                 const isSelected = session.sessionId === selectedSessionId;
                 const displayName =
                   session.leadName?.trim() || `Visitante Anônimo #${session.id}`;
+                const tagCfg = getChatTagConfig(session.tag);
                 return (
                   <button
                     key={session.sessionId}
                     type="button"
-                    onClick={() => setSelectedSessionId(session.sessionId)}
+                    onClick={() => {
+                      setSelectedSessionId(session.sessionId);
+                      if (tagFeedback && tagFeedback.sessionId !== session.sessionId) {
+                        setTagFeedback(null);
+                      }
+                    }}
                     className={`w-full text-left px-4 py-3.5 transition-colors ${
                       isSelected ? 'bg-red-600/12' : 'hover:bg-white/[0.03]'
                     }`}
@@ -495,6 +701,16 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                         {session.messageCount} msg
                       </span>
                     </div>
+
+                    {tagCfg && (
+                      <div className="mt-1.5">
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10.5px] font-medium ${tagCfg.badgeClass}`}
+                        >
+                          {tagCfg.label}
+                        </span>
+                      </div>
+                    )}
 
                     {session.lastMessage && (
                       <p className="text-xs text-zinc-400 truncate mt-1.5">
@@ -529,11 +745,21 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
               {/* Conversation Header */}
               <div className="px-5 py-4 border-b border-white/[0.08] flex flex-wrap items-center justify-between gap-4 bg-[#0D0D10]">
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <h3 className="font-display text-base font-semibold text-white truncate">
                       {activeSession.leadName?.trim() ||
                         `Visitante Anônimo #${activeSession.id}`}
                     </h3>
+                    {(() => {
+                      const activeTagCfg = getChatTagConfig(activeSession.tag);
+                      return activeTagCfg ? (
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium ${activeTagCfg.badgeClass}`}
+                        >
+                          {activeTagCfg.label}
+                        </span>
+                      ) : null;
+                    })()}
                   </div>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 mt-1">
                     {activeSession.leadPhone ? (
@@ -543,7 +769,9 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                       </span>
                     ) : (
                       <span className="text-zinc-500">
-                        Lead ainda não identificado
+                        {activeSession.leadName?.trim()
+                          ? 'Sem WhatsApp informado'
+                          : 'Lead ainda não identificado'}
                       </span>
                     )}
                     <span aria-hidden="true">·</span>
@@ -556,27 +784,210 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                   </div>
                 </div>
 
-                {activeSession.leadPhone ? (
-                  <a
-                    href={formatWhatsAppLink(
-                      activeSession.leadPhone,
-                      `Olá${
-                        activeSession.leadName
-                          ? `, ${activeSession.leadName}`
-                          : ''
-                      }! Aqui é da equipe ${settings.tradeName}. Vi sua conversa com nosso Consultor Virtual e vou dar continuidade ao seu atendimento.`
-                    )}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 transition-colors whitespace-nowrap shrink-0"
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={
+                      generatingSummarySessionId === activeSession.sessionId ||
+                      loadingMessages ||
+                      messages.length === 0
+                    }
+                    onClick={() =>
+                      void handleGenerateCrmSummary(activeSession.sessionId)
+                    }
+                    title="Chama a IA sob demanda para resumir esta conversa e anexar nas notas do CRM"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium text-zinc-100 bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.12] hover:border-red-500/45 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                   >
-                    <MessageCircle className="w-4 h-4" />
-                    <span>Assumir no WhatsApp</span>
-                  </a>
-                ) : (
-                  <span className="text-xs text-zinc-500 font-mono">
-                    ID {activeSession.sessionId.slice(0, 16)}
+                    {generatingSummarySessionId === activeSession.sessionId ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-red-400" />
+                        <span>Gerando resumo...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                        <span>
+                          {activeSession.aiSummary
+                            ? 'Atualizar Resumo CRM'
+                            : 'Gerar Resumo para o CRM'}
+                        </span>
+                      </>
+                    )}
+                  </button>
+
+                  {activeSession.leadPhone ? (
+                    <a
+                      href={formatWhatsAppLink(
+                        activeSession.leadPhone,
+                        `Olá${
+                          activeSession.leadName
+                            ? `, ${activeSession.leadName}`
+                            : ''
+                        }! Aqui é da equipe ${settings.tradeName}. Vi sua conversa com nosso Consultor Virtual e vou dar continuidade ao seu atendimento.`
+                      )}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 transition-colors whitespace-nowrap shrink-0"
+                    >
+                      <MessageCircle className="w-4 h-4" />
+                      <span>Assumir no WhatsApp</span>
+                    </a>
+                  ) : (
+                    <span className="text-xs text-zinc-500 font-mono">
+                      ID {activeSession.sessionId.slice(0, 16)}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Quick Classification & Automatic CRM Card Bar */}
+              <div className="px-5 py-3 border-b border-white/[0.08] bg-[#101014] space-y-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-zinc-400 mr-1">
+                    <Tag className="w-3.5 h-3.5 text-red-400" />
+                    <span>Classificar & Enviar ao CRM:</span>
                   </span>
+
+                  {CHAT_LEAD_TAGS.map((tagOpt) => {
+                    const isActive = activeSession.tag === tagOpt.id;
+                    const isSavingThis =
+                      savingTagSessionId === activeSession.sessionId;
+                    return (
+                      <button
+                        key={tagOpt.id}
+                        type="button"
+                        disabled={isSavingThis}
+                        onClick={() =>
+                          void handleSelectSessionTag(
+                            activeSession.sessionId,
+                            isActive ? null : tagOpt.id
+                          )
+                        }
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-all cursor-pointer disabled:opacity-60 inline-flex items-center gap-1.5 ${
+                          isActive
+                            ? tagOpt.activeButtonClass
+                            : tagOpt.inactiveButtonClass
+                        }`}
+                      >
+                        <span>{tagOpt.label}</span>
+                      </button>
+                    );
+                  })}
+
+                  {savingTagSessionId === activeSession.sessionId && (
+                    <span className="inline-flex items-center gap-1.5 text-[11px] text-zinc-400 ml-1">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-red-400" />
+                      <span>Sincronizando CRM...</span>
+                    </span>
+                  )}
+
+                  {activeSession.tag &&
+                    savingTagSessionId !== activeSession.sessionId && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void handleSelectSessionTag(
+                            activeSession.sessionId,
+                            null
+                          )
+                        }
+                        className="px-2 py-1 rounded-lg text-[11px] text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.05] transition-colors inline-flex items-center gap-1"
+                        title="Remover etiqueta desta conversa"
+                      >
+                        <X className="w-3 h-3" />
+                        <span>Limpar</span>
+                      </button>
+                    )}
+                </div>
+
+                {tagFeedback &&
+                  tagFeedback.sessionId === activeSession.sessionId && (
+                    <div
+                      className={`px-3 py-2 rounded-lg border flex flex-wrap items-center justify-between gap-2 text-xs ${
+                        tagFeedback.type === 'success'
+                          ? 'bg-emerald-950/50 border-emerald-500/35 text-emerald-200'
+                          : 'bg-red-950/50 border-red-600/40 text-red-200'
+                      }`}
+                    >
+                      <span className="inline-flex items-center gap-2">
+                        {tagFeedback.type === 'success' ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        ) : (
+                          <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                        )}
+                        <span>{tagFeedback.message}</span>
+                      </span>
+
+                      <div className="flex items-center gap-2">
+                        {tagFeedback.type === 'success' &&
+                          tagFeedback.leadId &&
+                          onOpenCrm && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenCrm(tagFeedback.leadId)}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors"
+                            >
+                              <Kanban className="w-3.5 h-3.5" />
+                              <span>Abrir no CRM</span>
+                            </button>
+                          )}
+                        <button
+                          type="button"
+                          onClick={() => setTagFeedback(null)}
+                          aria-label="Fechar aviso"
+                          className="text-zinc-400 hover:text-white"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                {/* Persisted On-Demand Commercial Summary for CRM */}
+                {activeSession.aiSummary && (
+                  <div className="p-3.5 rounded-xl bg-[#15151B] border border-amber-500/25 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span className="text-xs font-semibold text-amber-200">
+                          Resumo Comercial para o CRM
+                        </span>
+                        {activeSession.aiSummaryUpdatedAt && (
+                          <span className="text-[11px] font-mono tabular-nums text-zinc-500">
+                            · {formatDateTimePt(activeSession.aiSummaryUpdatedAt)}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void handleCopySummary(
+                            activeSession.sessionId,
+                            activeSession.aiSummary!
+                          )
+                        }
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-zinc-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-colors"
+                      >
+                        {copiedSummarySessionId === activeSession.sessionId ? (
+                          <>
+                            <Check className="w-3 h-3 text-emerald-400" />
+                            <span>Copiado</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            <span>Copiar</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <div className="text-xs text-zinc-200 leading-relaxed">
+                      <ChatMarkdown
+                        content={activeSession.aiSummary}
+                        variant="ai"
+                      />
+                    </div>
+                  </div>
                 )}
               </div>
 
