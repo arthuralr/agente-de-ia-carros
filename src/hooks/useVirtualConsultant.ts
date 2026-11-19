@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ChatAttachment,
+  ChatAudioMeta,
   ChatMessage,
+  ChatReplyContext,
   DealershipSettings,
   Lead,
   Vehicle,
@@ -19,9 +22,38 @@ interface UseVirtualConsultantParams {
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
 }
 
+export interface SendRichMessagePayload {
+  text?: string;
+  audio?: ChatAudioMeta | null;
+  attachment?: ChatAttachment | null;
+  replyTo?: ChatReplyContext | null;
+}
+
 function createChatSessionId(): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `sess-${Date.now().toString(36)}-${rand}`;
+}
+
+/**
+ * Strips heavy inline base64 media URLs before syncing to leads.chat_history,
+ * since full audio/attachments are persisted in chat_messages.
+ */
+function buildLightweightLeadHistory(transcript: ChatMessage[]): ChatMessage[] {
+  return transcript.map((m) => ({
+    id: m.id,
+    sender: m.sender,
+    text:
+      m.text ||
+      (m.audio?.transcription
+        ? `[Áudio] ${m.audio.transcription}`
+        : m.audio
+          ? '[Mensagem de áudio]'
+          : m.attachment
+            ? `[Anexo: ${m.attachment.name}]`
+            : ''),
+    timestamp: m.timestamp,
+    ...(m.replyTo ? { replyTo: m.replyTo } : {}),
+  }));
 }
 
 export function useVirtualConsultant({
@@ -37,6 +69,7 @@ export function useVirtualConsultant({
 }: UseVirtualConsultantParams) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
+  const [replyingTo, setReplyingTo] = useState<ChatReplyContext | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [hasStreamFirstToken, setHasStreamFirstToken] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -69,8 +102,21 @@ export function useVirtualConsultant({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isSending]);
 
+  const clearReply = useCallback(() => {
+    setReplyingTo(null);
+  }, []);
+
   const sendMessageToAi = useCallback(
-    async (nextMessages: ChatMessage[], vehicleContext: Vehicle | null) => {
+    async (
+      nextMessages: ChatMessage[],
+      vehicleContext: Vehicle | null,
+      options?: {
+        userMessageId?: string;
+        replyTo?: ChatReplyContext | null;
+        audio?: ChatAudioMeta | null;
+        attachment?: ChatAttachment | null;
+      }
+    ) => {
       abortControllerRef.current?.abort();
       const controller = new AbortController();
       abortControllerRef.current = controller;
@@ -105,8 +151,37 @@ export function useVirtualConsultant({
             origem: originLabel,
             messages: nextMessages.map((m) => ({
               sender: m.sender,
-              text: m.text,
+              text:
+                m.text ||
+                (m.audio?.transcription
+                  ? `[Áudio]: ${m.audio.transcription}`
+                  : m.audio
+                    ? 'Mensagem de áudio'
+                    : m.attachment
+                      ? `Anexo enviado: ${m.attachment.name}`
+                      : ''),
             })),
+            replyTo: options?.replyTo
+              ? {
+                  id: options.replyTo.id,
+                  sender: options.replyTo.sender,
+                  preview: options.replyTo.preview,
+                }
+              : null,
+            audio: options?.audio
+              ? {
+                  dataUrl: options.audio.url,
+                  mimeType: options.audio.mimeType,
+                  durationSec: options.audio.durationSec,
+                }
+              : null,
+            attachment: options?.attachment
+              ? {
+                  dataUrl: options.attachment.url,
+                  name: options.attachment.name,
+                  mimeType: options.attachment.mimeType,
+                }
+              : null,
             vehicle: vehicleContext
               ? {
                   brand: vehicleContext.brand,
@@ -153,18 +228,50 @@ export function useVirtualConsultant({
           minute: '2-digit',
         });
 
+        let workingMessages = nextMessages;
+        const applyTranscriptionToUserMsg = (transcription: string) => {
+          if (!options?.userMessageId || !transcription.trim()) return;
+          workingMessages = workingMessages.map((m) =>
+            m.id === options.userMessageId && m.audio
+              ? {
+                  ...m,
+                  audio: { ...m.audio, transcription: transcription.trim() },
+                }
+              : m
+          );
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === options.userMessageId && m.audio
+                ? {
+                    ...m,
+                    audio: { ...m.audio, transcription: transcription.trim() },
+                  }
+                : m
+            )
+          );
+        };
+
         if (!contentType.includes('text/event-stream') || !response.body) {
-          const data = (await response.json()) as { reply: string };
+          const data = (await response.json()) as {
+            reply: string;
+            transcription?: string;
+          };
+          if (data.transcription) {
+            applyTranscriptionToUserMsg(data.transcription);
+          }
           const aiMsg: ChatMessage = {
             id: aiMsgId,
             sender: 'ia',
             text: data.reply,
             timestamp: aiTimestamp,
           };
-          const updatedTranscript = [...nextMessages, aiMsg];
+          const updatedTranscript = [...workingMessages, aiMsg];
           setMessages(updatedTranscript);
           if (persistedLeadIdRef.current && onSyncLeadChat) {
-            void onSyncLeadChat(persistedLeadIdRef.current, updatedTranscript);
+            void onSyncLeadChat(
+              persistedLeadIdRef.current,
+              buildLightweightLeadHistory(updatedTranscript)
+            );
           }
           return;
         }
@@ -185,7 +292,7 @@ export function useVirtualConsultant({
           if (!streamMessageInserted) {
             streamMessageInserted = true;
             setHasStreamFirstToken(true);
-            setMessages([...nextMessages, streamingMsg]);
+            setMessages((prev) => [...prev, streamingMsg]);
           } else {
             setMessages((prev) =>
               prev.map((m) => (m.id === aiMsgId ? { ...m, text } : m))
@@ -209,13 +316,16 @@ export function useVirtualConsultant({
               const jsonStr = line.slice(5).trim();
               if (!jsonStr) continue;
               const parsed = JSON.parse(jsonStr) as {
-                type: 'chunk' | 'done' | 'error';
+                type: 'meta' | 'chunk' | 'done' | 'error';
                 text?: string;
                 reply?: string;
+                transcription?: string;
                 error?: string;
               };
 
-              if (parsed.type === 'chunk' && parsed.text) {
+              if (parsed.type === 'meta' && parsed.transcription) {
+                applyTranscriptionToUserMsg(parsed.transcription);
+              } else if (parsed.type === 'chunk' && parsed.text) {
                 accumulatedText += parsed.text;
                 upsertStreamingMessage(accumulatedText);
               } else if (parsed.type === 'done') {
@@ -223,7 +333,7 @@ export function useVirtualConsultant({
                 if (finalText) {
                   upsertStreamingMessage(finalText);
                   const updatedTranscript: ChatMessage[] = [
-                    ...nextMessages,
+                    ...workingMessages,
                     {
                       id: aiMsgId,
                       sender: 'ia',
@@ -234,7 +344,7 @@ export function useVirtualConsultant({
                   if (persistedLeadIdRef.current && onSyncLeadChat) {
                     void onSyncLeadChat(
                       persistedLeadIdRef.current,
-                      updatedTranscript
+                      buildLightweightLeadHistory(updatedTranscript)
                     );
                   }
                 }
@@ -276,6 +386,7 @@ export function useVirtualConsultant({
     setLeadSaveError(null);
     setLgpdConsent(false);
     setPersistedLeadId(null);
+    setReplyingTo(null);
     persistedLeadIdRef.current = null;
     setErrorMsg(null);
 
@@ -292,7 +403,9 @@ export function useVirtualConsultant({
         timestamp: now,
       };
       setMessages([autoUserMsg]);
-      void sendMessageToAi([autoUserMsg], targetVehicle);
+      void sendMessageToAi([autoUserMsg], targetVehicle, {
+        userMessageId: autoUserMsg.id,
+      });
     } else {
       setMessages([
         {
@@ -300,38 +413,72 @@ export function useVirtualConsultant({
           sender: 'ia',
           text: `Olá! Sou o **Consultor Oficial** da **${settings.tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
 
-Como posso ajudar na sua escolha hoje?
-- Consultar disponibilidade, detalhes e preços reais do estoque
-- Simular **financiamento bancário** ou carta de crédito
-- Avaliar seu **usado na troca** ou agendar visita no showroom
-
-Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`,
+Como posso ajudar você hoje? Escolha uma opção rápida abaixo ou **envie sua pergunta por texto, áudio ou foto** a qualquer momento:`,
           timestamp: now,
         },
       ]);
     }
   }, [active, messages.length, sendMessageToAi, settings.tradeName, targetVehicle]);
 
-  const sendQuickPrompt = useCallback(
-    (promptText: string) => {
+  const sendRichMessage = useCallback(
+    (payload: SendRichMessagePayload) => {
       if (isSending) return;
+      const trimmedText = (payload.text || '').trim();
+      const hasAudio = Boolean(payload.audio);
+      const hasAttachment = Boolean(payload.attachment);
+      if (!trimmedText && !hasAudio && !hasAttachment) return;
+
+      const effectiveReply =
+        payload.replyTo !== undefined ? payload.replyTo : replyingTo;
+
+      const userMsgId = `msg-cli-${Date.now()}`;
       const userMsg: ChatMessage = {
-        id: `msg-cli-${Date.now()}`,
+        id: userMsgId,
         sender: 'cliente',
-        text: promptText,
+        text: trimmedText,
         timestamp: new Date().toLocaleTimeString('pt-BR', {
           hour: '2-digit',
           minute: '2-digit',
         }),
+        ...(effectiveReply ? { replyTo: effectiveReply } : {}),
+        ...(payload.audio ? { audio: payload.audio } : {}),
+        ...(payload.attachment ? { attachment: payload.attachment } : {}),
       };
+
       const nextMessages = [...messages, userMsg];
       setMessages(nextMessages);
+      setInput('');
+      setReplyingTo(null);
+
       if (persistedLeadIdRef.current && onSyncLeadChat) {
-        void onSyncLeadChat(persistedLeadIdRef.current, nextMessages);
+        void onSyncLeadChat(
+          persistedLeadIdRef.current,
+          buildLightweightLeadHistory(nextMessages)
+        );
       }
-      void sendMessageToAi(nextMessages, targetVehicle);
+
+      void sendMessageToAi(nextMessages, targetVehicle, {
+        userMessageId: userMsgId,
+        replyTo: effectiveReply ?? null,
+        audio: payload.audio ?? null,
+        attachment: payload.attachment ?? null,
+      });
     },
-    [isSending, messages, onSyncLeadChat, sendMessageToAi, targetVehicle]
+    [
+      isSending,
+      messages,
+      onSyncLeadChat,
+      replyingTo,
+      sendMessageToAi,
+      targetVehicle,
+    ]
+  );
+
+  const sendQuickPrompt = useCallback(
+    (promptText: string) => {
+      sendRichMessage({ text: promptText, replyTo: null });
+    },
+    [sendRichMessage]
   );
 
   const handleSend = useCallback(
@@ -339,26 +486,9 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
       e.preventDefault();
       const trimmed = input.trim();
       if (!trimmed || isSending) return;
-
-      const userMsg: ChatMessage = {
-        id: `msg-cli-${Date.now()}`,
-        sender: 'cliente',
-        text: trimmed,
-        timestamp: new Date().toLocaleTimeString('pt-BR', {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-      };
-
-      const nextMessages = [...messages, userMsg];
-      setMessages(nextMessages);
-      setInput('');
-      if (persistedLeadIdRef.current && onSyncLeadChat) {
-        void onSyncLeadChat(persistedLeadIdRef.current, nextMessages);
-      }
-      void sendMessageToAi(nextMessages, targetVehicle);
+      sendRichMessage({ text: trimmed });
     },
-    [input, isSending, messages, onSyncLeadChat, sendMessageToAi, targetVehicle]
+    [input, isSending, sendRichMessage]
   );
 
   const handleSaveContactToCrm = useCallback(
@@ -395,7 +525,7 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
         notes: leadNote,
         lgpdConsent: true,
         chatSessionId: sessionIdRef.current,
-        chatHistory: messages,
+        chatHistory: buildLightweightLeadHistory(messages),
       };
 
       try {
@@ -432,9 +562,13 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
     messages,
     input,
     setInput,
+    replyingTo,
+    setReplyingTo,
+    clearReply,
     isSending,
     hasStreamFirstToken,
     errorMsg,
+    setErrorMsg,
     customerName,
     setCustomerName,
     customerWhatsapp,
@@ -445,6 +579,7 @@ Qual modelo você procura ou gostaria de receber uma simulação pelo WhatsApp?`
     leadSaveError,
     leadSaved,
     messagesEndRef,
+    sendRichMessage,
     sendQuickPrompt,
     handleSend,
     handleSaveContactToCrm,

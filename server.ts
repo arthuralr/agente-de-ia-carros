@@ -63,10 +63,31 @@ interface GeneratePostBody {
   city: string;
 }
 
+interface ChatReplyPayload {
+  id?: string;
+  sender?: 'ia' | 'cliente';
+  preview?: string;
+}
+
+interface ChatAudioPayload {
+  dataUrl: string;
+  mimeType?: string;
+  durationSec?: number;
+}
+
+interface ChatAttachmentPayload {
+  dataUrl: string;
+  name?: string;
+  mimeType?: string;
+}
+
 interface ChatRequestBody {
   sessionId?: string;
   origem?: string;
   messages: { sender: 'ia' | 'cliente'; text: string }[];
+  replyTo?: ChatReplyPayload | null;
+  audio?: ChatAudioPayload | null;
+  attachment?: ChatAttachmentPayload | null;
   vehicle?: {
     brand: string;
     model: string;
@@ -95,6 +116,44 @@ interface ChatRequestBody {
   };
 }
 
+interface ChatAuditMeta {
+  replyToId?: string | null;
+  replyToPreview?: string | null;
+  replyToSender?: 'user' | 'assistant' | null;
+  audioUrl?: string | null;
+  transcription?: string | null;
+  attachmentUrl?: string | null;
+  attachmentName?: string | null;
+  attachmentMime?: string | null;
+}
+
+const MAX_INLINE_MEDIA_BYTES = 3_200_000;
+
+function parseDataUrlMedia(
+  dataUrl: unknown,
+  fallbackMime?: string
+): { mimeType: string; base64: string; cleanDataUrl: string; byteLength: number } | null {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
+    return null;
+  }
+  const commaIdx = dataUrl.indexOf(',');
+  if (commaIdx === -1) return null;
+  const header = dataUrl.slice(5, commaIdx);
+  const base64 = dataUrl.slice(commaIdx + 1).replace(/\s+/g, '');
+  if (!base64) return null;
+
+  const rawMime = header.split(';')[0]?.trim().toLowerCase() || (fallbackMime || '').split(';')[0].trim().toLowerCase();
+  if (!rawMime) return null;
+
+  const byteLength = Math.floor((base64.length * 3) / 4);
+  return {
+    mimeType: rawMime,
+    base64,
+    cleanDataUrl: dataUrl,
+    byteLength,
+  };
+}
+
 type OperationMode = 'full' | 'agent_only';
 
 function sanitizeSessionId(raw: unknown): string | null {
@@ -114,9 +173,12 @@ async function recordChatAuditTurn(
   sessionId: string | null,
   origem: string,
   sender: 'user' | 'assistant',
-  content: string
+  content: string,
+  meta?: ChatAuditMeta
 ): Promise<void> {
-  if (!sessionId || !content.trim()) return;
+  const safeContent = content.trim();
+  const hasRichMedia = Boolean(meta?.audioUrl || meta?.attachmentUrl);
+  if (!sessionId || (!safeContent && !hasRichMedia)) return;
   try {
     await pool.query(
       `INSERT INTO chat_sessions (session_id, origem, created_at, updated_at)
@@ -126,9 +188,34 @@ async function recordChatAuditTurn(
       [sessionId, origem]
     );
     await pool.query(
-      `INSERT INTO chat_messages (session_id, sender, content, created_at)
-       VALUES ($1, $2, $3, NOW())`,
-      [sessionId, sender, content.trim()]
+      `INSERT INTO chat_messages (
+         session_id,
+         sender,
+         content,
+         reply_to_id,
+         reply_to_preview,
+         reply_to_sender,
+         audio_url,
+         transcription,
+         attachment_url,
+         attachment_name,
+         attachment_mime,
+         created_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
+      [
+        sessionId,
+        sender,
+        safeContent,
+        meta?.replyToId ?? null,
+        meta?.replyToPreview ?? null,
+        meta?.replyToSender ?? null,
+        meta?.audioUrl ?? null,
+        meta?.transcription ?? null,
+        meta?.attachmentUrl ?? null,
+        meta?.attachmentName ?? null,
+        meta?.attachmentMime ?? null,
+      ]
     );
   } catch (err) {
     console.error('[Chat Audit Log Error]', err);
@@ -713,7 +800,13 @@ app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
          s.created_at,
          s.updated_at,
          COALESCE(m_agg.message_count, 0)::int AS message_count,
-         m_last.content AS last_message,
+         CASE
+           WHEN m_last.audio_url IS NOT NULL THEN
+             COALESCE(NULLIF(TRIM(m_last.transcription), ''), NULLIF(TRIM(m_last.content), ''), '[Mensagem de áudio]')
+           WHEN m_last.attachment_url IS NOT NULL THEN
+             COALESCE(NULLIF(TRIM(m_last.content), ''), CONCAT('[Anexo: ', COALESCE(m_last.attachment_name, 'arquivo'), ']'))
+           ELSE m_last.content
+         END AS last_message,
          m_last.sender AS last_sender
        FROM chat_sessions s
        LEFT JOIN (
@@ -722,7 +815,7 @@ app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
          GROUP BY session_id
        ) m_agg ON m_agg.session_id = s.session_id
        LEFT JOIN LATERAL (
-         SELECT content, sender
+         SELECT content, sender, audio_url, transcription, attachment_url, attachment_name
          FROM chat_messages
          WHERE session_id = s.session_id
          ORDER BY id DESC
@@ -777,7 +870,20 @@ app.get(
       }
 
       const msgRes = await pool.query<DbChatMessageRow>(
-        `SELECT id, session_id, sender, content, created_at
+        `SELECT
+           id,
+           session_id,
+           sender,
+           content,
+           reply_to_id,
+           reply_to_preview,
+           reply_to_sender,
+           audio_url,
+           transcription,
+           attachment_url,
+           attachment_name,
+           attachment_mime,
+           created_at
          FROM chat_messages
          WHERE session_id = $1
          ORDER BY id ASC`,
@@ -800,6 +906,14 @@ app.get(
           sessionId: m.session_id,
           sender: m.sender,
           content: m.content,
+          replyToId: m.reply_to_id ?? null,
+          replyToPreview: m.reply_to_preview ?? null,
+          replyToSender: m.reply_to_sender ?? null,
+          audioUrl: m.audio_url ?? null,
+          transcription: m.transcription ?? null,
+          attachmentUrl: m.attachment_url ?? null,
+          attachmentName: m.attachment_name ?? null,
+          attachmentMime: m.attachment_mime ?? null,
           createdAt: m.created_at,
         })),
       });
@@ -1515,6 +1629,101 @@ app.post('/api/ai/chat', async (req, res) => {
     const dealership = s?.tradeName || 'Armazém do Carro';
     const assistantName = s?.aiAssistantName || 'Consultor Virtual Armazém';
 
+    // Validação opcional de mídia (áudio ou anexo imagem/PDF) respeitando limite serverless da Vercel
+    const parsedAudio = body.audio?.dataUrl
+      ? parseDataUrlMedia(body.audio.dataUrl, body.audio.mimeType)
+      : null;
+    if (body.audio?.dataUrl && !parsedAudio) {
+      res.status(400).json({ error: 'Formato de áudio inválido.' });
+      return;
+    }
+    if (parsedAudio) {
+      const allowedAudio = [
+        'audio/webm',
+        'audio/ogg',
+        'audio/mp4',
+        'audio/mpeg',
+        'audio/wav',
+        'audio/mp3',
+      ];
+      if (!allowedAudio.includes(parsedAudio.mimeType)) {
+        res.status(400).json({
+          error: `Formato de áudio (${parsedAudio.mimeType}) não suportado. Grave novamente pelo navegador.`,
+        });
+        return;
+      }
+      if (parsedAudio.byteLength > MAX_INLINE_MEDIA_BYTES) {
+        res.status(413).json({
+          error: 'O áudio excedeu o limite permitido para envio. Envie um áudio mais curto.',
+        });
+        return;
+      }
+    }
+
+    const parsedAttachment = body.attachment?.dataUrl
+      ? parseDataUrlMedia(body.attachment.dataUrl, body.attachment.mimeType)
+      : null;
+    if (body.attachment?.dataUrl && !parsedAttachment) {
+      res.status(400).json({ error: 'Formato de anexo inválido.' });
+      return;
+    }
+    if (parsedAttachment) {
+      const allowedAttachments = [
+        'image/jpeg',
+        'image/png',
+        'image/webp',
+        'application/pdf',
+      ];
+      if (!allowedAttachments.includes(parsedAttachment.mimeType)) {
+        res.status(400).json({
+          error: 'Envie apenas fotos (JPG, PNG, WEBP) ou documentos em PDF.',
+        });
+        return;
+      }
+      if (parsedAttachment.byteLength > MAX_INLINE_MEDIA_BYTES) {
+        res.status(413).json({
+          error: 'O arquivo anexado excede o tamanho máximo suportado (3 MB). Comprima e tente novamente.',
+        });
+        return;
+      }
+    }
+
+    // Se o cliente enviou áudio, realiza a transcrição oficial via Gemini antes da resposta consultiva
+    let audioTranscription: string | null = null;
+    if (parsedAudio) {
+      const audioInlinePart = {
+        inlineData: {
+          mimeType: parsedAudio.mimeType,
+          data: parsedAudio.base64,
+        },
+      };
+      const transcribePrompt = {
+        text: 'Transcreva fielmente em Português do Brasil o que foi falado neste áudio de um cliente em atendimento de revenda automotiva. Retorne apenas a transcrição limpa, sem prefixos ou comentários.',
+      };
+
+      try {
+        const transcribeRes = await callGeminiWithRetry(() =>
+          ai.models.generateContent({
+            model: 'gemini-3.5-transcribe',
+            contents: { parts: [audioInlinePart, transcribePrompt] },
+          })
+        );
+        audioTranscription = transcribeRes.text?.trim() || null;
+      } catch (transcribeErr) {
+        console.warn('[Audio Transcribe Fallback]', transcribeErr);
+        const fallbackRes = await callGeminiWithRetry(() =>
+          ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: { parts: [audioInlinePart, transcribePrompt] },
+            config: {
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          })
+        );
+        audioTranscription = fallbackRes.text?.trim() || null;
+      }
+    }
+
     // Consulta direta ao estoque real no Neon PostgreSQL para garantir dados 100% verídicos
     let dbInventoryText = '';
     try {
@@ -1569,12 +1778,15 @@ app.post('/api/ai/chat', async (req, res) => {
       }
     }
 
-    // Verifica se o cliente digitou explicitamente um código FIPE na última mensagem (ex: 001004-9)
+    // Verifica se o cliente digitou (ou falou no áudio) um código FIPE (ex: 001004-9)
     let clientFipeLookupContext = '';
-    const lastUserMessage = [...body.messages]
-      .reverse()
-      .find((m) => m.sender === 'cliente')?.text;
-    const fipeCodeMatch = lastUserMessage?.match(/\b\d{6}-?\d\b/);
+    const lastUserMessageRaw =
+      [...body.messages].reverse().find((m) => m.sender === 'cliente')?.text ||
+      '';
+    const fipeSearchText = audioTranscription
+      ? `${lastUserMessageRaw} ${audioTranscription}`
+      : lastUserMessageRaw;
+    const fipeCodeMatch = fipeSearchText.match(/\b\d{6}-?\d\b/);
     if (fipeCodeMatch) {
       try {
         const liveFipe = await fetchBrasilApiFipe(fipeCodeMatch[0]);
@@ -1623,13 +1835,49 @@ ${realStockContext}`
 ${realStockContext}${clientFipeLookupContext}`;
 
     const conversationTranscript = body.messages
-      .map((m) => `${m.sender === 'cliente' ? 'Cliente' : assistantName}: ${m.text}`)
+      .map((m, idx) => {
+        const isLastClient =
+          idx === body.messages.length - 1 && m.sender === 'cliente';
+        let messageText = m.text;
+        if (isLastClient && audioTranscription) {
+          messageText = `[Áudio enviado pelo cliente — Transcrição]: "${audioTranscription}"${
+            m.text && m.text !== 'Mensagem de áudio' ? ` (${m.text})` : ''
+          }`;
+        }
+        return `${m.sender === 'cliente' ? 'Cliente' : assistantName}: ${messageText}`;
+      })
       .join('\n');
 
-    const chatConfig = {
-      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-      maxOutputTokens: 500,
-      systemInstruction: `Você é o Consultor Oficial da revenda "${dealership}" (${s?.address || 'Av. Ibirapuera, 2.840 — Moema'}, ${s?.city || 'São Paulo'}/${s?.state || 'SP'}).
+    const safeReplyToId =
+      typeof body.replyTo?.id === 'string'
+        ? body.replyTo.id.trim().slice(0, 120)
+        : null;
+    const safeReplyToPreview =
+      typeof body.replyTo?.preview === 'string'
+        ? body.replyTo.preview.trim().slice(0, 400)
+        : null;
+    const safeReplyToSender: 'user' | 'assistant' | null =
+      body.replyTo?.sender === 'ia'
+        ? 'assistant'
+        : body.replyTo?.sender === 'cliente'
+          ? 'user'
+          : null;
+
+    const replyContextPrompt = safeReplyToPreview
+      ? `\n\n[MENSAGEM CITADA PELO CLIENTE (REPLY)]\nO cliente respondeu especificamente a esta mensagem anterior (${
+          safeReplyToSender === 'assistant'
+            ? `enviada por ${assistantName}`
+            : 'enviada pelo próprio Cliente'
+        }):\n"${safeReplyToPreview}"\nResponda levando exatamente essa mensagem citada como referência principal.`
+      : '';
+
+    const mediaInstructionPrompt = parsedAttachment
+      ? parsedAttachment.mimeType === 'application/pdf'
+        ? `\n\n[ANEXO PDF RECEBIDO: ${body.attachment?.name || 'documento.pdf'}]\nAnalise o PDF anexado (ex.: CRLV, ficha técnica, proposta ou simulação). Extraia apenas dados comerciais úteis do veículo (marca, modelo, ano, versão, condições) para orientar o cliente. Por LGPD, NUNCA repita dados pessoais sensíveis (CPF, RG, endereço, RENAVAM completo ou dados bancários) eventualmente presentes no documento.`
+        : `\n\n[FOTO/IMAGEM RECEBIDA: ${body.attachment?.name || 'imagem.jpg'}]\nAnalise atentamente a imagem enviada pelo cliente. Se for um veículo (por exemplo, o carro usado do cliente para avaliação na troca), identifique o que for visível (modelo/carroceria aproximada, cor, estado aparente de lataria/rodas/interior ou painel), elogie ou comente objetivamente o que observou sem inventar defeitos ou detalhes não visíveis, peça apenas ano/versão/km caso ainda não tenha sido informado e convide para pré-avaliação/visita no showroom.`
+      : '';
+
+    const systemInstruction = `Você é o Consultor Oficial da revenda "${dealership}" (${s?.address || 'Av. Ibirapuera, 2.840 — Moema'}, ${s?.city || 'São Paulo'}/${s?.state || 'SP'}).
 Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursSaturday || '09:00 às 16:00'} | WhatsApp: ${s?.whatsapp || '(11) 99482-1040'}.
 
 1. FORMATAÇÃO VISUAL LIMPA, CURTA E ESTRUTURADA (OBRIGATÓRIO):
@@ -1651,15 +1899,70 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 4. MINIMIZAÇÃO DE DADOS E PRIVACIDADE (LGPD):
 - Solicite APENAS os dados estritamente necessários para o atendimento inicial: **Nome** e **WhatsApp**.
 - É PROIBIDO solicitar CPF, RG, CNH, endereço residencial, comprovante de renda, dados bancários ou número de cartão pelo chat.
-- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente, NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.`,
-    };
+- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente (inclusive em fotos ou PDFs), NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.`;
 
-    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
+    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}${mediaInstructionPrompt}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
+
+    // Para anexos visuais/PDF, usa gemini-4-hydrogen multimodal; para texto/áudio já transcrito, mantém gemini-3.1-flash-lite ultrarrápido
+    const usesMultimodalAttachment = Boolean(parsedAttachment);
+    const selectedModel = usesMultimodalAttachment
+      ? 'gemini-4-hydrogen'
+      : 'gemini-3.1-flash-lite';
+
+    const chatConfig = usesMultimodalAttachment
+      ? {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          systemInstruction,
+        }
+      : {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          maxOutputTokens: 500,
+          systemInstruction,
+        };
+
+    const geminiContents = parsedAttachment
+      ? {
+          parts: [
+            {
+              inlineData: {
+                mimeType: parsedAttachment.mimeType,
+                data: parsedAttachment.base64,
+              },
+            },
+            { text: contentsPrompt },
+          ],
+        }
+      : contentsPrompt;
 
     const auditSessionId = sanitizeSessionId(body.sessionId);
     const auditOrigin = sanitizeOrigin(body.origem);
-    if (auditSessionId && lastUserMessage) {
-      await recordChatAuditTurn(auditSessionId, auditOrigin, 'user', lastUserMessage);
+    if (auditSessionId) {
+      const storedUserContent =
+        lastUserMessageRaw.trim() ||
+        (parsedAudio
+          ? audioTranscription || 'Mensagem de áudio'
+          : parsedAttachment
+            ? `Anexo enviado: ${body.attachment?.name || 'arquivo'}`
+            : '');
+      await recordChatAuditTurn(
+        auditSessionId,
+        auditOrigin,
+        'user',
+        storedUserContent,
+        {
+          replyToId: safeReplyToId,
+          replyToPreview: safeReplyToPreview,
+          replyToSender: safeReplyToSender,
+          audioUrl: parsedAudio?.cleanDataUrl ?? null,
+          transcription: audioTranscription,
+          attachmentUrl: parsedAttachment?.cleanDataUrl ?? null,
+          attachmentName:
+            typeof body.attachment?.name === 'string'
+              ? body.attachment.name.trim().slice(0, 250)
+              : null,
+          attachmentMime: parsedAttachment?.mimeType ?? null,
+        }
+      );
     }
 
     const wantsStream =
@@ -1670,8 +1973,8 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
     if (!wantsStream) {
       const response = await callGeminiWithRetry(() =>
         ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: contentsPrompt,
+          model: selectedModel,
+          contents: geminiContents,
           config: chatConfig,
         })
       );
@@ -1686,14 +1989,17 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
         await recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', reply);
       }
 
-      res.json({ reply });
+      res.json({
+        reply,
+        ...(audioTranscription ? { transcription: audioTranscription } : {}),
+      });
       return;
     }
 
     const stream = await callGeminiWithRetry(() =>
       ai.models.generateContentStream({
-        model: 'gemini-3.1-flash-lite',
-        contents: contentsPrompt,
+        model: selectedModel,
+        contents: geminiContents,
         config: chatConfig,
       })
     );
@@ -1703,6 +2009,12 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
+
+    if (audioTranscription) {
+      res.write(
+        `data: ${JSON.stringify({ type: 'meta', transcription: audioTranscription })}\n\n`
+      );
+    }
 
     let clientClosed = false;
     res.on('close', () => {

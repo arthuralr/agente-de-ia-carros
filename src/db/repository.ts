@@ -57,6 +57,14 @@ export interface DbChatMessageRow {
   session_id: string;
   sender: 'user' | 'assistant';
   content: string;
+  reply_to_id?: string | null;
+  reply_to_preview?: string | null;
+  reply_to_sender?: 'user' | 'assistant' | null;
+  audio_url?: string | null;
+  transcription?: string | null;
+  attachment_url?: string | null;
+  attachment_name?: string | null;
+  attachment_mime?: string | null;
   created_at: Date;
 }
 
@@ -95,6 +103,17 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
         content TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+    await client.query(`
+      ALTER TABLE chat_messages
+      ADD COLUMN IF NOT EXISTS reply_to_id VARCHAR(128),
+      ADD COLUMN IF NOT EXISTS reply_to_preview TEXT,
+      ADD COLUMN IF NOT EXISTS reply_to_sender VARCHAR(32),
+      ADD COLUMN IF NOT EXISTS audio_url TEXT,
+      ADD COLUMN IF NOT EXISTS transcription TEXT,
+      ADD COLUMN IF NOT EXISTS attachment_url TEXT,
+      ADD COLUMN IF NOT EXISTS attachment_name VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS attachment_mime VARCHAR(128)
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id

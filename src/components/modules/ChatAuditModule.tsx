@@ -2,14 +2,22 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   Bot,
+  ChevronDown,
+  ChevronUp,
   Clock,
+  Download,
+  FileText,
+  Image as ImageIcon,
   Loader2,
   MessageCircle,
   MessageSquareText,
+  Mic,
   Phone,
   RefreshCw,
+  Reply,
   Search,
   User,
+  X,
 } from 'lucide-react';
 import {
   ChatAuditMessage,
@@ -69,6 +77,13 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
   const [originFilter, setOriginFilter] = useState<'Todos' | '/chat' | 'Vitrine'>(
     'Todos'
   );
+  const [collapsedTranscriptions, setCollapsedTranscriptions] = useState<
+    Record<number, boolean>
+  >({});
+  const [lightboxImage, setLightboxImage] = useState<{
+    url: string;
+    name: string;
+  } | null>(null);
 
   const fetchSessions = useCallback(async () => {
     setLoadingSessions(true);
@@ -176,6 +191,13 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
     [selectedSessionId, sessions]
   );
 
+  const toggleTranscription = (msgId: number) => {
+    setCollapsedTranscriptions((prev) => ({
+      ...prev,
+      [msgId]: !prev[msgId],
+    }));
+  };
+
   return (
     <div className="space-y-5">
       {/* Toolbar */}
@@ -272,9 +294,7 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                     type="button"
                     onClick={() => setSelectedSessionId(session.sessionId)}
                     className={`w-full text-left px-4 py-3.5 transition-colors ${
-                      isSelected
-                        ? 'bg-red-600/12'
-                        : 'hover:bg-white/[0.03]'
+                      isSelected ? 'bg-red-600/12' : 'hover:bg-white/[0.03]'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">
@@ -319,7 +339,7 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
           </div>
         </section>
 
-        {/* Right Detail: Full Transcript */}
+        {/* Right Detail: Full Transcript (with Replies, Audio Player + Transcription, Photos & PDFs) */}
         <section className="lg:col-span-8 bg-[#111114] border border-white/[0.08] rounded-xl flex flex-col overflow-hidden max-h-[72vh]">
           {!activeSession ? (
             <div className="flex-1 flex flex-col items-center justify-center p-10 text-center space-y-2">
@@ -328,7 +348,7 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                 Selecione uma conversa para auditar
               </p>
               <p className="text-xs text-zinc-500 max-w-md">
-                Acompanhe todas as perguntas dos clientes, argumentos da IA e
+                Acompanhe perguntas, áudios transcritos, fotos de troca, PDFs e
                 assuma o atendimento pelo WhatsApp em um clique.
               </p>
             </div>
@@ -407,6 +427,24 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                 ) : (
                   messages.map((msg) => {
                     const isAssistant = msg.sender === 'assistant';
+                    const isImageAttachment =
+                      Boolean(msg.attachmentUrl) &&
+                      (msg.attachmentMime || '').startsWith('image/');
+                    const isPdfAttachment =
+                      Boolean(msg.attachmentUrl) &&
+                      msg.attachmentMime === 'application/pdf';
+                    const isTranscriptionHidden = Boolean(
+                      collapsedTranscriptions[msg.id]
+                    );
+                    const hideDuplicateAudioText =
+                      Boolean(msg.audioUrl) &&
+                      (!msg.content.trim() ||
+                        msg.content.trim() === 'Mensagem de áudio' ||
+                        msg.content.trim() === (msg.transcription || '').trim());
+                    const hideDefaultAttachmentPlaceholder =
+                      Boolean(msg.attachmentUrl) &&
+                      msg.content.trim().startsWith('Anexo enviado:');
+
                     return (
                       <div
                         key={msg.id}
@@ -435,16 +473,135 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                         </div>
 
                         <div
-                          className={`max-w-[88%] rounded-xl px-4 py-3 ${
+                          className={`max-w-[88%] rounded-xl px-4 py-3 space-y-2.5 ${
                             isAssistant
                               ? 'bg-[#18181C] text-zinc-200 border border-white/[0.08]'
                               : 'bg-emerald-950/50 text-zinc-100 border border-emerald-500/30'
                           }`}
                         >
-                          <ChatMarkdown
-                            content={msg.content}
-                            variant={isAssistant ? 'ai' : 'user'}
-                          />
+                          {/* Quoted Reply Reference */}
+                          {msg.replyToPreview && (
+                            <div className="rounded-md bg-black/30 border-l-2 border-emerald-400 px-3 py-1.5 text-xs">
+                              <p className="text-[11px] font-medium text-emerald-400 inline-flex items-center gap-1">
+                                <Reply className="w-3 h-3" />
+                                <span>
+                                  Respondendo a{' '}
+                                  {msg.replyToSender === 'assistant'
+                                    ? settings.aiAssistantName
+                                    : activeSession.leadName?.trim() ||
+                                      'Visitante'}
+                                </span>
+                              </p>
+                              <p className="text-zinc-400 line-clamp-2 mt-0.5">
+                                {msg.replyToPreview}
+                              </p>
+                            </div>
+                          )}
+
+                          {/* Audio Player + Automatic Transcription */}
+                          {msg.audioUrl && (
+                            <div className="space-y-2 min-w-[240px]">
+                              <div className="flex items-center gap-2.5">
+                                <span className="w-8 h-8 rounded-full bg-emerald-600/20 border border-emerald-500/40 text-emerald-400 flex items-center justify-center shrink-0">
+                                  <Mic className="w-4 h-4" />
+                                </span>
+                                <audio
+                                  controls
+                                  src={msg.audioUrl}
+                                  className="h-8 w-full max-w-[280px]"
+                                />
+                              </div>
+
+                              {msg.transcription && (
+                                <div className="rounded-lg bg-black/30 border border-white/[0.08] p-2.5 space-y-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleTranscription(msg.id)}
+                                    className="w-full flex items-center justify-between gap-2 text-[11px] font-medium text-emerald-400 hover:text-emerald-300"
+                                  >
+                                    <span>Transcrição automática (IA)</span>
+                                    {isTranscriptionHidden ? (
+                                      <ChevronDown className="w-3.5 h-3.5" />
+                                    ) : (
+                                      <ChevronUp className="w-3.5 h-3.5" />
+                                    )}
+                                  </button>
+                                  {!isTranscriptionHidden && (
+                                    <p className="text-xs text-zinc-200 leading-relaxed">
+                                      “{msg.transcription}”
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Image Attachment Thumbnail */}
+                          {isImageAttachment && msg.attachmentUrl && (
+                            <div className="space-y-1.5">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setLightboxImage({
+                                    url: msg.attachmentUrl!,
+                                    name: msg.attachmentName || 'imagem.jpg',
+                                  })
+                                }
+                                className="block rounded-lg overflow-hidden border border-white/10 hover:opacity-95 transition-opacity max-w-[280px]"
+                              >
+                                <img
+                                  src={msg.attachmentUrl}
+                                  alt={msg.attachmentName || 'Foto enviada'}
+                                  className="w-full max-h-[240px] object-cover block"
+                                />
+                              </button>
+                              <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
+                                <span className="truncate max-w-[200px]">
+                                  {msg.attachmentName || 'Foto anexada'}
+                                </span>
+                                <a
+                                  href={msg.attachmentUrl}
+                                  download={msg.attachmentName || 'foto.jpg'}
+                                  className="inline-flex items-center gap-1 text-emerald-400 hover:underline shrink-0"
+                                >
+                                  <Download className="w-3 h-3" />
+                                  <span>Baixar</span>
+                                </a>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* PDF Document Attachment Card */}
+                          {isPdfAttachment && msg.attachmentUrl && (
+                            <a
+                              href={msg.attachmentUrl}
+                              download={msg.attachmentName || 'documento.pdf'}
+                              className="flex items-center gap-3 p-3 rounded-lg bg-black/30 hover:bg-black/45 border border-white/[0.1] transition-colors max-w-[320px]"
+                            >
+                              <div className="w-9 h-9 rounded-lg bg-red-600/20 border border-red-500/30 text-red-400 flex items-center justify-center shrink-0">
+                                <FileText className="w-4 h-4" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs font-medium text-white truncate">
+                                  {msg.attachmentName || 'documento.pdf'}
+                                </p>
+                                <p className="text-[11px] text-zinc-400">
+                                  Documento PDF · Clique para baixar
+                                </p>
+                              </div>
+                              <Download className="w-4 h-4 text-emerald-400 shrink-0" />
+                            </a>
+                          )}
+
+                          {/* Text Message Body */}
+                          {msg.content &&
+                            !hideDuplicateAudioText &&
+                            !hideDefaultAttachmentPlaceholder && (
+                              <ChatMarkdown
+                                content={msg.content}
+                                variant={isAssistant ? 'ai' : 'user'}
+                              />
+                            )}
                         </div>
                       </div>
                     );
@@ -455,6 +612,49 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
           )}
         </section>
       </div>
+
+      {/* Admin Image Lightbox Modal */}
+      {lightboxImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-4"
+          onClick={() => setLightboxImage(null)}
+        >
+          <div
+            className="max-w-3xl w-full flex flex-col items-center gap-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="w-full flex items-center justify-between text-white">
+              <span className="text-xs font-medium truncate inline-flex items-center gap-2">
+                <ImageIcon className="w-4 h-4 text-emerald-400" />
+                {lightboxImage.name}
+              </span>
+              <div className="flex items-center gap-2">
+                <a
+                  href={lightboxImage.url}
+                  download={lightboxImage.name}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold inline-flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Baixar imagem</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setLightboxImage(null)}
+                  aria-label="Fechar visualização"
+                  className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <img
+              src={lightboxImage.url}
+              alt={lightboxImage.name}
+              className="max-h-[82dvh] max-w-full rounded-lg object-contain shadow-2xl border border-white/10"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 };

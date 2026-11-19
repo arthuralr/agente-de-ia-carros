@@ -70,11 +70,34 @@ export interface FipeLookupResult {
 
 export type LeadStage = 'Novo Lead' | 'Em Atendimento' | 'Proposta' | 'Fechado';
 
+export interface ChatReplyContext {
+  id: string;
+  sender: 'ia' | 'cliente';
+  preview: string;
+}
+
+export interface ChatAttachment {
+  url: string;
+  name: string;
+  mimeType: string;
+  sizeBytes?: number;
+}
+
+export interface ChatAudioMeta {
+  url: string;
+  mimeType: string;
+  durationSec?: number;
+  transcription?: string;
+}
+
 export interface ChatMessage {
   id: string;
   sender: 'ia' | 'cliente';
   text: string;
   timestamp: string;
+  replyTo?: ChatReplyContext;
+  audio?: ChatAudioMeta;
+  attachment?: ChatAttachment;
 }
 
 export interface Lead {
@@ -119,6 +142,14 @@ export interface ChatAuditMessage {
   sessionId: string;
   sender: 'user' | 'assistant';
   content: string;
+  replyToId?: string | null;
+  replyToPreview?: string | null;
+  replyToSender?: 'user' | 'assistant' | null;
+  audioUrl?: string | null;
+  transcription?: string | null;
+  attachmentUrl?: string | null;
+  attachmentName?: string | null;
+  attachmentMime?: string | null;
   createdAt: string;
 }
 

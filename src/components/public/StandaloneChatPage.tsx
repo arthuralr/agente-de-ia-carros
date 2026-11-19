@@ -1,26 +1,51 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeft,
+  CalendarClock,
+  Camera,
+  Car,
   Check,
   CheckCheck,
+  ChevronRight,
   Copy,
+  Download,
+  FileText,
+  Image as ImageIcon,
   Loader2,
   MapPin,
   MessageCircle,
+  Mic,
+  Paperclip,
+  RefreshCw,
+  Reply,
   Send,
   ShieldCheck,
+  Trash2,
   UserCheck,
   UserPlus,
+  Wallet,
   X,
 } from 'lucide-react';
 import {
+  ChatAttachment,
   ChatMessage,
+  ChatReplyContext,
   DealershipSettings,
   Lead,
   Vehicle,
 } from '../../types';
 import { formatWhatsAppLink } from '../../utils/formatters';
+import {
+  blobToDataUrl,
+  formatBytesCompact,
+  formatDurationSeconds,
+  MAX_AUDIO_DURATION_SEC,
+  MAX_AUDIO_RAW_BYTES,
+  pickSupportedAudioMimeType,
+  prepareChatAttachment,
+  stripMarkdownForPreview,
+} from '../../utils/chatMedia';
 import { useVirtualConsultant } from '../../hooks/useVirtualConsultant';
 import { ChatMarkdown } from './ChatMarkdown';
 
@@ -58,10 +83,42 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const [leadPanelOpen, setLeadPanelOpen] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
 
+  // Attachment state
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [pendingAttachment, setPendingAttachment] =
+    useState<ChatAttachment | null>(null);
+  const [isProcessingFile, setIsProcessingFile] = useState(false);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  const [lightboxImage, setLightboxImage] = useState<{
+    url: string;
+    name: string;
+  } | null>(null);
+
+  // Audio recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSec, setRecordingSec] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
+  const recordingStartRef = useRef<number>(0);
+  const discardAudioRef = useRef<boolean>(false);
+
+  // Refs for inputs & swipe-to-reply
+  const textInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const pdfInputRef = useRef<HTMLInputElement>(null);
+  const touchStartRef = useRef<{ x: number; y: number; msgId: string } | null>(
+    null
+  );
+
   const {
     messages,
     input,
     setInput,
+    replyingTo,
+    setReplyingTo,
+    clearReply,
     isSending,
     hasStreamFirstToken,
     errorMsg,
@@ -75,8 +132,8 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     leadSaveError,
     leadSaved,
     messagesEndRef,
+    sendRichMessage,
     sendQuickPrompt,
-    handleSend,
     handleSaveContactToCrm,
   } = useVirtualConsultant({
     active: true,
@@ -90,6 +147,16 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     onSyncLeadChat,
   });
 
+  // Clean up audio streams and timers on unmount
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) {
+        window.clearInterval(recordingTimerRef.current);
+      }
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
   const handleCopyShareLink = async () => {
     try {
       await navigator.clipboard.writeText(window.location.href);
@@ -99,6 +166,246 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       // Clipboard fallback ignored
     }
   };
+
+  const buildReplyPreviewForMessage = (msg: ChatMessage): string => {
+    if (msg.text?.trim()) {
+      return stripMarkdownForPreview(msg.text, 110);
+    }
+    if (msg.audio) {
+      return msg.audio.transcription
+        ? `Áudio: ${stripMarkdownForPreview(msg.audio.transcription, 95)}`
+        : `Mensagem de áudio (${formatDurationSeconds(msg.audio.durationSec || 0)})`;
+    }
+    if (msg.attachment) {
+      return msg.attachment.mimeType === 'application/pdf'
+        ? `Documento PDF: ${msg.attachment.name}`
+        : `Foto: ${msg.attachment.name}`;
+    }
+    return 'Mensagem';
+  };
+
+  const handleSelectReply = (msg: ChatMessage) => {
+    const ctx: ChatReplyContext = {
+      id: msg.id,
+      sender: msg.sender,
+      preview: buildReplyPreviewForMessage(msg),
+    };
+    setReplyingTo(ctx);
+    textInputRef.current?.focus();
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    setAttachMenuOpen(false);
+    if (!file) return;
+
+    setMediaError(null);
+    setIsProcessingFile(true);
+    try {
+      const prepared = await prepareChatAttachment(file);
+      setPendingAttachment(prepared);
+      textInputRef.current?.focus();
+    } catch (err: unknown) {
+      setMediaError(
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível preparar o arquivo selecionado.'
+      );
+    } finally {
+      setIsProcessingFile(false);
+    }
+  };
+
+  const stopRecordingHardware = () => {
+    if (recordingTimerRef.current) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+  };
+
+  const startAudioRecording = async () => {
+    if (isSending || isRecording) return;
+    setMediaError(null);
+    setAttachMenuOpen(false);
+
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof MediaRecorder === 'undefined'
+    ) {
+      setMediaError(
+        'Seu navegador não suporta gravação de áudio direta. Digite sua mensagem normalmente.'
+      );
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      const mimeType = pickSupportedAudioMimeType();
+      const recorderOptions: MediaRecorderOptions = {
+        audioBitsPerSecond: 24000,
+        ...(mimeType ? { mimeType } : {}),
+      };
+
+      const recorder = new MediaRecorder(stream, recorderOptions);
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+      discardAudioRef.current = false;
+      recordingStartRef.current = Date.now();
+      setRecordingSec(0);
+      setIsRecording(true);
+
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          audioChunksRef.current.push(ev.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        const shouldDiscard = discardAudioRef.current;
+        const durationSec = Math.max(
+          1,
+          Math.round((Date.now() - recordingStartRef.current) / 1000)
+        );
+        const chunks = audioChunksRef.current;
+        const resolvedMime =
+          recorder.mimeType || mimeType || 'audio/webm';
+
+        stopRecordingHardware();
+        setIsRecording(false);
+        setRecordingSec(0);
+
+        if (shouldDiscard || chunks.length === 0) return;
+
+        const blob = new Blob(chunks, { type: resolvedMime });
+        if (blob.size < 400) {
+          setMediaError(
+            'Áudio muito curto. Segure ou fale por pelo menos 1 segundo.'
+          );
+          return;
+        }
+        if (blob.size > MAX_AUDIO_RAW_BYTES) {
+          setMediaError(
+            'O áudio ficou grande demais para envio rápido. Tente gravar uma mensagem mais objetiva.'
+          );
+          return;
+        }
+
+        try {
+          const dataUrl = await blobToDataUrl(blob);
+          sendRichMessage({
+            text: '',
+            audio: {
+              url: dataUrl,
+              mimeType: resolvedMime.split(';')[0] || 'audio/webm',
+              durationSec,
+            },
+          });
+        } catch (err: unknown) {
+          setMediaError(
+            err instanceof Error
+              ? err.message
+              : 'Erro ao preparar o áudio gravado.'
+          );
+        }
+      };
+
+      recorder.start(250);
+      recordingTimerRef.current = window.setInterval(() => {
+        const elapsed = Math.floor(
+          (Date.now() - recordingStartRef.current) / 1000
+        );
+        setRecordingSec(elapsed);
+        if (elapsed >= MAX_AUDIO_DURATION_SEC) {
+          if (mediaRecorderRef.current?.state === 'recording') {
+            mediaRecorderRef.current.stop();
+          }
+        }
+      }, 300);
+    } catch {
+      stopRecordingHardware();
+      setIsRecording(false);
+      setMediaError(
+        'Não foi possível acessar o microfone. Verifique a permissão no navegador ou envie sua dúvida por texto.'
+      );
+    }
+  };
+
+  const cancelAudioRecording = () => {
+    discardAudioRef.current = true;
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    } else {
+      stopRecordingHardware();
+      setIsRecording(false);
+      setRecordingSec(0);
+    }
+  };
+
+  const finishAndSendAudioRecording = () => {
+    discardAudioRef.current = false;
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const handleFormSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSending || isProcessingFile) return;
+
+    const trimmed = input.trim();
+    if (!trimmed && !pendingAttachment) return;
+
+    const attachmentToSend = pendingAttachment;
+    setPendingAttachment(null);
+    setAttachMenuOpen(false);
+    setMediaError(null);
+
+    sendRichMessage({
+      text: trimmed,
+      attachment: attachmentToSend,
+    });
+  };
+
+  const interactiveWelcomeOptions = [
+    {
+      id: 'stock',
+      icon: Car,
+      title: '🚗 Ver estoque e ofertas abaixo da FIPE',
+      subtitle: 'Modelos disponíveis hoje e economia na tabela oficial',
+      prompt:
+        'Quero ver o estoque disponível hoje e as melhores ofertas com comparativo da Tabela FIPE.',
+    },
+    {
+      id: 'finance',
+      icon: Wallet,
+      title: '💰 Simular financiamento ou parcelas',
+      subtitle: 'Entrada, parcelas, taxas bancárias e carta de crédito',
+      prompt:
+        'Quero simular financiamento ou parcelas. Quais condições vocês trabalham?',
+    },
+    {
+      id: 'tradein',
+      icon: RefreshCw,
+      title: '🔄 Avaliar meu carro na troca (enviar fotos)',
+      subtitle: 'Envie fotos do seu usado pelo clipe + para pré-avaliação',
+      prompt:
+        'Quero avaliar meu carro usado na troca. Quais dados e fotos devo enviar agora?',
+    },
+    {
+      id: 'visit',
+      icon: CalendarClock,
+      title: '📍 Agendar visita / Falar com consultor',
+      subtitle: 'Showroom, horários de atendimento ou contato no WhatsApp',
+      prompt:
+        'Quero agendar uma visita no showroom ou falar com um consultor humano.',
+    },
+  ];
 
   const quickChips = [
     {
@@ -111,13 +418,16 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     },
     {
       label: 'Avaliar troca',
-      prompt: 'Vocês aceitam veículo usado na troca?',
+      prompt: 'Vocês aceitam veículo usado na troca? Posso enviar fotos agora?',
     },
     {
       label: 'Agendar visita',
       prompt: 'Quais os horários e endereço para visita no showroom?',
     },
   ];
+
+  const canSendTextOrAttachment =
+    Boolean(input.trim()) || Boolean(pendingAttachment);
 
   const renderLeadFormBody = () => (
     <div className="space-y-4">
@@ -282,7 +592,23 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
         className="hidden lg:block fixed top-0 inset-x-0 h-[128px] bg-[#00A884] z-0"
       />
 
-      {/* Main WhatsApp App Container (100% Native Fullscreen on Mobile, Centered WhatsApp Web Frame on Desktop) */}
+      {/* Hidden File Inputs for Images & PDF */}
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        onChange={(e) => void handleFileChange(e)}
+        className="hidden"
+      />
+      <input
+        ref={pdfInputRef}
+        type="file"
+        accept="application/pdf,.pdf"
+        onChange={(e) => void handleFileChange(e)}
+        className="hidden"
+      />
+
+      {/* Main WhatsApp App Container */}
       <div className="relative z-10 w-full h-full lg:max-w-[1100px] lg:max-h-[920px] lg:rounded-lg lg:shadow-[0_12px_32px_rgba(11,20,26,0.18)] flex overflow-hidden bg-[#EFEAE2]">
         {/* Primary WhatsApp Conversation Column */}
         <div className="flex-1 min-w-0 h-full flex flex-col">
@@ -329,12 +655,16 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                   {effectiveSettings.tradeName}
                 </h1>
                 <p className="text-[12px] leading-tight text-[#D9FDD3] truncate">
-                  {isSending ? 'digitando...' : 'online'}
+                  {isSending
+                    ? 'digitando...'
+                    : isRecording
+                      ? 'gravando áudio...'
+                      : 'online'}
                 </p>
               </div>
             </div>
 
-            {/* Header Right Actions: Lead Capture Trigger + Copy Direct Link */}
+            {/* Header Right Actions */}
             <div className="flex items-center gap-1 shrink-0">
               <button
                 type="button"
@@ -380,7 +710,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             </div>
           </header>
 
-          {/* Subtle Compact Lead Confirmation / Quick Trigger Banner (when lead not yet saved) */}
+          {/* Lead Confirmed Subtle Bar */}
           {leadSaved && (
             <div className="shrink-0 bg-[#E7FCEB] border-b border-[#00A884]/20 px-4 py-1.5 flex items-center justify-between gap-2 text-[11px] text-[#075E54]">
               <span className="inline-flex items-center gap-1.5 truncate">
@@ -393,8 +723,13 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             </div>
           )}
 
-          {/* Scrollable Messages Area with Classic WhatsApp Wallpaper (#EFEAE2) */}
-          <div className="flex-1 overflow-y-auto wa-chat-wallpaper px-3 sm:px-6 lg:px-10 py-4 space-y-2.5">
+          {/* Scrollable Messages Area (#EFEAE2 Wallpaper) */}
+          <div
+            className="flex-1 overflow-y-auto wa-chat-wallpaper px-3 sm:px-6 lg:px-10 py-4 space-y-2.5"
+            onClick={() => {
+              if (attachMenuOpen) setAttachMenuOpen(false);
+            }}
+          >
             {/* Classic Date Divider */}
             <div className="flex justify-center pb-1">
               <span className="px-3 py-1 rounded-lg bg-white/90 shadow-[0_1px_1px_rgba(11,20,26,0.1)] text-[11px] font-medium text-[#54656F] uppercase tracking-wide">
@@ -402,77 +737,279 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </span>
             </div>
 
-            {/* Subtle Encryption / Official Channel Notice */}
+            {/* Official Channel Notice */}
             <div className="flex justify-center pb-2">
               <p className="max-w-md text-center px-3.5 py-1.5 rounded-lg bg-[#FFF5C4]/95 shadow-[0_1px_1px_rgba(11,20,26,0.08)] text-[11.5px] text-[#54656F] leading-snug">
                 Canal oficial de atendimento da{' '}
                 <strong className="text-[#111B21]">
                   {effectiveSettings.tradeName}
                 </strong>
-                . Estoque atualizado em tempo real com laudo cautelar aprovado.
+                . Estoque atualizado em tempo real · Responda qualquer mensagem
+                ou envie texto, áudio, fotos e PDF.
               </p>
             </div>
 
-            {messages.map((msg) => {
+            {messages.map((msg, index) => {
               const isAi = msg.sender === 'ia';
+              const isWelcomeBubble =
+                index === 0 && isAi && msg.id.startsWith('msg-ia-welcome');
+              const isImageAttachment =
+                msg.attachment?.mimeType.startsWith('image/');
+              const isPdfAttachment =
+                msg.attachment?.mimeType === 'application/pdf';
+
               return (
-                <div
-                  key={msg.id}
-                  className={`flex w-full ${
-                    isAi ? 'justify-start' : 'justify-end'
-                  }`}
-                >
+                <div key={msg.id} className="space-y-2">
                   <div
-                    className={`relative max-w-[88%] sm:max-w-[78%] lg:max-w-[72%] px-3 pt-2 pb-1.5 shadow-[0_1px_1px_rgba(11,20,26,0.13)] ${
-                      isAi
-                        ? 'bg-white text-[#111B21] rounded-lg rounded-tl-none ml-2'
-                        : 'bg-[#D9FDD3] text-[#111B21] rounded-lg rounded-tr-none mr-2'
+                    className={`group flex w-full items-center gap-1.5 ${
+                      isAi ? 'justify-start' : 'justify-end'
                     }`}
+                    onTouchStart={(e) => {
+                      const t = e.touches[0];
+                      if (t) {
+                        touchStartRef.current = {
+                          x: t.clientX,
+                          y: t.clientY,
+                          msgId: msg.id,
+                        };
+                      }
+                    }}
+                    onTouchEnd={(e) => {
+                      const start = touchStartRef.current;
+                      const t = e.changedTouches[0];
+                      touchStartRef.current = null;
+                      if (!start || !t || start.msgId !== msg.id) return;
+                      const dx = t.clientX - start.x;
+                      const dy = Math.abs(t.clientY - start.y);
+                      if (dx >= 48 && dy < 40) {
+                        handleSelectReply(msg);
+                      }
+                    }}
                   >
-                    {/* Top Corner WhatsApp Bubble Tail */}
-                    {isAi ? (
-                      <svg
-                        aria-hidden="true"
-                        viewBox="0 0 8 13"
-                        width="8"
-                        height="13"
-                        className="absolute top-0 -left-[8px] text-white fill-current"
+                    {/* Reply Button on Left for User Messages */}
+                    {!isAi && (
+                      <button
+                        type="button"
+                        onClick={() => handleSelectReply(msg)}
+                        title="Responder mensagem"
+                        aria-label="Responder mensagem"
+                        className="opacity-70 sm:opacity-0 sm:group-hover:opacity-100 focus:opacity-100 w-8 h-8 rounded-full bg-white/85 hover:bg-white text-[#54656F] hover:text-[#075E54] shadow-xs flex items-center justify-center transition-all shrink-0"
                       >
-                        <path d="M1.533 3.568L8 12.193V1H2.812C1.042 1 .474 2.156 1.533 3.568z" />
-                      </svg>
-                    ) : (
-                      <svg
-                        aria-hidden="true"
-                        viewBox="0 0 8 13"
-                        width="8"
-                        height="13"
-                        className="absolute top-0 -right-[8px] text-[#D9FDD3] fill-current"
-                      >
-                        <path d="M5.188 1H0v11.193l6.467-8.625C7.526 2.156 6.958 1 5.188 1z" />
-                      </svg>
+                        <Reply className="w-3.5 h-3.5" />
+                      </button>
                     )}
 
-                    <div className="pr-1">
-                      <ChatMarkdown
-                        content={msg.text}
-                        variant={isAi ? 'ai' : 'user'}
-                        theme="whatsapp"
-                      />
+                    <div
+                      className={`relative max-w-[85%] sm:max-w-[76%] lg:max-w-[70%] px-3 pt-2 pb-1.5 shadow-[0_1px_1px_rgba(11,20,26,0.13)] ${
+                        isAi
+                          ? 'bg-white text-[#111B21] rounded-lg rounded-tl-none ml-2'
+                          : 'bg-[#D9FDD3] text-[#111B21] rounded-lg rounded-tr-none mr-2'
+                      }`}
+                    >
+                      {/* Top Corner WhatsApp Bubble Tail */}
+                      {isAi ? (
+                        <svg
+                          aria-hidden="true"
+                          viewBox="0 0 8 13"
+                          width="8"
+                          height="13"
+                          className="absolute top-0 -left-[8px] text-white fill-current"
+                        >
+                          <path d="M1.533 3.568L8 12.193V1H2.812C1.042 1 .474 2.156 1.533 3.568z" />
+                        </svg>
+                      ) : (
+                        <svg
+                          aria-hidden="true"
+                          viewBox="0 0 8 13"
+                          width="8"
+                          height="13"
+                          className="absolute top-0 -right-[8px] text-[#D9FDD3] fill-current"
+                        >
+                          <path d="M5.188 1H0v11.193l6.467-8.625C7.526 2.156 6.958 1 5.188 1z" />
+                        </svg>
+                      )}
+
+                      {/* Quoted Reply Block inside Bubble */}
+                      {msg.replyTo && (
+                        <div
+                          className={`mb-2 rounded-md px-2.5 py-1.5 border-l-[3.5px] text-xs ${
+                            msg.replyTo.sender === 'ia'
+                              ? 'bg-black/[0.05] border-[#00A884]'
+                              : 'bg-black/[0.06] border-[#075E54]'
+                          }`}
+                        >
+                          <p
+                            className={`text-[11px] font-semibold leading-tight ${
+                              msg.replyTo.sender === 'ia'
+                                ? 'text-[#008069]'
+                                : 'text-[#075E54]'
+                            }`}
+                          >
+                            {msg.replyTo.sender === 'ia'
+                              ? effectiveSettings.tradeName
+                              : 'Você'}
+                          </p>
+                          <p className="text-[12px] text-[#54656F] line-clamp-2 mt-0.5 leading-snug">
+                            {msg.replyTo.preview}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Image Attachment Thumbnail */}
+                      {isImageAttachment && msg.attachment && (
+                        <div className="mb-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setLightboxImage({
+                                url: msg.attachment!.url,
+                                name: msg.attachment!.name,
+                              })
+                            }
+                            className="block rounded-md overflow-hidden border border-black/10 hover:opacity-95 transition-opacity max-w-[260px]"
+                          >
+                            <img
+                              src={msg.attachment.url}
+                              alt={msg.attachment.name}
+                              className="w-full max-h-[240px] object-cover block"
+                            />
+                          </button>
+                        </div>
+                      )}
+
+                      {/* PDF Attachment Card */}
+                      {isPdfAttachment && msg.attachment && (
+                        <a
+                          href={msg.attachment.url}
+                          download={msg.attachment.name}
+                          className="mb-2 flex items-center gap-2.5 p-2.5 rounded-md bg-black/[0.05] hover:bg-black/[0.08] border border-black/10 transition-colors max-w-[290px]"
+                        >
+                          <div className="w-9 h-9 rounded-md bg-[#E53935] text-white flex items-center justify-center shrink-0">
+                            <FileText className="w-5 h-5" />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="text-xs font-semibold text-[#111B21] truncate">
+                              {msg.attachment.name}
+                            </p>
+                            <p className="text-[11px] text-[#54656F]">
+                              PDF
+                              {msg.attachment.sizeBytes
+                                ? ` · ${formatBytesCompact(msg.attachment.sizeBytes)}`
+                                : ''}
+                            </p>
+                          </div>
+                          <Download className="w-4 h-4 text-[#54656F] shrink-0" />
+                        </a>
+                      )}
+
+                      {/* Audio Voice Note Player + Live Transcription */}
+                      {msg.audio && (
+                        <div className="mb-1.5 space-y-1.5 min-w-[220px] sm:min-w-[260px]">
+                          <div className="flex items-center gap-2">
+                            <div className="w-8 h-8 rounded-full bg-[#00A884] text-white flex items-center justify-center shrink-0">
+                              <Mic className="w-4 h-4" />
+                            </div>
+                            <audio
+                              controls
+                              src={msg.audio.url}
+                              className="h-8 w-full max-w-[230px]"
+                            />
+                          </div>
+                          {msg.audio.transcription ? (
+                            <p className="text-[12px] text-[#3B4A54] bg-black/[0.04] rounded px-2 py-1 leading-snug italic">
+                              “{msg.audio.transcription}”
+                            </p>
+                          ) : isSending ? (
+                            <p className="text-[11px] text-[#54656F] inline-flex items-center gap-1.5">
+                              <Loader2 className="w-3 h-3 animate-spin text-[#008069]" />
+                              <span>Transcrevendo áudio...</span>
+                            </p>
+                          ) : null}
+                        </div>
+                      )}
+
+                      {/* Text Content */}
+                      {msg.text && (
+                        <div className="pr-1">
+                          <ChatMarkdown
+                            content={msg.text}
+                            variant={isAi ? 'ai' : 'user'}
+                            theme="whatsapp"
+                          />
+                        </div>
+                      )}
+
+                      {/* Timestamp + Blue Double Check */}
+                      <div className="mt-1 flex items-center justify-end gap-1 select-none">
+                        <span className="text-[11px] leading-none text-[#667781] font-mono tabular-nums">
+                          {msg.timestamp}
+                        </span>
+                        {!isAi && (
+                          <CheckCheck
+                            aria-label="Visualizada"
+                            className="w-3.5 h-3.5 text-[#53BDEB] shrink-0"
+                          />
+                        )}
+                      </div>
                     </div>
 
-                    {/* Bottom-Right Timestamp + Blue Double Check on User Messages */}
-                    <div className="mt-1 flex items-center justify-end gap-1 select-none">
-                      <span className="text-[11px] leading-none text-[#667781] font-mono tabular-nums">
-                        {msg.timestamp}
-                      </span>
-                      {!isAi && (
-                        <CheckCheck
-                          aria-label="Visualizada"
-                          className="w-3.5 h-3.5 text-[#53BDEB] shrink-0"
-                        />
-                      )}
-                    </div>
+                    {/* Reply Button on Right for AI Messages */}
+                    {isAi && (
+                      <button
+                        type="button"
+                        onClick={() => handleSelectReply(msg)}
+                        title="Responder mensagem"
+                        aria-label="Responder mensagem"
+                        className="opacity-70 sm:opacity-0 sm:group-hover:opacity-100 focus:opacity-100 w-8 h-8 rounded-full bg-white/85 hover:bg-white text-[#54656F] hover:text-[#075E54] shadow-xs flex items-center justify-center transition-all shrink-0"
+                      >
+                        <Reply className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
+
+                  {/* Interactive Structured Welcome Menu right below initial greeting */}
+                  {isWelcomeBubble && (
+                    <div className="flex justify-start pl-2">
+                      <div className="w-full max-w-[88%] sm:max-w-[76%] lg:max-w-[460px] bg-white rounded-xl shadow-[0_1px_2px_rgba(11,20,26,0.14)] overflow-hidden border border-black/[0.05]">
+                        <div className="px-3.5 py-2.5 bg-[#F0F2F5] border-b border-[#E9EDEF] flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#075E54]">
+                            Menu Rápido de Atendimento
+                          </span>
+                          <span className="text-[11px] text-[#667781]">
+                            Toque ou pergunte livremente
+                          </span>
+                        </div>
+                        <div className="divide-y divide-[#E9EDEF]">
+                          {interactiveWelcomeOptions.map((opt) => (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              disabled={isSending}
+                              onClick={() => sendQuickPrompt(opt.prompt)}
+                              className="w-full text-left px-3.5 py-2.5 hover:bg-[#F5F6F6] active:bg-[#E7FCEB] transition-colors flex items-center justify-between gap-3 disabled:opacity-50"
+                            >
+                              <div className="min-w-0">
+                                <p className="text-[13.5px] font-semibold text-[#111B21] leading-snug">
+                                  {opt.title}
+                                </p>
+                                <p className="text-[11.5px] text-[#667781] leading-snug mt-0.5">
+                                  {opt.subtitle}
+                                </p>
+                              </div>
+                              <ChevronRight className="w-4 h-4 text-[#00A884] shrink-0" />
+                            </button>
+                          ))}
+                        </div>
+                        <div className="px-3.5 py-2 bg-[#FAFAFA] border-t border-[#E9EDEF] text-[11px] text-[#54656F] leading-snug">
+                          Atendimento livre: digite qualquer dúvida, clique no{' '}
+                          <strong className="text-[#111B21]">microfone</strong>{' '}
+                          para mandar áudio ou no{' '}
+                          <strong className="text-[#111B21]">clipe</strong> para
+                          enviar fotos/PDF.
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -490,30 +1027,42 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     <path d="M1.533 3.568L8 12.193V1H2.812C1.042 1 .474 2.156 1.533 3.568z" />
                   </svg>
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-[#00A884]" />
-                  <span>Digitando resposta...</span>
+                  <span>Analisando e digitando resposta...</span>
                 </div>
               </div>
             )}
 
-            {errorMsg && (
+            {(errorMsg || mediaError) && (
               <div className="flex justify-center">
                 <div className="max-w-md p-3 rounded-lg bg-white border border-red-200 shadow-xs flex items-start gap-2.5 text-xs text-red-700">
                   <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                  <div className="space-y-1.5">
-                    <p>{errorMsg}</p>
-                    <a
-                      href={formatWhatsAppLink(
-                        effectiveSettings.whatsapp,
-                        `Olá! Gostaria de falar com um consultor da ${effectiveSettings.tradeName}.`
-                      )}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1.5 text-[#008069] hover:underline font-semibold"
-                    >
-                      <MessageCircle className="w-3.5 h-3.5" />
-                      <span>Continuar no WhatsApp da loja</span>
-                    </a>
+                  <div className="space-y-1.5 flex-1">
+                    <p>{mediaError || errorMsg}</p>
+                    {errorMsg && (
+                      <a
+                        href={formatWhatsAppLink(
+                          effectiveSettings.whatsapp,
+                          `Olá! Gostaria de falar com um consultor da ${effectiveSettings.tradeName}.`
+                        )}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 text-[#008069] hover:underline font-semibold"
+                      >
+                        <MessageCircle className="w-3.5 h-3.5" />
+                        <span>Continuar no WhatsApp da loja</span>
+                      </a>
+                    )}
                   </div>
+                  {mediaError && (
+                    <button
+                      type="button"
+                      onClick={() => setMediaError(null)}
+                      aria-label="Fechar aviso"
+                      className="text-red-500 hover:text-red-700"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -521,57 +1070,246 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             <div ref={messagesEndRef} />
           </div>
 
-          {/* Bottom Composer Dock (#F0F2F5) with Quick Suggestion Chips + Rounded Input + Circular Green Send */}
-          <div className="shrink-0 bg-[#F0F2F5] border-t border-[#D1D7DB]/70 pb-[env(safe-area-inset-bottom)]">
-            {/* Horizontal Scrollable Quick Chips */}
-            <div className="px-3 sm:px-4 pt-2 pb-1 flex items-center gap-2 overflow-x-auto">
-              {quickChips.map((chip) => (
-                <button
-                  key={chip.label}
-                  type="button"
-                  disabled={isSending}
-                  onClick={() => sendQuickPrompt(chip.prompt)}
-                  className="min-h-[36px] px-3.5 py-1.5 rounded-full text-xs font-medium text-[#111B21] bg-white hover:bg-[#E7FCEB] hover:text-[#075E54] border border-[#D1D7DB] shadow-[0_1px_1px_rgba(11,20,26,0.06)] transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
-                >
-                  {chip.label}
-                </button>
-              ))}
-              {!leadSaved && (
-                <button
-                  type="button"
-                  onClick={() => setLeadPanelOpen(true)}
-                  className="min-h-[36px] px-3.5 py-1.5 rounded-full text-xs font-semibold text-[#075E54] bg-[#D9FDD3] hover:bg-[#C7F5C0] border border-[#00A884]/30 transition-colors whitespace-nowrap shrink-0"
-                >
-                  Deixar meu WhatsApp
-                </button>
-              )}
-            </div>
+          {/* Bottom Composer Dock (#F0F2F5) */}
+          <div className="shrink-0 bg-[#F0F2F5] border-t border-[#D1D7DB]/70 pb-[env(safe-area-inset-bottom)] relative">
+            {/* Compact Reply Preview Strip (WhatsApp Style) */}
+            {replyingTo && (
+              <div className="px-3 sm:px-4 pt-2">
+                <div className="bg-white rounded-lg border-l-4 border-[#00A884] px-3 py-2 flex items-center justify-between gap-2 shadow-[0_1px_1px_rgba(11,20,26,0.08)]">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-semibold text-[#008069] leading-tight">
+                      Respondendo a{' '}
+                      {replyingTo.sender === 'ia'
+                        ? effectiveSettings.tradeName
+                        : 'Você'}
+                    </p>
+                    <p className="text-xs text-[#54656F] truncate mt-0.5">
+                      {replyingTo.preview}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={clearReply}
+                    aria-label="Cancelar resposta citada"
+                    className="w-7 h-7 rounded-full hover:bg-black/5 text-[#54656F] flex items-center justify-center shrink-0"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
 
-            {/* WhatsApp Rounded White Input + Circular #00A884 Send Button */}
-            <form
-              onSubmit={handleSend}
-              className="px-3 sm:px-4 py-2.5 flex items-center gap-2.5"
-            >
-              <input
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder="Mensagem"
-                className="flex-1 min-h-[44px] px-4 py-2 bg-white border border-transparent focus:border-[#00A884]/50 rounded-full text-[15px] text-[#111B21] placeholder:text-[#667781] shadow-[0_1px_1px_rgba(11,20,26,0.08)] focus:outline-none"
-              />
-              <button
-                type="submit"
-                disabled={isSending || !input.trim()}
-                aria-label="Enviar mensagem"
-                className="w-[44px] h-[44px] rounded-full bg-[#00A884] hover:bg-[#008F72] disabled:bg-[#8696A0] text-white shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
+            {/* Pending Attachment Preview Strip */}
+            {pendingAttachment && (
+              <div className="px-3 sm:px-4 pt-2">
+                <div className="bg-white rounded-lg border border-[#D1D7DB] px-3 py-2 flex items-center justify-between gap-3 shadow-[0_1px_1px_rgba(11,20,26,0.08)]">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    {pendingAttachment.mimeType.startsWith('image/') ? (
+                      <img
+                        src={pendingAttachment.url}
+                        alt={pendingAttachment.name}
+                        className="w-11 h-11 rounded-md object-cover border border-black/10 shrink-0"
+                      />
+                    ) : (
+                      <div className="w-11 h-11 rounded-md bg-[#E53935]/10 text-[#E53935] flex items-center justify-center shrink-0">
+                        <FileText className="w-5 h-5" />
+                      </div>
+                    )}
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-[#111B21] truncate">
+                        {pendingAttachment.name}
+                      </p>
+                      <p className="text-[11px] text-[#54656F]">
+                        {pendingAttachment.mimeType === 'application/pdf'
+                          ? 'Documento PDF pronto para análise'
+                          : 'Foto otimizada pronta para envio'}
+                        {pendingAttachment.sizeBytes
+                          ? ` · ${formatBytesCompact(pendingAttachment.sizeBytes)}`
+                          : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPendingAttachment(null)}
+                    aria-label="Remover anexo"
+                    className="w-7 h-7 rounded-full hover:bg-black/5 text-[#54656F] flex items-center justify-center shrink-0"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Horizontal Scrollable Quick Chips (hidden during active recording) */}
+            {!isRecording && (
+              <div className="px-3 sm:px-4 pt-2 pb-1 flex items-center gap-2 overflow-x-auto">
+                {quickChips.map((chip) => (
+                  <button
+                    key={chip.label}
+                    type="button"
+                    disabled={isSending}
+                    onClick={() => sendQuickPrompt(chip.prompt)}
+                    className="min-h-[34px] px-3 py-1 rounded-full text-xs font-medium text-[#111B21] bg-white hover:bg-[#E7FCEB] hover:text-[#075E54] border border-[#D1D7DB] shadow-[0_1px_1px_rgba(11,20,26,0.06)] transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    {chip.label}
+                  </button>
+                ))}
+                {!leadSaved && (
+                  <button
+                    type="button"
+                    onClick={() => setLeadPanelOpen(true)}
+                    className="min-h-[34px] px-3 py-1 rounded-full text-xs font-semibold text-[#075E54] bg-[#D9FDD3] hover:bg-[#C7F5C0] border border-[#00A884]/30 transition-colors whitespace-nowrap shrink-0"
+                  >
+                    Deixar meu WhatsApp
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Attachment Popover Menu */}
+            {attachMenuOpen && !isRecording && (
+              <div className="absolute bottom-[68px] left-3 sm:left-4 z-30 bg-white rounded-2xl shadow-xl border border-[#D1D7DB] p-2 w-60 space-y-1">
+                <button
+                  type="button"
+                  onClick={() => imageInputRef.current?.click()}
+                  className="w-full px-3 py-2.5 rounded-xl hover:bg-[#F0F2F5] flex items-center gap-3 text-left transition-colors"
+                >
+                  <span className="w-9 h-9 rounded-full bg-[#007BFC]/12 text-[#007BFC] flex items-center justify-center shrink-0">
+                    <Camera className="w-4 h-4" />
+                  </span>
+                  <div>
+                    <p className="text-xs font-semibold text-[#111B21]">
+                      Foto / Imagem
+                    </p>
+                    <p className="text-[11px] text-[#667781]">
+                      JPG, PNG ou WEBP (ex.: carro na troca)
+                    </p>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => pdfInputRef.current?.click()}
+                  className="w-full px-3 py-2.5 rounded-xl hover:bg-[#F0F2F5] flex items-center gap-3 text-left transition-colors"
+                >
+                  <span className="w-9 h-9 rounded-full bg-[#7F66FF]/12 text-[#5E4AE3] flex items-center justify-center shrink-0">
+                    <FileText className="w-4 h-4" />
+                  </span>
+                  <div>
+                    <p className="text-xs font-semibold text-[#111B21]">
+                      Documento PDF
+                    </p>
+                    <p className="text-[11px] text-[#667781]">
+                      CRLV, ficha técnica ou proposta (até 2,4 MB)
+                    </p>
+                  </div>
+                </button>
+              </div>
+            )}
+
+            {/* Composer Bar: Recording State vs Normal Input State */}
+            {isRecording ? (
+              <div className="px-3 sm:px-4 py-2.5 flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={cancelAudioRecording}
+                  aria-label="Cancelar gravação de áudio"
+                  title="Descartar áudio"
+                  className="w-[44px] h-[44px] rounded-full bg-white hover:bg-red-50 text-red-600 border border-red-200 shadow-xs transition-colors shrink-0 inline-flex items-center justify-center"
+                >
+                  <Trash2 className="w-5 h-5" />
+                </button>
+
+                <div className="flex-1 min-h-[44px] px-4 py-2 bg-white rounded-full shadow-[0_1px_1px_rgba(11,20,26,0.08)] flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="w-2.5 h-2.5 rounded-full bg-red-600 animate-pulse shrink-0" />
+                    <span className="font-mono text-sm font-semibold tabular-nums text-[#111B21]">
+                      {formatDurationSeconds(recordingSec)}
+                    </span>
+                    <span className="text-xs text-[#54656F] truncate">
+                      Gravando áudio... fale sua dúvida
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-mono text-[#8696A0] shrink-0">
+                    máx {formatDurationSeconds(MAX_AUDIO_DURATION_SEC)}
+                  </span>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={finishAndSendAudioRecording}
+                  aria-label="Enviar áudio gravado"
+                  title="Enviar áudio"
+                  className="w-[44px] h-[44px] rounded-full bg-[#00A884] hover:bg-[#008F72] text-white shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
+                >
+                  <Send className="w-4 h-4 translate-x-[1px]" />
+                </button>
+              </div>
+            ) : (
+              <form
+                onSubmit={handleFormSubmit}
+                className="px-3 sm:px-4 py-2.5 flex items-center gap-2"
               >
-                <Send className="w-4 h-4 translate-x-[1px]" />
-              </button>
-            </form>
+                {/* Attachment Clip Button */}
+                <button
+                  type="button"
+                  disabled={isSending || isProcessingFile}
+                  onClick={() => setAttachMenuOpen((prev) => !prev)}
+                  aria-label="Anexar foto ou documento PDF"
+                  title="Anexar foto ou PDF"
+                  className={`w-[42px] h-[42px] rounded-full transition-colors shrink-0 inline-flex items-center justify-center ${
+                    attachMenuOpen || pendingAttachment
+                      ? 'bg-[#00A884]/15 text-[#075E54]'
+                      : 'text-[#54656F] hover:bg-black/[0.06]'
+                  } disabled:opacity-50`}
+                >
+                  {isProcessingFile ? (
+                    <Loader2 className="w-5 h-5 animate-spin text-[#00A884]" />
+                  ) : (
+                    <Paperclip className="w-5 h-5" />
+                  )}
+                </button>
+
+                <input
+                  ref={textInputRef}
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder={
+                    pendingAttachment
+                      ? 'Adicione uma legenda opcional ou envie...'
+                      : 'Mensagem'
+                  }
+                  className="flex-1 min-h-[44px] px-4 py-2 bg-white border border-transparent focus:border-[#00A884]/50 rounded-full text-[15px] text-[#111B21] placeholder:text-[#667781] shadow-[0_1px_1px_rgba(11,20,26,0.08)] focus:outline-none"
+                />
+
+                {canSendTextOrAttachment ? (
+                  <button
+                    type="submit"
+                    disabled={isSending || isProcessingFile}
+                    aria-label="Enviar mensagem"
+                    className="w-[44px] h-[44px] rounded-full bg-[#00A884] hover:bg-[#008F72] disabled:bg-[#8696A0] text-white shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
+                  >
+                    <Send className="w-4 h-4 translate-x-[1px]" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={isSending || isProcessingFile}
+                    onClick={() => void startAudioRecording()}
+                    aria-label="Gravar mensagem de áudio"
+                    title="Gravar áudio"
+                    className="w-[44px] h-[44px] rounded-full bg-[#00A884] hover:bg-[#008F72] disabled:bg-[#8696A0] text-white shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
+                  >
+                    <Mic className="w-5 h-5" />
+                  </button>
+                )}
+              </form>
+            )}
           </div>
         </div>
 
-        {/* Desktop Collapsible Side Panel for LGPD Lead Capture (keeps WhatsApp Web aesthetic intact) */}
+        {/* Desktop Collapsible Side Panel for LGPD Lead Capture */}
         {leadPanelOpen && (
           <aside className="hidden lg:flex w-[340px] shrink-0 h-full bg-[#F8F9FA] border-l border-[#D1D7DB] flex-col">
             <div className="h-[60px] shrink-0 px-4 bg-[#075E54] text-white flex items-center justify-between gap-2 border-l border-white/10">
@@ -615,6 +1353,49 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </button>
             </div>
             {renderLeadFormBody()}
+          </div>
+        </div>
+      )}
+
+      {/* Fullscreen Image Lightbox */}
+      {lightboxImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 flex flex-col items-center justify-center p-4"
+          onClick={() => setLightboxImage(null)}
+        >
+          <div
+            className="max-w-3xl w-full flex flex-col items-center gap-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="w-full flex items-center justify-between text-white px-1">
+              <span className="text-xs font-medium truncate inline-flex items-center gap-2">
+                <ImageIcon className="w-4 h-4 text-[#25D366]" />
+                {lightboxImage.name}
+              </span>
+              <div className="flex items-center gap-2">
+                <a
+                  href={lightboxImage.url}
+                  download={lightboxImage.name}
+                  className="px-3 py-1.5 rounded-full bg-white/15 hover:bg-white/25 text-xs font-medium inline-flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Baixar</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setLightboxImage(null)}
+                  aria-label="Fechar imagem"
+                  className="w-8 h-8 rounded-full bg-white/15 hover:bg-white/25 flex items-center justify-center"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <img
+              src={lightboxImage.url}
+              alt={lightboxImage.name}
+              className="max-h-[80dvh] max-w-full rounded-lg object-contain shadow-2xl"
+            />
           </div>
         </div>
       )}
