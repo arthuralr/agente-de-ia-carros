@@ -9,6 +9,12 @@ import {
   Vehicle,
 } from '../types';
 import { formatBRL, formatKm } from '../utils/formatters';
+import {
+  clearLocalChatState,
+  loadLocalChatStateAsync,
+  loadLocalChatStateSync,
+  saveLocalChatState,
+} from '../utils/chatLocalStorage';
 
 interface UseVirtualConsultantParams {
   active: boolean;
@@ -18,6 +24,7 @@ interface UseVirtualConsultantParams {
   originLabel?: string;
   leadSourceLabel?: Lead['source'];
   leadNote?: string;
+  persistStorageKey?: string;
   onCaptureLead: (lead: Lead) => Promise<Lead>;
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
 }
@@ -32,6 +39,21 @@ export interface SendRichMessagePayload {
 function createChatSessionId(): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `sess-${Date.now().toString(36)}-${rand}`;
+}
+
+function createWelcomeMessage(tradeName: string): ChatMessage {
+  const now = new Date().toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  return {
+    id: `msg-ia-welcome-${Date.now()}`,
+    sender: 'ia',
+    text: `Olá! Sou o **Consultor Oficial** da **${tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
+
+Como posso ajudar você hoje? Escolha uma opção rápida abaixo ou **envie sua pergunta por texto, áudio ou foto** a qualquer momento:`,
+    timestamp: now,
+  };
 }
 
 /**
@@ -64,6 +86,7 @@ export function useVirtualConsultant({
   originLabel = 'Vitrine',
   leadSourceLabel = 'Chat IA do Site',
   leadNote = 'Lead capturado pelo Consultor Virtual de IA.',
+  persistStorageKey,
   onCaptureLead,
   onSyncLeadChat,
 }: UseVirtualConsultantParams) {
@@ -87,6 +110,9 @@ export function useVirtualConsultant({
   const persistedLeadIdRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const sessionIdRef = useRef<string>(createChatSessionId());
+  const storageReadyRef = useRef<boolean>(false);
+  const storageVersionRef = useRef<number>(0);
+  const userMutatedRef = useRef<boolean>(false);
 
   useEffect(() => {
     persistedLeadIdRef.current = persistedLeadId;
@@ -371,31 +397,39 @@ export function useVirtualConsultant({
     [onSyncLeadChat, originLabel, settings, vehicles]
   );
 
-  // Initialize greeting or auto-inquiry when opened
+  // Initialize greeting, restore local history (when persistStorageKey is set), or auto-inquiry
   useEffect(() => {
     if (!active) return;
 
-    const triggerKey = targetVehicle ? targetVehicle.id : 'general';
+    const triggerKey = targetVehicle
+      ? targetVehicle.id
+      : persistStorageKey
+        ? `general:${persistStorageKey}`
+        : 'general';
     if (lastTriggerRef.current === triggerKey && messages.length > 0) {
       return;
     }
 
     lastTriggerRef.current = triggerKey;
-    sessionIdRef.current = createChatSessionId();
-    setLeadSaved(false);
-    setLeadSaveError(null);
-    setLgpdConsent(false);
-    setPersistedLeadId(null);
-    setReplyingTo(null);
-    persistedLeadIdRef.current = null;
-    setErrorMsg(null);
-
-    const now = new Date().toLocaleTimeString('pt-BR', {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
+    storageReadyRef.current = false;
+    userMutatedRef.current = false;
+    storageVersionRef.current += 1;
+    const hydrationVersion = storageVersionRef.current;
 
     if (targetVehicle) {
+      sessionIdRef.current = createChatSessionId();
+      setLeadSaved(false);
+      setLeadSaveError(null);
+      setLgpdConsent(false);
+      setPersistedLeadId(null);
+      setReplyingTo(null);
+      persistedLeadIdRef.current = null;
+      setErrorMsg(null);
+
+      const now = new Date().toLocaleTimeString('pt-BR', {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
       const autoUserMsg: ChatMessage = {
         id: `msg-cli-${Date.now()}`,
         sender: 'cliente',
@@ -406,19 +440,141 @@ export function useVirtualConsultant({
       void sendMessageToAi([autoUserMsg], targetVehicle, {
         userMessageId: autoUserMsg.id,
       });
-    } else {
-      setMessages([
-        {
-          id: `msg-ia-welcome-${Date.now()}`,
-          sender: 'ia',
-          text: `Olá! Sou o **Consultor Oficial** da **${settings.tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
-
-Como posso ajudar você hoje? Escolha uma opção rápida abaixo ou **envie sua pergunta por texto, áudio ou foto** a qualquer momento:`,
-          timestamp: now,
-        },
-      ]);
+      return;
     }
-  }, [active, messages.length, sendMessageToAi, settings.tradeName, targetVehicle]);
+
+    if (persistStorageKey) {
+      const savedSync = loadLocalChatStateSync(persistStorageKey);
+      if (savedSync && savedSync.messages.length > 0) {
+        sessionIdRef.current = savedSync.sessionId;
+        setMessages(savedSync.messages);
+        setLeadSaved(Boolean(savedSync.leadSaved));
+        setPersistedLeadId(savedSync.persistedLeadId ?? null);
+        persistedLeadIdRef.current = savedSync.persistedLeadId ?? null;
+        setCustomerName(savedSync.customerName || '');
+        setCustomerWhatsapp(savedSync.customerWhatsapp || '');
+        setLeadSaveError(null);
+        setReplyingTo(null);
+        setErrorMsg(null);
+        storageReadyRef.current = true;
+      } else {
+        sessionIdRef.current = createChatSessionId();
+        setLeadSaved(false);
+        setLeadSaveError(null);
+        setLgpdConsent(false);
+        setPersistedLeadId(null);
+        setReplyingTo(null);
+        persistedLeadIdRef.current = null;
+        setErrorMsg(null);
+        setMessages([createWelcomeMessage(settings.tradeName)]);
+        storageReadyRef.current = true;
+      }
+
+      // Async hydration from IndexedDB restores full audio/image/PDF payloads if available
+      void loadLocalChatStateAsync(persistStorageKey).then((savedAsync) => {
+        if (
+          !savedAsync ||
+          savedAsync.messages.length === 0 ||
+          storageVersionRef.current !== hydrationVersion ||
+          userMutatedRef.current
+        ) {
+          return;
+        }
+        if (savedSync) {
+          if (
+            savedAsync.sessionId === savedSync.sessionId &&
+            savedAsync.messages.length >= savedSync.messages.length
+          ) {
+            setMessages(savedAsync.messages);
+          }
+        } else {
+          sessionIdRef.current = savedAsync.sessionId;
+          setMessages(savedAsync.messages);
+          setLeadSaved(Boolean(savedAsync.leadSaved));
+          setPersistedLeadId(savedAsync.persistedLeadId ?? null);
+          persistedLeadIdRef.current = savedAsync.persistedLeadId ?? null;
+          setCustomerName(savedAsync.customerName || '');
+          setCustomerWhatsapp(savedAsync.customerWhatsapp || '');
+        }
+      });
+      return;
+    }
+
+    sessionIdRef.current = createChatSessionId();
+    setLeadSaved(false);
+    setLeadSaveError(null);
+    setLgpdConsent(false);
+    setPersistedLeadId(null);
+    setReplyingTo(null);
+    persistedLeadIdRef.current = null;
+    setErrorMsg(null);
+    setMessages([createWelcomeMessage(settings.tradeName)]);
+  }, [
+    active,
+    messages.length,
+    persistStorageKey,
+    sendMessageToAi,
+    settings.tradeName,
+    targetVehicle,
+  ]);
+
+  // Persist conversation automatically to localStorage + IndexedDB when enabled
+  useEffect(() => {
+    if (
+      !persistStorageKey ||
+      targetVehicle ||
+      !storageReadyRef.current ||
+      messages.length === 0 ||
+      isSending
+    ) {
+      return;
+    }
+    saveLocalChatState(persistStorageKey, {
+      version: 1,
+      sessionId: sessionIdRef.current,
+      messages,
+      leadSaved,
+      persistedLeadId,
+      customerName,
+      customerWhatsapp,
+      updatedAt: Date.now(),
+    });
+  }, [
+    customerName,
+    customerWhatsapp,
+    isSending,
+    leadSaved,
+    messages,
+    persistStorageKey,
+    persistedLeadId,
+    targetVehicle,
+  ]);
+
+  const resetConversation = useCallback(() => {
+    abortControllerRef.current?.abort();
+    storageVersionRef.current += 1;
+    userMutatedRef.current = true;
+
+    if (persistStorageKey) {
+      clearLocalChatState(persistStorageKey);
+    }
+
+    sessionIdRef.current = createChatSessionId();
+    setIsSending(false);
+    setHasStreamFirstToken(false);
+    setInput('');
+    setReplyingTo(null);
+    setErrorMsg(null);
+    setLeadSaved(false);
+    setLeadSaveError(null);
+    setLgpdConsent(false);
+    setPersistedLeadId(null);
+    persistedLeadIdRef.current = null;
+    setCustomerName('');
+    setCustomerWhatsapp('');
+    setMessages([createWelcomeMessage(settings.tradeName)]);
+    storageReadyRef.current = true;
+  }, [persistStorageKey, settings.tradeName]);
 
   const sendRichMessage = useCallback(
     (payload: SendRichMessagePayload) => {
@@ -446,9 +602,23 @@ Como posso ajudar você hoje? Escolha uma opção rápida abaixo ou **envie sua 
       };
 
       const nextMessages = [...messages, userMsg];
+      userMutatedRef.current = true;
       setMessages(nextMessages);
       setInput('');
       setReplyingTo(null);
+
+      if (persistStorageKey && !targetVehicle) {
+        saveLocalChatState(persistStorageKey, {
+          version: 1,
+          sessionId: sessionIdRef.current,
+          messages: nextMessages,
+          leadSaved,
+          persistedLeadId: persistedLeadIdRef.current,
+          customerName,
+          customerWhatsapp,
+          updatedAt: Date.now(),
+        });
+      }
 
       if (persistedLeadIdRef.current && onSyncLeadChat) {
         void onSyncLeadChat(
@@ -465,9 +635,13 @@ Como posso ajudar você hoje? Escolha uma opção rápida abaixo ou **envie sua 
       });
     },
     [
+      customerName,
+      customerWhatsapp,
       isSending,
+      leadSaved,
       messages,
       onSyncLeadChat,
+      persistStorageKey,
       replyingTo,
       sendMessageToAi,
       targetVehicle,
@@ -583,5 +757,6 @@ Como posso ajudar você hoje? Escolha uma opção rápida abaixo ou **envie sua 
     sendQuickPrompt,
     handleSend,
     handleSaveContactToCrm,
+    resetConversation,
   };
 }

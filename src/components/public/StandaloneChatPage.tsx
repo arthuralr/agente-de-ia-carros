@@ -16,9 +16,11 @@ import {
   MapPin,
   MessageCircle,
   Mic,
+  MoreVertical,
   Paperclip,
   RefreshCw,
   Reply,
+  RotateCcw,
   Send,
   ShieldCheck,
   Trash2,
@@ -80,8 +82,23 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     };
   }, [settings]);
 
+  const persistStorageKey = useMemo(() => {
+    if (typeof window === 'undefined') return 'armazem_chat_v1_default';
+    const partnerStore = new URLSearchParams(window.location.search)
+      .get('loja')
+      ?.trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
+    return partnerStore
+      ? `armazem_chat_v1_loja_${partnerStore}`
+      : 'armazem_chat_v1_default';
+  }, []);
+
   const [leadPanelOpen, setLeadPanelOpen] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
 
   // Attachment state
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
@@ -138,6 +155,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     sendRichMessage,
     sendQuickPrompt,
     handleSaveContactToCrm,
+    resetConversation,
   } = useVirtualConsultant({
     active: true,
     targetVehicle: null,
@@ -146,6 +164,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     originLabel: '/chat',
     leadSourceLabel: 'Chat IA do Site',
     leadNote: 'Lead capturado pela página dedicada (/chat) estilo WhatsApp.',
+    persistStorageKey,
     onCaptureLead,
     onSyncLeadChat,
   });
@@ -173,6 +192,19 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     } catch {
       // Clipboard fallback ignored
     }
+  };
+
+  const handleConfirmClearConversation = () => {
+    if (isRecording) {
+      cancelAudioRecording();
+    }
+    setPendingAttachment(null);
+    setAttachMenuOpen(false);
+    setMediaError(null);
+    setLightboxImage(null);
+    setHeaderMenuOpen(false);
+    setConfirmClearOpen(false);
+    resetConversation();
   };
 
   const buildReplyPreviewForMessage = (msg: ChatMessage): string => {
@@ -795,6 +827,35 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                   </>
                 )}
               </button>
+
+              {/* Discreet WhatsApp-style Overflow Menu (Limpar / Nova conversa) */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setHeaderMenuOpen((prev) => !prev)}
+                  aria-label="Opções da conversa"
+                  title="Opções da conversa"
+                  className="w-9 h-9 rounded-full text-white/90 hover:text-white hover:bg-white/10 transition-colors inline-flex items-center justify-center"
+                >
+                  <MoreVertical className="w-4 h-4" />
+                </button>
+
+                {headerMenuOpen && (
+                  <div className="absolute right-0 top-[46px] z-40 w-52 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMenuOpen(false);
+                        setConfirmClearOpen(true);
+                      }}
+                      className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5 text-[#54656F] shrink-0" />
+                      <span>Nova conversa / Limpar</span>
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </header>
 
@@ -816,6 +877,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             className="flex-1 overflow-y-auto wa-chat-wallpaper px-3 sm:px-6 lg:px-10 py-4 space-y-2.5"
             onClick={() => {
               if (attachMenuOpen) setAttachMenuOpen(false);
+              if (headerMenuOpen) setHeaderMenuOpen(false);
             }}
           >
             {/* Classic Date Divider */}
@@ -946,49 +1008,86 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                       {/* Image Attachment Thumbnail */}
                       {isImageAttachment && msg.attachment && (
                         <div className="mb-2">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setLightboxImage({
-                                url: msg.attachment!.url,
-                                name: msg.attachment!.name,
-                              })
-                            }
-                            className="block rounded-md overflow-hidden border border-black/10 hover:opacity-95 transition-opacity max-w-[260px]"
-                          >
-                            <img
-                              src={msg.attachment.url}
-                              alt={msg.attachment.name}
-                              className="w-full max-h-[240px] object-cover block"
-                            />
-                          </button>
+                          {msg.attachment.url ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setLightboxImage({
+                                  url: msg.attachment!.url,
+                                  name: msg.attachment!.name,
+                                })
+                              }
+                              className="block rounded-md overflow-hidden border border-black/10 hover:opacity-95 transition-opacity max-w-[260px]"
+                            >
+                              <img
+                                src={msg.attachment.url}
+                                alt={msg.attachment.name}
+                                className="w-full max-h-[240px] object-cover block"
+                              />
+                            </button>
+                          ) : (
+                            <div className="flex items-center gap-2.5 p-2.5 rounded-md bg-black/[0.05] border border-black/10 max-w-[290px]">
+                              <div className="w-9 h-9 rounded-md bg-[#00A884]/15 text-[#075E54] flex items-center justify-center shrink-0">
+                                <ImageIcon className="w-5 h-5" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs font-semibold text-[#111B21] truncate">
+                                  {msg.attachment.name}
+                                </p>
+                                <p className="text-[11px] text-[#54656F]">
+                                  Foto enviada nesta conversa
+                                  {msg.attachment.sizeBytes
+                                    ? ` · ${formatBytesCompact(msg.attachment.sizeBytes)}`
+                                    : ''}
+                                </p>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
 
                       {/* PDF Attachment Card */}
-                      {isPdfAttachment && msg.attachment && (
-                        <a
-                          href={msg.attachment.url}
-                          download={msg.attachment.name}
-                          className="mb-2 flex items-center gap-2.5 p-2.5 rounded-md bg-black/[0.05] hover:bg-black/[0.08] border border-black/10 transition-colors max-w-[290px]"
-                        >
-                          <div className="w-9 h-9 rounded-md bg-[#E53935] text-white flex items-center justify-center shrink-0">
-                            <FileText className="w-5 h-5" />
+                      {isPdfAttachment && msg.attachment &&
+                        (msg.attachment.url ? (
+                          <a
+                            href={msg.attachment.url}
+                            download={msg.attachment.name}
+                            className="mb-2 flex items-center gap-2.5 p-2.5 rounded-md bg-black/[0.05] hover:bg-black/[0.08] border border-black/10 transition-colors max-w-[290px]"
+                          >
+                            <div className="w-9 h-9 rounded-md bg-[#E53935] text-white flex items-center justify-center shrink-0">
+                              <FileText className="w-5 h-5" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs font-semibold text-[#111B21] truncate">
+                                {msg.attachment.name}
+                              </p>
+                              <p className="text-[11px] text-[#54656F]">
+                                PDF
+                                {msg.attachment.sizeBytes
+                                  ? ` · ${formatBytesCompact(msg.attachment.sizeBytes)}`
+                                  : ''}
+                              </p>
+                            </div>
+                            <Download className="w-4 h-4 text-[#54656F] shrink-0" />
+                          </a>
+                        ) : (
+                          <div className="mb-2 flex items-center gap-2.5 p-2.5 rounded-md bg-black/[0.05] border border-black/10 max-w-[290px]">
+                            <div className="w-9 h-9 rounded-md bg-[#E53935] text-white flex items-center justify-center shrink-0">
+                              <FileText className="w-5 h-5" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs font-semibold text-[#111B21] truncate">
+                                {msg.attachment.name}
+                              </p>
+                              <p className="text-[11px] text-[#54656F]">
+                                PDF enviado nesta conversa
+                                {msg.attachment.sizeBytes
+                                  ? ` · ${formatBytesCompact(msg.attachment.sizeBytes)}`
+                                  : ''}
+                              </p>
+                            </div>
                           </div>
-                          <div className="min-w-0 flex-1">
-                            <p className="text-xs font-semibold text-[#111B21] truncate">
-                              {msg.attachment.name}
-                            </p>
-                            <p className="text-[11px] text-[#54656F]">
-                              PDF
-                              {msg.attachment.sizeBytes
-                                ? ` · ${formatBytesCompact(msg.attachment.sizeBytes)}`
-                                : ''}
-                            </p>
-                          </div>
-                          <Download className="w-4 h-4 text-[#54656F] shrink-0" />
-                        </a>
-                      )}
+                        ))}
 
                       {/* Audio Voice Note Player + Live Transcription */}
                       {msg.audio && (
@@ -997,11 +1096,20 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                             <div className="w-8 h-8 rounded-full bg-[#00A884] text-white flex items-center justify-center shrink-0">
                               <Mic className="w-4 h-4" />
                             </div>
-                            <audio
-                              controls
-                              src={msg.audio.url}
-                              className="h-8 w-full max-w-[230px]"
-                            />
+                            {msg.audio.url ? (
+                              <audio
+                                controls
+                                src={msg.audio.url}
+                                className="h-8 w-full max-w-[230px]"
+                              />
+                            ) : (
+                              <span className="text-xs font-medium text-[#3B4A54]">
+                                Mensagem de áudio
+                                {msg.audio.durationSec
+                                  ? ` (${formatDurationSeconds(msg.audio.durationSec)})`
+                                  : ''}
+                              </span>
+                            )}
                           </div>
                           {msg.audio.transcription ? (
                             <p className="text-[12px] text-[#3B4A54] bg-black/[0.04] rounded px-2 py-1 leading-snug italic">
@@ -1491,6 +1599,44 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               alt={lightboxImage.name}
               className="max-h-[80dvh] max-w-full rounded-lg object-contain shadow-2xl"
             />
+          </div>
+        </div>
+      )}
+      {/* Confirm Clear Conversation Modal */}
+      {confirmClearOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/55 flex items-center justify-center p-4"
+          onClick={() => setConfirmClearOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm bg-white rounded-2xl shadow-2xl border border-[#D1D7DB] p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="space-y-1.5">
+              <h2 className="font-display text-base font-semibold text-[#111B21]">
+                Iniciar nova conversa?
+              </h2>
+              <p className="text-xs text-[#54656F] leading-relaxed">
+                O histórico salvo neste navegador será apagado e um novo
+                atendimento limpo será iniciado.
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setConfirmClearOpen(false)}
+                className="min-h-[40px] px-4 rounded-xl text-xs font-medium text-[#54656F] hover:bg-[#F0F2F5] transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmClearConversation}
+                className="min-h-[40px] px-4 rounded-xl text-xs font-semibold text-white bg-[#00A884] hover:bg-[#008F72] transition-colors"
+              >
+                Limpar conversa
+              </button>
+            </div>
           </div>
         </div>
       )}
