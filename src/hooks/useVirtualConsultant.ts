@@ -94,6 +94,8 @@ export function useVirtualConsultant({
   const [input, setInput] = useState('');
   const [replyingTo, setReplyingTo] = useState<ChatReplyContext | null>(null);
   const [isSending, setIsSending] = useState(false);
+  const [isProcessingAudio, setIsProcessingAudio] = useState(false);
+  const [activeAudioMessageId, setActiveAudioMessageId] = useState<string | null>(null);
   const [hasStreamFirstToken, setHasStreamFirstToken] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -147,7 +149,19 @@ export function useVirtualConsultant({
       const controller = new AbortController();
       abortControllerRef.current = controller;
 
+      const hasAudioPayload = Boolean(options?.audio);
+      let didTimeout = false;
+      const timeoutMs = hasAudioPayload ? 35_000 : 30_000;
+      const requestTimeoutId = window.setTimeout(() => {
+        didTimeout = true;
+        controller.abort();
+      }, timeoutMs);
+
       setIsSending(true);
+      setIsProcessingAudio(hasAudioPayload);
+      setActiveAudioMessageId(
+        hasAudioPayload && options?.userMessageId ? options.userMessageId : null
+      );
       setHasStreamFirstToken(false);
       setErrorMsg(null);
 
@@ -381,16 +395,29 @@ export function useVirtualConsultant({
           }
         }
       } catch (err: unknown) {
+        if (didTimeout) {
+          setErrorMsg(
+            hasAudioPayload
+              ? 'O processamento do áudio demorou mais que o esperado. Tente enviar um áudio mais curto ou escreva sua mensagem por texto.'
+              : 'O atendimento demorou mais que o esperado. Tente enviar sua mensagem novamente.'
+          );
+          return;
+        }
         if (err instanceof DOMException && err.name === 'AbortError') {
           return;
         }
         setErrorMsg(
           err instanceof Error
             ? err.message
-            : 'Não foi possível conectar ao assistente de IA.'
+            : hasAudioPayload
+              ? 'Não foi possível processar o áudio agora. Tente enviar novamente ou digite sua dúvida.'
+              : 'Não foi possível conectar ao assistente de IA.'
         );
       } finally {
+        window.clearTimeout(requestTimeoutId);
         setIsSending(false);
+        setIsProcessingAudio(false);
+        setActiveAudioMessageId(null);
         setHasStreamFirstToken(false);
       }
     },
@@ -561,6 +588,8 @@ export function useVirtualConsultant({
 
     sessionIdRef.current = createChatSessionId();
     setIsSending(false);
+    setIsProcessingAudio(false);
+    setActiveAudioMessageId(null);
     setHasStreamFirstToken(false);
     setInput('');
     setReplyingTo(null);
@@ -740,6 +769,8 @@ export function useVirtualConsultant({
     setReplyingTo,
     clearReply,
     isSending,
+    isProcessingAudio,
+    activeAudioMessageId,
     hasStreamFirstToken,
     errorMsg,
     setErrorMsg,

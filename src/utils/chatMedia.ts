@@ -2,8 +2,15 @@ import { ChatAttachment } from '../types';
 
 export const MAX_IMAGE_DATA_URL_BYTES = 1_200_000; // ~1.2MB base64 after compression
 export const MAX_PDF_RAW_BYTES = 2_400_000; // ~2.4MB raw (~3.2MB base64, safe under Vercel 4.5MB limit)
-export const MAX_AUDIO_RAW_BYTES = 1_800_000; // ~1.8MB raw (~2.4MB base64)
+export const MAX_AUDIO_RAW_BYTES = 1_200_000; // ~1.2MB raw (~1.6MB base64, fast serverless upload)
 export const MAX_AUDIO_DURATION_SEC = 90;
+export const AUDIO_RECORDING_BITRATE = 16_000; // 16 kbps Opus mono: crisp voice speech & compact payload
+export const AUDIO_CAPTURE_CONSTRAINTS: MediaTrackConstraints = {
+  channelCount: 1,
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
 
 export const ALLOWED_IMAGE_MIMES = new Set([
   'image/jpeg',

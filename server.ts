@@ -154,6 +154,65 @@ function parseDataUrlMedia(
   };
 }
 
+function normalizeGeminiAudioMime(mime: string): string {
+  const base = mime.split(';')[0].trim().toLowerCase();
+  if (base === 'audio/x-m4a' || base === 'audio/m4a') return 'audio/mp4';
+  if (base === 'audio/mp3') return 'audio/mpeg';
+  return base;
+}
+
+function withPromiseTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+function isAudioTranscriptionUnintelligible(raw: string | null): boolean {
+  if (!raw) return true;
+  const trimmed = raw.trim();
+  if (!trimmed) return true;
+  if (/\[?\s*audio[_\s-]?inaud[ií]vel\s*\]?/i.test(trimmed)) return true;
+
+  // Strip common non-speech tags like [silêncio], (ruído), [música], [inaudível]
+  const withoutTags = trimmed
+    .replace(
+      /[\[(]\s*(sil[eê]ncio|ru[ií]do|inaud[ií]vel|m[uú]sica|sem\s+[aá]udio|sem\s+fala|barulho|est[aá]tica|silence|noise|inaudible|unintelligible|music)[^\]\)]*[\])]/gi,
+      ' '
+    )
+    .trim();
+
+  const alnumOnly = withoutTags.replace(/[^a-zA-Z0-9À-ÿ]/g, '');
+  return alnumOnly.length < 2;
+}
+
+function isNonFallbackGeminiError(err: unknown): boolean {
+  const raw = err instanceof Error ? err.message : String(err);
+  return (
+    raw.includes('API_KEY_INVALID') ||
+    raw.includes('PERMISSION_DENIED') ||
+    raw.includes('401') ||
+    raw.includes('403')
+  );
+}
+
+let transcribeModelUnavailableUntil = 0;
+
 type OperationMode = 'full' | 'agent_only';
 
 function sanitizeSessionId(raw: unknown): string | null {
@@ -1710,6 +1769,9 @@ app.post('/api/ai/chat', async (req, res) => {
         'audio/mpeg',
         'audio/wav',
         'audio/mp3',
+        'audio/aac',
+        'audio/m4a',
+        'audio/x-m4a',
       ];
       if (!allowedAudio.includes(parsedAudio.mimeType)) {
         res.status(400).json({
@@ -1854,77 +1916,196 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
 
     const ai = getGeminiClient();
 
-    // Se o cliente enviou áudio, realiza a transcrição oficial via Gemini antes da resposta consultiva
+    // Inicia consulta ao estoque real no Neon em paralelo com a transcrição de áudio para máxima agilidade
+    const dbInventoryPromise: Promise<string> = (async () => {
+      try {
+        const stockRes = await pool.query<DbVehicleRow>(
+          `SELECT brand, model, version, year_fab, year_model, km, price, fipe_code, fipe_price, status, fuel, transmission, options
+           FROM vehicles
+           WHERE status IN ('Disponivel', 'Disponível', 'Reservado')
+           ORDER BY created_at DESC, id DESC`
+        );
+        if (stockRes.rows.length > 0) {
+          return stockRes.rows
+            .map((v) => {
+              const sellingPrice = Number(v.price);
+              const formattedPrice = new Intl.NumberFormat('pt-BR', {
+                style: 'currency',
+                currency: 'BRL',
+                maximumFractionDigits: 0,
+              }).format(sellingPrice);
+              const formattedKm = new Intl.NumberFormat('pt-BR').format(Number(v.km));
+              const opts =
+                Array.isArray(v.options) && v.options.length > 0
+                  ? v.options.join(', ')
+                  : 'Pacote de série';
+              const fipeNote = buildFipeComparisonSummary(
+                sellingPrice,
+                v.fipe_price ? Number(v.fipe_price) : null,
+                v.fipe_code
+              );
+              return `- ${v.brand} ${v.model} ${v.version || ''} | Ano: ${v.year_fab}/${v.year_model} | Km: ${formattedKm} km | Preço: ${formattedPrice}${fipeNote ? ` | ${fipeNote}` : ''} | Status: ${v.status} | Câmbio: ${v.transmission || 'N/I'} | Combustível: ${v.fuel || 'N/I'} | Opcionais: ${opts}`.trim();
+            })
+            .join('\n');
+        }
+        return '';
+      } catch {
+        return '';
+      }
+    })();
+
+    // Se o cliente enviou áudio, realiza transcrição calibrada via Gemini com detecção de áudio inaudível
     let audioTranscription: string | null = null;
     if (parsedAudio) {
       const audioInlinePart = {
         inlineData: {
-          mimeType: parsedAudio.mimeType,
+          mimeType: normalizeGeminiAudioMime(parsedAudio.mimeType),
           data: parsedAudio.base64,
         },
       };
       const transcribePrompt = {
-        text: 'Transcreva fielmente em Português do Brasil o que foi falado neste áudio de um cliente em atendimento de revenda automotiva. Retorne apenas a transcrição limpa, sem prefixos ou comentários.',
+        text: 'Transcreva fielmente em Português do Brasil o que o cliente falou neste áudio de atendimento em revenda de veículos. REGRAS ESTRITAS: Retorne APENAS o texto falado limpo, sem prefixos ou explicações. Se o áudio estiver mudo, apenas silêncio, inaudível, com ruído excessivo, cortado ou incompreensível a ponto de não ser possível entender com segurança o que foi falado, NÃO chute nem invente palavras ou letras isoladas — responda EXATAMENTE com: [AUDIO_INAUDIVEL]',
       };
 
-      try {
-        const transcribeRes = await callGeminiWithRetry(() =>
-          ai.models.generateContent({
-            model: 'gemini-3.5-transcribe',
-            contents: { parts: [audioInlinePart, transcribePrompt] },
-          })
+      const transcribeCandidates: Array<{
+        model: string;
+        timeoutMs: number;
+        config?: Record<string, unknown>;
+      }> = [];
+
+      if (Date.now() >= transcribeModelUnavailableUntil) {
+        transcribeCandidates.push({
+          model: 'gemini-3.5-transcribe',
+          timeoutMs: 10_000,
+        });
+      }
+      transcribeCandidates.push(
+        {
+          model: 'gemini-3.1-flash-lite',
+          timeoutMs: 10_000,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          },
+        },
+        {
+          model: 'gemini-2.5-flash',
+          timeoutMs: 12_000,
+        }
+      );
+
+      let lastTranscribeErr: unknown = null;
+      let transcribedSuccessfully = false;
+      for (const candidate of transcribeCandidates) {
+        try {
+          const resTranscribe = await withPromiseTimeout(
+            ai.models.generateContent({
+              model: candidate.model,
+              contents: { parts: [audioInlinePart, transcribePrompt] },
+              ...(candidate.config ? { config: candidate.config } : {}),
+            }),
+            candidate.timeoutMs,
+            `DEADLINE_EXCEEDED: Tempo limite na transcrição de áudio (${candidate.model}).`
+          );
+          audioTranscription = resTranscribe.text?.trim() || null;
+          transcribedSuccessfully = true;
+          break;
+        } catch (transcribeErr) {
+          lastTranscribeErr = transcribeErr;
+          if (isNonFallbackGeminiError(transcribeErr)) {
+            throw transcribeErr;
+          }
+          const errMsg =
+            transcribeErr instanceof Error
+              ? transcribeErr.message
+              : String(transcribeErr);
+          if (
+            candidate.model === 'gemini-3.5-transcribe' &&
+            (errMsg.includes('404') || errMsg.includes('not found'))
+          ) {
+            transcribeModelUnavailableUntil = Date.now() + 10 * 60 * 1000;
+          }
+          console.warn(
+            `[Audio Transcribe Fallback] ${candidate.model} failed:`,
+            errMsg.slice(0, 140)
+          );
+        }
+      }
+
+      if (!transcribedSuccessfully && lastTranscribeErr) {
+        throw lastTranscribeErr;
+      }
+
+      // Fallback seguro: áudio inaudível, mudo, cortado ou com ruído excessivo — pede reenvio sem inventar resposta
+      if (isAudioTranscriptionUnintelligible(audioTranscription)) {
+        const auditSessionId = sanitizeSessionId(body.sessionId);
+        const auditOrigin = sanitizeOrigin(body.origem);
+        const safeReplyToId =
+          typeof body.replyTo?.id === 'string'
+            ? body.replyTo.id.trim().slice(0, 120)
+            : null;
+        const safeReplyToPreview =
+          typeof body.replyTo?.preview === 'string'
+            ? body.replyTo.preview.trim().slice(0, 400)
+            : null;
+        const safeReplyToSender: 'user' | 'assistant' | null =
+          body.replyTo?.sender === 'ia'
+            ? 'assistant'
+            : body.replyTo?.sender === 'cliente'
+              ? 'user'
+              : null;
+
+        const unclearAudioReply =
+          'Não consegui entender o seu áudio com clareza (ele pode ter ficado baixo, cortado ou com ruído de fundo).\n\nPode **enviar o áudio novamente** falando um pouco mais perto do microfone ou, se preferir, **escrever sua dúvida por texto**? Assim consigo te responder com precisão!';
+
+        if (auditSessionId) {
+          await recordChatAuditTurn(
+            auditSessionId,
+            auditOrigin,
+            'user',
+            'Mensagem de áudio (não compreendida)',
+            {
+              replyToId: safeReplyToId,
+              replyToPreview: safeReplyToPreview,
+              replyToSender: safeReplyToSender,
+              audioUrl: parsedAudio.cleanDataUrl,
+              transcription: null,
+            }
+          );
+          await recordChatAuditTurn(
+            auditSessionId,
+            auditOrigin,
+            'assistant',
+            unclearAudioReply
+          );
+        }
+
+        const wantsStreamForUnclear =
+          (req.body as { stream?: boolean }).stream !== false &&
+          (req.headers.accept?.includes('text/event-stream') ||
+            (req.body as { stream?: boolean }).stream === true);
+
+        if (!wantsStreamForUnclear) {
+          res.json({ reply: unclearAudioReply });
+          return;
+        }
+
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders?.();
+        res.write(
+          `data: ${JSON.stringify({ type: 'chunk', text: unclearAudioReply })}\n\n`
         );
-        audioTranscription = transcribeRes.text?.trim() || null;
-      } catch (transcribeErr) {
-        console.warn('[Audio Transcribe Fallback]', transcribeErr);
-        const fallbackRes = await callGeminiWithRetry(() =>
-          ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: { parts: [audioInlinePart, transcribePrompt] },
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            },
-          })
+        res.write(
+          `data: ${JSON.stringify({ type: 'done', reply: unclearAudioReply })}\n\n`
         );
-        audioTranscription = fallbackRes.text?.trim() || null;
+        res.end();
+        return;
       }
     }
 
-    // Consulta direta ao estoque real no Neon PostgreSQL para garantir dados 100% verídicos
-    let dbInventoryText = '';
-    try {
-      const stockRes = await pool.query<DbVehicleRow>(
-        `SELECT brand, model, version, year_fab, year_model, km, price, fipe_code, fipe_price, status, fuel, transmission, options
-         FROM vehicles
-         WHERE status IN ('Disponivel', 'Disponível', 'Reservado')
-         ORDER BY created_at DESC, id DESC`
-      );
-      if (stockRes.rows.length > 0) {
-        dbInventoryText = stockRes.rows
-          .map((v) => {
-            const sellingPrice = Number(v.price);
-            const formattedPrice = new Intl.NumberFormat('pt-BR', {
-              style: 'currency',
-              currency: 'BRL',
-              maximumFractionDigits: 0,
-            }).format(sellingPrice);
-            const formattedKm = new Intl.NumberFormat('pt-BR').format(Number(v.km));
-            const opts =
-              Array.isArray(v.options) && v.options.length > 0
-                ? v.options.join(', ')
-                : 'Pacote de série';
-            const fipeNote = buildFipeComparisonSummary(
-              sellingPrice,
-              v.fipe_price ? Number(v.fipe_price) : null,
-              v.fipe_code
-            );
-            return `- ${v.brand} ${v.model} ${v.version || ''} | Ano: ${v.year_fab}/${v.year_model} | Km: ${formattedKm} km | Preço: ${formattedPrice}${fipeNote ? ` | ${fipeNote}` : ''} | Status: ${v.status} | Câmbio: ${v.transmission || 'N/I'} | Combustível: ${v.fuel || 'N/I'} | Opcionais: ${opts}`.trim();
-          })
-          .join('\n');
-      }
-    } catch {
-      dbInventoryText = '';
-    }
+    const dbInventoryText = await dbInventoryPromise;
 
     // Se o cliente ou veículo selecionado informar código FIPE, consulta BrasilAPI ao vivo quando necessário
     let resolvedSelectedFipePrice = body.vehicle?.fipePrice;
@@ -2059,7 +2240,11 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 4. MINIMIZAÇÃO DE DADOS E PRIVACIDADE (LGPD):
 - Solicite APENAS os dados estritamente necessários para o atendimento inicial: **Nome** e **WhatsApp**.
 - É PROIBIDO solicitar CPF, RG, CNH, endereço residencial, comprovante de renda, dados bancários ou número de cartão pelo chat.
-- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente, NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.`;
+- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente, NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.
+
+5. COMPREENSÃO DE ÁUDIO E FALLBACK HONESTO:
+- Quando a última mensagem do cliente vier de uma transcrição de áudio, responda normalmente ao pedido com base no estoque real e nas diretrizes comerciais acima.
+- Se a transcrição do áudio estiver cortada, fragmentada, sem sentido ou ambígua a ponto de não ser possível entender com segurança o que o cliente pediu, NÃO chute nem invente respostas: peça de forma direta e cordial para o cliente **enviar o áudio novamente** ou **escrever a mensagem por texto**.`;
 
     const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, em tópicos Markdown e com CTA ativo.`;
 
@@ -2098,13 +2283,30 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
         (req.body as { stream?: boolean }).stream === true);
 
     if (!wantsStream) {
-      const response = await callGeminiWithRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
+      let response;
+      try {
+        response = await callGeminiWithRetry(
+          () =>
+            ai.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents: contentsPrompt,
+              config: chatConfig,
+            }),
+          parsedAudio ? 1 : 2
+        );
+      } catch (chatErr) {
+        if (!parsedAudio || isNonFallbackGeminiError(chatErr)) {
+          throw chatErr;
+        }
+        response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
           contents: contentsPrompt,
-          config: chatConfig,
-        })
-      );
+          config: {
+            maxOutputTokens: 500,
+            systemInstruction,
+          },
+        });
+      }
 
       const reply = response.text?.trim();
       if (!reply) {
@@ -2123,13 +2325,30 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       return;
     }
 
-    const stream = await callGeminiWithRetry(() =>
-      ai.models.generateContentStream({
-        model: 'gemini-3.1-flash-lite',
+    let stream;
+    try {
+      stream = await callGeminiWithRetry(
+        () =>
+          ai.models.generateContentStream({
+            model: 'gemini-3.1-flash-lite',
+            contents: contentsPrompt,
+            config: chatConfig,
+          }),
+        parsedAudio ? 1 : 2
+      );
+    } catch (streamErr) {
+      if (!parsedAudio || isNonFallbackGeminiError(streamErr)) {
+        throw streamErr;
+      }
+      stream = await ai.models.generateContentStream({
+        model: 'gemini-2.5-flash',
         contents: contentsPrompt,
-        config: chatConfig,
-      })
-    );
+        config: {
+          maxOutputTokens: 500,
+          systemInstruction,
+        },
+      });
+    }
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');

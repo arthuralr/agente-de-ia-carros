@@ -39,6 +39,8 @@ import {
 } from '../../types';
 import { formatWhatsAppLink } from '../../utils/formatters';
 import {
+  AUDIO_CAPTURE_CONSTRAINTS,
+  AUDIO_RECORDING_BITRATE,
   blobToDataUrl,
   formatBytesCompact,
   formatDurationSeconds,
@@ -140,8 +142,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setReplyingTo,
     clearReply,
     isSending,
+    isProcessingAudio,
+    activeAudioMessageId,
     hasStreamFirstToken,
     errorMsg,
+    setErrorMsg,
     customerName,
     setCustomerName,
     customerWhatsapp,
@@ -283,12 +288,19 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: AUDIO_CAPTURE_CONSTRAINTS,
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       mediaStreamRef.current = stream;
 
       const mimeType = pickSupportedAudioMimeType();
       const recorderOptions: MediaRecorderOptions = {
-        audioBitsPerSecond: 24000,
+        audioBitsPerSecond: AUDIO_RECORDING_BITRATE,
         ...(mimeType ? { mimeType } : {}),
       };
 
@@ -775,11 +787,13 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                   {effectiveSettings.tradeName}
                 </h1>
                 <p className="text-[12px] leading-tight text-[#D9FDD3] truncate">
-                  {isSending
-                    ? 'digitando...'
-                    : isRecording
-                      ? 'gravando áudio...'
-                      : 'online'}
+                  {isProcessingAudio && !hasStreamFirstToken
+                    ? 'ouvindo e analisando áudio...'
+                    : isSending
+                      ? 'digitando...'
+                      : isRecording
+                        ? 'gravando áudio...'
+                        : 'online'}
                 </p>
               </div>
             </div>
@@ -1115,10 +1129,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                             <p className="text-[12px] text-[#3B4A54] bg-black/[0.04] rounded px-2 py-1 leading-snug italic">
                               “{msg.audio.transcription}”
                             </p>
-                          ) : isSending ? (
+                          ) : isProcessingAudio &&
+                            activeAudioMessageId === msg.id ? (
                             <p className="text-[11px] text-[#54656F] inline-flex items-center gap-1.5">
                               <Loader2 className="w-3 h-3 animate-spin text-[#008069]" />
-                              <span>Transcrevendo áudio...</span>
+                              <span>Transcrevendo e analisando áudio...</span>
                             </p>
                           ) : null}
                         </div>
@@ -1223,7 +1238,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     <path d="M1.533 3.568L8 12.193V1H2.812C1.042 1 .474 2.156 1.533 3.568z" />
                   </svg>
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-[#00A884]" />
-                  <span>Analisando e digitando resposta...</span>
+                  <span>
+                    {isProcessingAudio
+                      ? 'Transcrevendo e analisando áudio...'
+                      : 'Analisando e digitando resposta...'}
+                  </span>
                 </div>
               </div>
             )}
@@ -1249,16 +1268,17 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                       </a>
                     )}
                   </div>
-                  {mediaError && (
-                    <button
-                      type="button"
-                      onClick={() => setMediaError(null)}
-                      aria-label="Fechar aviso"
-                      className="text-red-500 hover:text-red-700"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMediaError(null);
+                      setErrorMsg(null);
+                    }}
+                    aria-label="Fechar aviso"
+                    className="text-red-500 hover:text-red-700 shrink-0"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
                 </div>
               </div>
             )}
