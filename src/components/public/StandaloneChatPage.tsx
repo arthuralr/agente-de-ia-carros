@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeft,
+  Bell,
   CalendarClock,
   Camera,
   Car,
@@ -11,6 +12,7 @@ import {
   Copy,
   Download,
   FileText,
+  Headset,
   Image as ImageIcon,
   Loader2,
   MapPin,
@@ -24,7 +26,6 @@ import {
   Send,
   ShieldCheck,
   Trash2,
-  User,
   UserCheck,
   UserPlus,
   Wallet,
@@ -54,6 +55,7 @@ import {
 } from '../../utils/chatMedia';
 import { useVirtualConsultant } from '../../hooks/useVirtualConsultant';
 import { ChatMarkdown } from './ChatMarkdown';
+import { PWAInstallBanner } from './PWAInstallBanner';
 
 interface StandaloneChatPageProps {
   vehicles: Vehicle[];
@@ -103,9 +105,12 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
-  const [introName, setIntroName] = useState('');
-  const [introPhone, setIntroPhone] = useState('');
-  const [introError, setIntroError] = useState<string | null>(null);
+  const [notifPermission, setNotifPermission] = useState<string>(() => {
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      return Notification.permission;
+    }
+    return 'unsupported';
+  });
 
   // Attachment state
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
@@ -156,9 +161,9 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setCustomerName,
     customerWhatsapp,
     setCustomerWhatsapp,
-    needsInitialIdentification,
-    isIdentifying,
-    completeInitialIdentification,
+    triageStage,
+    incomingNotification,
+    dismissIncomingNotification,
     lgpdConsent,
     setLgpdConsent,
     isSavingLead,
@@ -181,6 +186,8 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     onCaptureLead,
     onSyncLeadChat,
   });
+
+  const isTriageComplete = triageStage === 'complete';
 
   const sendRichMessageRef = useRef(sendRichMessage);
   useEffect(() => {
@@ -217,35 +224,17 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setLightboxImage(null);
     setHeaderMenuOpen(false);
     setConfirmClearOpen(false);
-    setIntroName('');
-    setIntroPhone('');
-    setIntroError(null);
     resetConversation();
   };
 
-  const handleInitialIdentificationSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (isIdentifying) return;
-    const cleanName = introName.replace(/\s+/g, ' ').trim();
-    if (cleanName.length < 2) {
-      setIntroError('Por favor, informe seu nome para iniciarmos.');
-      return;
+  const handleRequestVisitorNotifications = async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    try {
+      const result = await Notification.requestPermission();
+      setNotifPermission(result);
+    } catch {
+      // Ignore permission prompt errors
     }
-    const phoneDigits = introPhone.replace(/\D/g, '');
-    if (phoneDigits.length > 0 && phoneDigits.length < 10) {
-      setIntroError(
-        'Telefone incompleto. Preencha com DDD ou deixe em branco (opcional).'
-      );
-      return;
-    }
-    setIntroError(null);
-    await completeInitialIdentification(
-      cleanName,
-      phoneDigits.length >= 10 ? formatBrazilianPhone(introPhone) : undefined
-    );
-    window.setTimeout(() => {
-      textInputRef.current?.focus();
-    }, 80);
   };
 
   const buildReplyPreviewForMessage = (msg: ChatMessage): string => {
@@ -894,7 +883,20 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 </button>
 
                 {headerMenuOpen && (
-                  <div className="absolute right-0 top-[46px] z-40 w-56 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
+                  <div className="absolute right-0 top-[46px] z-40 w-60 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
+                    {notifPermission === 'default' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setHeaderMenuOpen(false);
+                          void handleRequestVisitorNotifications();
+                        }}
+                        className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-[#075E54] hover:bg-[#E7FCEB] flex items-center gap-2.5 transition-colors border-b border-[#E9EDEF]"
+                      >
+                        <Bell className="w-3.5 h-3.5 text-[#00A884] shrink-0" />
+                        <span>Ativar alertas de respostas</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
@@ -911,6 +913,39 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </div>
             </div>
           </header>
+
+          {/* First-Access Installable PWA Banner */}
+          <PWAInstallBanner
+            variant="whatsapp"
+            appName={effectiveSettings.tradeName}
+          />
+
+          {/* Live Notification Toast from Human Consultant or Store Broadcast */}
+          {incomingNotification && (
+            <div className="shrink-0 bg-[#111B21] text-white border-b border-[#00A884]/40 px-3.5 py-2.5 flex items-center justify-between gap-3 shadow-md">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="w-7 h-7 rounded-full bg-[#00A884] text-white flex items-center justify-center shrink-0">
+                  <Bell className="w-3.5 h-3.5" />
+                </span>
+                <div className="min-w-0">
+                  <p className="text-[11.5px] font-semibold text-[#D9FDD3] truncate">
+                    {incomingNotification.title}
+                  </p>
+                  <p className="text-xs text-white/90 truncate">
+                    {incomingNotification.body}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={dismissIncomingNotification}
+                aria-label="Fechar notificação"
+                className="w-7 h-7 rounded-full hover:bg-white/10 text-white/80 flex items-center justify-center shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
 
           {/* Lead Confirmed Subtle Bar */}
           {leadSaved && (
@@ -954,26 +989,24 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
             {(() => {
               let activeMenuBubbleIdx = -1;
-              for (let i = messages.length - 1; i >= 0; i--) {
-                const candidate = messages[i];
-                if (
-                  candidate.sender === 'ia' &&
-                  candidate.id.startsWith('msg-ia-return-welcome')
-                ) {
-                  activeMenuBubbleIdx = i;
-                  break;
+              if (isTriageComplete) {
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  const candidate = messages[i];
+                  if (
+                    candidate.sender === 'ia' &&
+                    (candidate.id.startsWith('msg-ia-triage-complete') ||
+                      candidate.id.startsWith('msg-ia-return-welcome') ||
+                      candidate.id.startsWith('msg-ia-welcome'))
+                  ) {
+                    activeMenuBubbleIdx = i;
+                    break;
+                  }
                 }
-              }
-              if (
-                activeMenuBubbleIdx === -1 &&
-                messages[0]?.sender === 'ia' &&
-                messages[0].id.startsWith('msg-ia-welcome')
-              ) {
-                activeMenuBubbleIdx = 0;
               }
               return messages.map((msg, index) => {
                 const isAi = msg.sender === 'ia';
-                const isWelcomeBubble = index === activeMenuBubbleIdx;
+                const isWelcomeBubble =
+                  isTriageComplete && index === activeMenuBubbleIdx;
                 const isImageAttachment =
                   msg.attachment?.mimeType.startsWith('image/');
                 const isPdfAttachment =
@@ -1048,6 +1081,14 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                         >
                           <path d="M5.188 1H0v11.193l6.467-8.625C7.526 2.156 6.958 1 5.188 1z" />
                         </svg>
+                      )}
+
+                      {/* Human Consultant / Store Notice Header Tag */}
+                      {isAi && msg.isHumanConsultant && (
+                        <div className="mb-1.5 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#E7FCEB] border border-[#00A884]/30 text-[11px] font-semibold text-[#075E54]">
+                          <Headset className="w-3 h-3 text-[#00A884]" />
+                          <span>{msg.senderLabel || 'Consultor da Loja'}</span>
+                        </div>
                       )}
 
                       {/* Quoted Reply Block inside Bubble */}
@@ -1415,8 +1456,8 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </div>
             )}
 
-            {/* Horizontal Scrollable Quick Chips (hidden during active recording) */}
-            {!isRecording && (
+            {/* Horizontal Scrollable Quick Chips (only unlocked after 2-step triage & hidden during recording) */}
+            {!isRecording && isTriageComplete && (
               <div className="px-3 sm:px-4 pt-2 pb-1 flex items-center gap-2 overflow-x-auto">
                 {quickChips.map((chip) => (
                   <button
@@ -1531,51 +1572,53 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 onSubmit={handleFormSubmit}
                 className="px-3 sm:px-4 py-2.5 flex items-center gap-2"
               >
-                {/* Attachment Clip Button */}
-                <button
-                  type="button"
-                  disabled={
-                    isSending || isProcessingFile || needsInitialIdentification
-                  }
-                  onClick={() => setAttachMenuOpen((prev) => !prev)}
-                  aria-label="Anexar foto ou documento PDF"
-                  title="Anexar foto ou PDF"
-                  className={`w-[42px] h-[42px] rounded-full transition-colors shrink-0 inline-flex items-center justify-center ${
-                    attachMenuOpen || pendingAttachment
-                      ? 'bg-[#00A884]/15 text-[#075E54]'
-                      : 'text-[#54656F] hover:bg-black/[0.06]'
-                  } disabled:opacity-50`}
-                >
-                  {isProcessingFile ? (
-                    <Loader2 className="w-5 h-5 animate-spin text-[#00A884]" />
-                  ) : (
-                    <Paperclip className="w-5 h-5" />
-                  )}
-                </button>
+                {/* Attachment Clip Button (active once triage is complete) */}
+                {isTriageComplete && (
+                  <button
+                    type="button"
+                    disabled={isSending || isProcessingFile}
+                    onClick={() => setAttachMenuOpen((prev) => !prev)}
+                    aria-label="Anexar foto ou documento PDF"
+                    title="Anexar foto ou PDF"
+                    className={`w-[42px] h-[42px] rounded-full transition-colors shrink-0 inline-flex items-center justify-center ${
+                      attachMenuOpen || pendingAttachment
+                        ? 'bg-[#00A884]/15 text-[#075E54]'
+                        : 'text-[#54656F] hover:bg-black/[0.06]'
+                    } disabled:opacity-50`}
+                  >
+                    {isProcessingFile ? (
+                      <Loader2 className="w-5 h-5 animate-spin text-[#00A884]" />
+                    ) : (
+                      <Paperclip className="w-5 h-5" />
+                    )}
+                  </button>
+                )}
 
                 <input
                   ref={textInputRef}
-                  type="text"
+                  type={triageStage === 'ask_phone' ? 'tel' : 'text'}
+                  inputMode={triageStage === 'ask_phone' ? 'tel' : 'text'}
                   value={input}
-                  disabled={needsInitialIdentification}
                   onChange={(e) => setInput(e.target.value)}
                   placeholder={
-                    needsInitialIdentification
-                      ? 'Informe seu nome para começar...'
-                      : pendingAttachment
-                        ? 'Adicione uma legenda opcional ou envie...'
-                        : 'Mensagem'
+                    triageStage === 'ask_name'
+                      ? 'Digite seu nome...'
+                      : triageStage === 'ask_phone'
+                        ? 'Digite seu WhatsApp com DDD (ex: 11 99999-9999)...'
+                        : pendingAttachment
+                          ? 'Adicione uma legenda opcional ou envie...'
+                          : 'Mensagem'
                   }
-                  className="flex-1 min-h-[44px] px-4 py-2 bg-white border border-transparent focus:border-[#00A884]/50 rounded-full text-[15px] text-[#111B21] placeholder:text-[#667781] shadow-[0_1px_1px_rgba(11,20,26,0.08)] focus:outline-none disabled:bg-[#F5F6F7] disabled:cursor-not-allowed"
+                  className="flex-1 min-h-[44px] px-4 py-2 bg-white border border-transparent focus:border-[#00A884]/50 rounded-full text-[15px] text-[#111B21] placeholder:text-[#667781] shadow-[0_1px_1px_rgba(11,20,26,0.08)] focus:outline-none"
                 />
 
-                {canSendTextOrAttachment ? (
+                {canSendTextOrAttachment || !isTriageComplete ? (
                   <button
                     type="submit"
                     disabled={
                       isSending ||
                       isProcessingFile ||
-                      needsInitialIdentification
+                      !canSendTextOrAttachment
                     }
                     aria-label="Enviar mensagem"
                     className="w-[44px] h-[44px] rounded-full bg-[#00A884] hover:bg-[#008F72] disabled:bg-[#8696A0] text-white shadow-xs transition-colors shrink-0 inline-flex items-center justify-center active:scale-95"
@@ -1585,11 +1628,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 ) : (
                   <button
                     type="button"
-                    disabled={
-                      isSending ||
-                      isProcessingFile ||
-                      needsInitialIdentification
-                    }
+                    disabled={isSending || isProcessingFile}
                     onClick={() => void startAudioRecording()}
                     aria-label="Gravar mensagem de áudio"
                     title="Gravar áudio"
@@ -1732,150 +1771,6 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
         </div>
       )}
 
-      {/* Initial Identification Popup (First Visit / Unidentified Session) */}
-      {needsInitialIdentification && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="intro-identify-title"
-          className="fixed inset-0 z-50 bg-[#0B141A]/65 backdrop-blur-[2px] flex items-center justify-center p-4"
-        >
-          <div className="w-full max-w-[400px] bg-white rounded-2xl shadow-2xl border border-[#D1D7DB] overflow-hidden">
-            {/* Friendly WhatsApp-harmonized top bar */}
-            <div className="bg-[#075E54] px-5 py-4 text-white flex items-center gap-3">
-              <div className="w-11 h-11 rounded-full bg-[#111B21] border border-white/25 flex items-center justify-center shrink-0 relative">
-                <User className="w-5 h-5 text-[#25D366]" />
-                <span className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-[#25D366] ring-2 ring-[#075E54]" />
-              </div>
-              <div className="min-w-0">
-                <h2
-                  id="intro-identify-title"
-                  className="font-display text-base font-semibold leading-tight text-white truncate"
-                >
-                  {effectiveSettings.tradeName}
-                </h2>
-                <p className="text-xs text-[#D9FDD3] mt-0.5">
-                  Consultor Virtual · Atendimento imediato
-                </p>
-              </div>
-            </div>
-
-            <form
-              onSubmit={(e) => void handleInitialIdentificationSubmit(e)}
-              className="p-5 space-y-4"
-            >
-              <div className="space-y-1">
-                <p className="text-sm font-semibold text-[#111B21]">
-                  Olá! Como podemos te chamar?
-                </p>
-                <p className="text-xs text-[#54656F] leading-relaxed">
-                  Informe seu nome para iniciarmos um atendimento personalizado
-                  sobre nosso estoque, FIPE, trocas e financiamento.
-                </p>
-              </div>
-
-              {introError && (
-                <div className="p-2.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
-                  <span>{introError}</span>
-                </div>
-              )}
-
-              <div className="space-y-3">
-                <div>
-                  <label
-                    htmlFor="intro-visitor-name"
-                    className="block text-xs font-semibold text-[#3B4A54] mb-1"
-                  >
-                    Seu Nome <span className="text-red-600">*</span>
-                  </label>
-                  <input
-                    id="intro-visitor-name"
-                    type="text"
-                    required
-                    autoFocus
-                    autoComplete="name"
-                    value={introName}
-                    onChange={(e) => {
-                      setIntroName(e.target.value);
-                      if (introError) setIntroError(null);
-                    }}
-                    placeholder="Ex: João Silva"
-                    disabled={isIdentifying}
-                    className="w-full min-h-[46px] px-3.5 py-2.5 bg-[#F8F9FA] border border-[#D1D7DB] focus:bg-white focus:border-[#00A884] rounded-xl text-sm text-[#111B21] placeholder:text-[#8696A0] focus:outline-none transition-colors"
-                  />
-                </div>
-
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label
-                      htmlFor="intro-visitor-phone"
-                      className="block text-xs font-semibold text-[#3B4A54]"
-                    >
-                      Seu WhatsApp / Telefone
-                    </label>
-                    <span className="text-[11px] font-medium text-[#667781]">
-                      Opcional
-                    </span>
-                  </div>
-                  <input
-                    id="intro-visitor-phone"
-                    type="tel"
-                    inputMode="tel"
-                    autoComplete="tel"
-                    value={introPhone}
-                    onChange={(e) => {
-                      setIntroPhone(formatBrazilianPhone(e.target.value));
-                      if (introError) setIntroError(null);
-                    }}
-                    placeholder="(00) 00000-0000"
-                    maxLength={15}
-                    disabled={isIdentifying}
-                    className="w-full min-h-[46px] px-3.5 py-2.5 bg-[#F8F9FA] border border-[#D1D7DB] focus:bg-white focus:border-[#00A884] rounded-xl text-sm text-[#111B21] font-mono placeholder:text-[#8696A0] focus:outline-none transition-colors"
-                  />
-                  <p className="mt-1.5 text-[11px] text-[#667781] leading-relaxed flex items-start gap-1.5">
-                    <ShieldCheck className="w-3.5 h-3.5 text-[#008069] shrink-0 mt-0.5" />
-                    <span>
-                      Caso informado, seu número será usado apenas para retorno
-                      deste atendimento, conforme nossa{' '}
-                      {onOpenPrivacy ? (
-                        <button
-                          type="button"
-                          onClick={onOpenPrivacy}
-                          className="text-[#008069] hover:underline font-medium"
-                        >
-                          Política de Privacidade (LGPD)
-                        </button>
-                      ) : (
-                        <span>Política de Privacidade (LGPD)</span>
-                      )}
-                      .
-                    </span>
-                  </p>
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={isIdentifying || introName.trim().length < 2}
-                className="w-full min-h-[48px] px-4 py-3 rounded-xl text-sm font-semibold text-white bg-[#00A884] hover:bg-[#008F72] disabled:opacity-50 transition-colors inline-flex items-center justify-center gap-2 shadow-sm active:scale-[0.99] cursor-pointer"
-              >
-                {isIdentifying ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Iniciando atendimento...</span>
-                  </>
-                ) : (
-                  <>
-                    <MessageCircle className="w-4 h-4" />
-                    <span>Iniciar Atendimento</span>
-                  </>
-                )}
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

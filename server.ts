@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express, { NextFunction, Request, Response } from 'express';
 import fs from 'fs';
@@ -709,6 +710,100 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
+interface GeminiUsageMetadataLike {
+  promptTokenCount?: number | null;
+  candidatesTokenCount?: number | null;
+  totalTokenCount?: number | null;
+}
+
+type AiUsageFeature = 'chat_text' | 'chat_audio' | 'crm_summary' | 'social_post';
+
+/**
+ * Persiste silenciosamente o consumo de tokens reportado pelo Gemini em ai_usage_logs.
+ * Executa em background com try/catch para nunca atrasar nem interromper a resposta ao usuário.
+ */
+function recordAiUsageLog(params: {
+  sessionId?: string | null;
+  feature: AiUsageFeature;
+  model: string;
+  usageMetadata?: GeminiUsageMetadataLike | null;
+}): void {
+  try {
+    const meta = params.usageMetadata;
+    if (!meta) return;
+
+    const promptTokens = Math.max(0, Math.round(Number(meta.promptTokenCount) || 0));
+    const completionTokens = Math.max(
+      0,
+      Math.round(Number(meta.candidatesTokenCount) || 0)
+    );
+    const totalTokens = Math.max(
+      0,
+      Math.round(Number(meta.totalTokenCount) || promptTokens + completionTokens)
+    );
+
+    if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0) {
+      return;
+    }
+
+    const safeSessionId = params.sessionId
+      ? sanitizeSessionId(params.sessionId)
+      : null;
+    const safeModel = String(params.model || 'unknown').trim().slice(0, 128);
+
+    void pool
+      .query(
+        `INSERT INTO ai_usage_logs (
+           session_id,
+           feature,
+           model,
+           prompt_tokens,
+           completion_tokens,
+           total_tokens,
+           created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+        [
+          safeSessionId,
+          params.feature,
+          safeModel,
+          promptTokens,
+          completionTokens,
+          totalTokens,
+        ]
+      )
+      .catch((err) => {
+        console.error('[AI Usage Audit Log Error]', err);
+      });
+  } catch (err) {
+    console.error('[AI Usage Audit Log Sync Error]', err);
+  }
+}
+
+function isValidOwnerSecret(req: express.Request, configuredSecret: string): boolean {
+  const headerKey =
+    typeof req.headers['x-owner-secret'] === 'string'
+      ? req.headers['x-owner-secret'].trim()
+      : '';
+  const authHeader =
+    typeof req.headers.authorization === 'string'
+      ? req.headers.authorization.trim()
+      : '';
+  const bearerKey = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : '';
+  const queryKey =
+    typeof req.query.key === 'string' ? req.query.key.trim() : '';
+
+  const provided = headerKey || bearerKey || queryKey;
+  if (!provided) return false;
+
+  const providedBuf = Buffer.from(provided, 'utf8');
+  const expectedBuf = Buffer.from(configuredSecret, 'utf8');
+  if (providedBuf.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(providedBuf, expectedBuf);
+}
+
 async function callGeminiWithRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -1027,6 +1122,72 @@ app.post('/api/public/chat-session/identify', async (req, res) => {
   }
 });
 
+app.get('/api/public/chat-session/:sessionId/updates', async (req, res) => {
+  const cleanSessionId = sanitizeSessionId(req.params.sessionId);
+  if (!cleanSessionId) {
+    res.status(400).json({ error: 'Sessão inválida.' });
+    return;
+  }
+
+  const afterMessageId = Math.max(0, Number(req.query.afterMessageId) || 0);
+  const afterBroadcastId = Math.max(
+    0,
+    Number(req.query.afterBroadcastId) || 0
+  );
+
+  try {
+    const [msgRes, broadcastRes] = await Promise.all([
+      pool.query<DbChatMessageRow>(
+        `SELECT id, session_id, sender, content, sender_label, is_human_consultant, created_at
+         FROM chat_messages
+         WHERE session_id = $1
+           AND is_human_consultant = true
+           AND id > $2
+         ORDER BY id ASC
+         LIMIT 20`,
+        [cleanSessionId, afterMessageId]
+      ),
+      pool.query<{
+        id: number;
+        title: string | null;
+        message: string;
+        created_by: string | null;
+        created_at: Date;
+      }>(
+        `SELECT id, title, message, created_by, created_at
+         FROM chat_broadcasts
+         WHERE id > $1
+           AND created_at >= NOW() - INTERVAL '24 hours'
+         ORDER BY id ASC
+         LIMIT 5`,
+        [afterBroadcastId]
+      ),
+    ]);
+
+    res.json({
+      consultantMessages: msgRes.rows.map((m) => ({
+        id: m.id,
+        content: m.content,
+        senderLabel: m.sender_label || 'Consultor da Loja',
+        isHumanConsultant: true,
+        createdAt: m.created_at,
+      })),
+      broadcasts: broadcastRes.rows.map((b) => ({
+        id: b.id,
+        title: b.title,
+        message: b.message,
+        createdBy: b.created_by || 'Equipe Armazém do Carro',
+        createdAt: b.created_at,
+      })),
+    });
+  } catch {
+    res.json({
+      consultantMessages: [],
+      broadcasts: [],
+    });
+  }
+});
+
 app.patch('/api/admin/settings/operation-mode', requireAdminAuth, async (req, res) => {
   try {
     const requested =
@@ -1159,6 +1320,8 @@ app.get(
            attachment_url,
            attachment_name,
            attachment_mime,
+           sender_label,
+           is_human_consultant,
            created_at
          FROM chat_messages
          WHERE session_id = $1
@@ -1196,6 +1359,8 @@ app.get(
           attachmentDownloadUrl: m.attachment_url
             ? `/api/admin/chat-messages/${m.id}/attachment`
             : null,
+          senderLabel: m.sender_label ?? null,
+          isHumanConsultant: Boolean(m.is_human_consultant),
           createdAt: m.created_at,
         })),
       });
@@ -1208,6 +1373,251 @@ app.get(
     }
   }
 );
+
+app.post(
+  '/api/admin/chat-sessions/:sessionId/consultant-message',
+  requireAdminAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const sessionId = sanitizeSessionId(req.params.sessionId);
+    if (!sessionId) {
+      res.status(400).json({ error: 'Identificador de sessão inválido.' });
+      return;
+    }
+
+    const rawText =
+      typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    if (!rawText) {
+      res.status(400).json({ error: 'Digite uma mensagem para enviar ao visitante.' });
+      return;
+    }
+
+    const safeMessage = rawText.slice(0, 2000);
+    const customLabel =
+      typeof req.body?.senderLabel === 'string' && req.body.senderLabel.trim()
+        ? req.body.senderLabel.trim().slice(0, 80)
+        : req.adminUser?.name
+          ? `Consultor ${req.adminUser.name.split(' ')[0]}`
+          : 'Consultor da Loja';
+
+    try {
+      const sessionRes = await pool.query<{ session_id: string }>(
+        'SELECT session_id FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+        [sessionId]
+      );
+      if (sessionRes.rowCount === 0) {
+        res.status(404).json({ error: 'Sessão de conversa não encontrada.' });
+        return;
+      }
+
+      const insertRes = await pool.query<DbChatMessageRow>(
+        `INSERT INTO chat_messages (
+           session_id,
+           sender,
+           content,
+           sender_label,
+           is_human_consultant
+         )
+         VALUES ($1, 'assistant', $2, $3, true)
+         RETURNING id, session_id, sender, content, sender_label, is_human_consultant, created_at`,
+        [sessionId, safeMessage, customLabel]
+      );
+
+      await pool.query(
+        'UPDATE chat_sessions SET updated_at = NOW() WHERE session_id = $1',
+        [sessionId]
+      );
+
+      const m = insertRes.rows[0];
+      res.status(201).json({
+        id: m.id,
+        sessionId: m.session_id,
+        sender: m.sender,
+        content: m.content,
+        senderLabel: m.sender_label ?? customLabel,
+        isHumanConsultant: true,
+        createdAt: m.created_at,
+      });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Erro ao enviar mensagem do consultor.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
+app.get('/api/admin/notifications', requireAdminAuth, async (_req, res) => {
+  try {
+    const [chatMsgsRes, leadsRes] = await Promise.all([
+      pool.query<{
+        id: number;
+        session_id: string;
+        content: string;
+        transcription: string | null;
+        attachment_name: string | null;
+        created_at: Date;
+        lead_name: string | null;
+        lead_phone: string | null;
+        origem: string;
+      }>(
+        `SELECT
+           m.id,
+           m.session_id,
+           m.content,
+           m.transcription,
+           m.attachment_name,
+           m.created_at,
+           s.lead_name,
+           s.lead_phone,
+           s.origem
+         FROM chat_messages m
+         JOIN chat_sessions s ON s.session_id = m.session_id
+         WHERE m.sender = 'user'
+         ORDER BY m.id DESC
+         LIMIT 20`
+      ),
+      pool.query<{
+        id: number;
+        name: string;
+        phone: string;
+        vehicle_interest: string | null;
+        chat_session_id: string | null;
+        created_at: Date;
+      }>(
+        `SELECT id, name, phone, vehicle_interest, chat_session_id, created_at
+         FROM leads
+         ORDER BY id DESC
+         LIMIT 12`
+      ),
+    ]);
+
+    const items = [
+      ...chatMsgsRes.rows.map((row) => {
+        const preview =
+          row.transcription?.trim() ||
+          row.content?.trim() ||
+          (row.attachment_name ? `Anexo: ${row.attachment_name}` : 'Nova mensagem');
+        return {
+          id: `msg-${row.id}`,
+          type: 'chat_message' as const,
+          title: row.lead_name?.trim()
+            ? `Nova mensagem de ${row.lead_name.trim()}`
+            : `Nova mensagem (${row.origem})`,
+          preview: preview.replace(/\s+/g, ' ').slice(0, 120),
+          sessionId: row.session_id,
+          leadId: null,
+          leadPhone: row.lead_phone,
+          origem: row.origem,
+          createdAt: row.created_at.toISOString(),
+        };
+      }),
+      ...leadsRes.rows.map((lead) => ({
+        id: `lead-${lead.id}`,
+        type: 'new_lead' as const,
+        title: `Novo lead: ${lead.name}`,
+        preview: (lead.vehicle_interest || lead.phone || 'Novo contato no CRM').slice(
+          0,
+          120
+        ),
+        sessionId: lead.chat_session_id,
+        leadId: String(lead.id),
+        leadPhone: lead.phone,
+        origem: 'CRM',
+        createdAt: lead.created_at.toISOString(),
+      })),
+    ]
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      )
+      .slice(0, 25);
+
+    res.json({
+      serverTime: new Date().toISOString(),
+      items,
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao carregar notificações administrativas.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get('/api/admin/chat-broadcasts', requireAdminAuth, async (_req, res) => {
+  try {
+    const result = await pool.query<{
+      id: number;
+      title: string | null;
+      message: string;
+      created_by: string | null;
+      created_at: Date;
+    }>(
+      `SELECT id, title, message, created_by, created_at
+       FROM chat_broadcasts
+       ORDER BY id DESC
+       LIMIT 15`
+    );
+    res.json(
+      result.rows.map((b) => ({
+        id: b.id,
+        title: b.title,
+        message: b.message,
+        createdBy: b.created_by,
+        createdAt: b.created_at,
+      }))
+    );
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao listar avisos enviados.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/admin/chat-broadcasts', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
+  const rawMessage =
+    typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  const rawTitle =
+    typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+
+  if (!rawMessage) {
+    res.status(400).json({ error: 'Escreva o texto do aviso/campanha antes de enviar.' });
+    return;
+  }
+
+  const safeMessage = rawMessage.slice(0, 1200);
+  const safeTitle = rawTitle ? rawTitle.slice(0, 120) : 'Aviso da Loja';
+  const createdBy = req.adminUser?.name || 'Equipe Comercial';
+
+  try {
+    const result = await pool.query<{
+      id: number;
+      title: string | null;
+      message: string;
+      created_by: string | null;
+      created_at: Date;
+    }>(
+      `INSERT INTO chat_broadcasts (title, message, created_by)
+       VALUES ($1, $2, $3)
+       RETURNING id, title, message, created_by, created_at`,
+      [safeTitle, safeMessage, createdBy]
+    );
+    const b = result.rows[0];
+    res.status(201).json({
+      id: b.id,
+      title: b.title,
+      message: b.message,
+      createdBy: b.created_by,
+      createdAt: b.created_at,
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao publicar aviso no /chat.';
+    res.status(500).json({ error: message });
+  }
+});
 
 const ALLOWED_CHAT_SESSION_TAGS: Record<string, string> = {
   'Lead Quente': '🔥 Lead Quente',
@@ -1574,6 +1984,12 @@ Regras obrigatórias de formato:
             1
           );
           const candidate = response.text?.trim() || '';
+          recordAiUsageLog({
+            sessionId,
+            feature: 'crm_summary',
+            model: modelName,
+            usageMetadata: response.usageMetadata,
+          });
           if (candidate) {
             summaryText = candidate;
             break;
@@ -2568,6 +2984,13 @@ Instruções:
       })
     );
 
+    recordAiUsageLog({
+      sessionId: null,
+      feature: 'social_post',
+      model: 'gemini-4-hydrogen',
+      usageMetadata: response.usageMetadata,
+    });
+
     const rawText = response.text?.trim();
     if (!rawText) {
       res.status(502).json({ error: 'A IA não retornou conteúdo textual válido.' });
@@ -2850,6 +3273,12 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
           );
           audioTranscription = resTranscribe.text?.trim() || null;
           transcribedSuccessfully = true;
+          recordAiUsageLog({
+            sessionId: sanitizeSessionId(body.sessionId),
+            feature: 'chat_audio',
+            model: candidate.model,
+            usageMetadata: resTranscribe.usageMetadata,
+          });
           break;
         } catch (transcribeErr) {
           lastTranscribeErr = transcribeErr;
@@ -3118,39 +3547,33 @@ ${realStockContext}${clientFipeLookupContext}`;
     const systemInstruction = `Você é o Consultor Oficial da revenda "${dealership}" (${s?.address || 'Av. Ibirapuera, 2.840 — Moema'}, ${s?.city || 'São Paulo'}/${s?.state || 'SP'}).
 Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursSaturday || '09:00 às 16:00'} | WhatsApp: ${s?.whatsapp || '(11) 99482-1040'}.
 
-1. FORMATAÇÃO VISUAL LIMPA, CURTA E ESTRUTURADA (OBRIGATÓRIO):
-- É PROIBIDO enviar blocos longos ou densos de texto corrido.
-- Seja objetivo e direto (idealmente entre 60 e 160 palavras por resposta).
-- Separe seções com linha em branco e use parágrafos curtos (1 frase por parágrafo).
-- Use listas em Markdown com \`- \` para apresentar ficha técnica, diferenciais, opcionais ou opções de estoque.
-- Use negritos estratégicos (\`**texto**\`) para destacar nomes de modelos, anos, quilometragem, preços e economia frente à Tabela FIPE (ex: **BMW 320i M Sport (2023/2024)** por **R$ 314.900**).
+1. CONCISÃO RIGOROSA ESTILO WHATSAPP (OBRIGATÓRIO):
+- Responda de forma **curta, direta e escaneável** — como um vendedor ágil no WhatsApp.
+- Limite-se a **2 a 4 linhas curtas** OU no máximo **3 bullet points curtos** com \`- \`.
+- É PROIBIDO enviar introduções longas, repetições, despedidas extensas ou paredões de texto.
+- Vá direto ao ponto: destaque em negrito (\`**texto**\`) apenas o essencial (modelo, ano, preço, economia frente à FIPE ou condição principal).
+- Encerre sempre com **apenas 1 pergunta curta e objetiva** conduzindo ao próximo passo (ex.: visita, simulação de financiamento ou avaliação de troca).
 
 2. PERSONALIDADE COMERCIAL CONSULTIVA, FIPE OFICIAL E VERACIDADE:
-- Atue estritamente como o Consultor Oficial do ${dealership}, especialista em seminovos selecionados com procedência garantida, **laudo cautelar 100% aprovado** e **garantia legal de 90 dias (CDC)**.
-- Utilize APENAS os dados reais do estoque e os valores oficiais da Tabela FIPE (BrasilAPI) fornecidos no contexto. NUNCA invente especificações, preços, valores FIPE, anos, versões, taxas exatas de financiamento ou veículos que não constam no contexto. Se uma informação não estiver listada, diga com clareza que confirmará presencialmente ou pelo WhatsApp.
-- ARGUMENTAÇÃO COMERCIAL COM TABELA FIPE: Sempre que o contexto trouxer o valor oficial da **Tabela FIPE** (ou consulta ao vivo por código FIPE), use essa referência para valorizar o negócio de forma transparente — destacando o preço FIPE, o **percentual de desconto** e a **economia em reais** quando o veículo estiver abaixo da tabela, ou justificando o valor de mercado pela baixa quilometragem, laudo cautelar e pacote de opcionais.
-- Quando pertinente, destaque que aceitamos veículo usado na troca (mediante avaliação presencial) e trabalhamos com financiamento bancário e carta de crédito contemplada.
+- Seminovos com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
+- Utilize APENAS os dados reais do estoque e os valores oficiais da Tabela FIPE (BrasilAPI) fornecidos no contexto. NUNCA invente preços, valores FIPE, taxas exatas ou veículos fora do estoque. Se algo não constar, diga brevemente que confirmará com a equipe.
+- Quando houver valor FIPE no contexto, cite de forma sucinta o preço e a economia frente à tabela. Aceitamos usado na troca e financiamento bancário/carta contemplada.
 
-3. IDENTIFICAÇÃO LEVE, VISITANTE RECORRENTE E MOMENTO COMERCIAL (SEM ATRITO):
-- Quando o nome do cliente já estiver informado no contexto (seja por cadastro anterior ou por esta conversa), trate-o naturalmente pelo primeiro nome e NUNCA peça o nome novamente.
-- Quando o cliente informar o nome (ex.: "Lucas", "Me chamo Mariana", "Sou o Pedro, quero simular"), cumprimente-o e passe a chamá-lo naturalmente pelo primeiro nome nas respostas seguintes. Se ele já trouxe uma dúvida junto com o nome, responda imediatamente ao pedido sem repetir perguntas desnecessárias. Se ele respondeu apenas com o nome, dê boas-vindas calorosas pelo nome e pergunte como pode ajudar (ex.: estoque, simulação ou avaliação de troca).
-- Se o cliente for direto à pergunta sem informar o nome, responda normalmente sem insistir ou criar barreiras.
-- Convide o cliente a deixar o **WhatsApp** (com consentimento explícito LGPD no botão "Simulação / Contato") apenas quando avançar para etapas comerciais que exijam envio externo ou agendamento (ex.: simulação detalhada de financiamento, avaliação de troca, envio de laudo cautelar completo ou agendamento de visita/test-drive).
+3. IDENTIFICAÇÃO E CONTINUIDADE (SEM REPETIÇÃO):
+- Se o nome do cliente estiver no contexto, chame-o naturalmente pelo primeiro nome e NUNCA peça o nome novamente.
+- Não peça novamente dados que o cliente já informou.
 
 4. MINIMIZAÇÃO DE DADOS E PRIVACIDADE (LGPD):
-- Solicite APENAS os dados estritamente necessários para o atendimento comercial: **Nome** e **WhatsApp**.
-- É PROIBIDO solicitar CPF, RG, CNH, endereço residencial, comprovante de renda, dados bancários ou número de cartão pelo chat.
-- Caso o cliente informe documentos pessoais ou dados sensíveis espontaneamente, NÃO repita esses dados e oriente que documentos cadastrais são tratados apenas presencialmente ou com o consultor autorizado no fechamento da negociação.
+- Solicite apenas **Nome** e **WhatsApp** quando necessário. É PROIBIDO pedir CPF, RG, CNH, endereço, renda ou dados bancários no chat.
 
 5. COMPREENSÃO DE ÁUDIO E FALLBACK HONESTO:
-- Quando a última mensagem do cliente vier de uma transcrição de áudio, responda normalmente ao pedido com base no estoque real e nas diretrizes comerciais acima.
-- Se a transcrição do áudio estiver cortada, fragmentada, sem sentido ou ambígua a ponto de não ser possível entender com segurança o que o cliente pediu, NÃO chute nem invente respostas: peça de forma direta e cordial para o cliente **enviar o áudio novamente** ou **escrever a mensagem por texto**.`;
+- Se a transcrição do áudio estiver incompleta, cortada ou inaudível, não chute: peça em 1 frase curta para reenviar o áudio ou escrever por texto.`;
 
-    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}${visitorContextLine}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}\n\nResponda à última mensagem do cliente de forma rápida, objetiva, cordial e em tópicos Markdown quando apropriado.`;
+    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}${visitorContextLine}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}\n\nResponda à última mensagem do cliente em no máximo 2 a 4 linhas curtas (ou até 3 tópicos breves), direto ao ponto e finalizando com 1 única pergunta curta.`;
 
     const chatConfig = {
       thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-      maxOutputTokens: 500,
+      maxOutputTokens: 360,
       systemInstruction,
     };
 
@@ -3189,6 +3612,7 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 
     if (!wantsStream) {
       let response;
+      let replyModelUsed = 'gemini-3.1-flash-lite';
       try {
         response = await callGeminiWithRetry(
           () =>
@@ -3203,6 +3627,7 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
         if (!parsedAudio || isNonFallbackGeminiError(chatErr)) {
           throw chatErr;
         }
+        replyModelUsed = 'gemini-2.5-flash';
         response = await ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: contentsPrompt,
@@ -3212,6 +3637,13 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
           },
         });
       }
+
+      recordAiUsageLog({
+        sessionId: auditSessionId,
+        feature: 'chat_text',
+        model: replyModelUsed,
+        usageMetadata: response.usageMetadata,
+      });
 
       const reply = response.text?.trim();
       if (!reply) {
@@ -3232,6 +3664,7 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
     }
 
     let stream;
+    let streamModelUsed = 'gemini-3.1-flash-lite';
     try {
       stream = await callGeminiWithRetry(
         () =>
@@ -3246,6 +3679,7 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       if (!parsedAudio || isNonFallbackGeminiError(streamErr)) {
         throw streamErr;
       }
+      streamModelUsed = 'gemini-2.5-flash';
       stream = await ai.models.generateContentStream({
         model: 'gemini-2.5-flash',
         contents: contentsPrompt,
@@ -3278,8 +3712,12 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
     });
 
     let fullText = '';
+    let lastStreamUsage: GeminiUsageMetadataLike | null = null;
     try {
       for await (const chunk of stream) {
+        if (chunk.usageMetadata) {
+          lastStreamUsage = chunk.usageMetadata;
+        }
         if (clientClosed) break;
         const delta = chunk.text;
         if (delta) {
@@ -3287,6 +3725,13 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
           res.write(`data: ${JSON.stringify({ type: 'chunk', text: delta })}\n\n`);
         }
       }
+
+      recordAiUsageLog({
+        sessionId: auditSessionId,
+        feature: 'chat_text',
+        model: streamModelUsed,
+        usageMetadata: lastStreamUsage,
+      });
 
       if (!clientClosed) {
         const trimmed = fullText.trim();
@@ -3328,6 +3773,177 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       );
       res.end();
     }
+  }
+});
+
+// ============================================================================
+// Private Owner-Only AI Token Usage Monitoring (100% Invisible to UI/Users)
+// ============================================================================
+
+app.get('/api/internal/ai-usage', async (req, res) => {
+  const configuredSecret = process.env.OWNER_SECRET_KEY?.trim();
+  if (!configuredSecret || configuredSecret === 'MY_OWNER_SECRET_KEY') {
+    res.status(503).json({
+      error:
+        'Endpoint privado indisponível: configure a variável de ambiente OWNER_SECRET_KEY.',
+    });
+    return;
+  }
+
+  if (!isValidOwnerSecret(req, configuredSecret)) {
+    res.status(401).json({ error: 'Não autorizado.' });
+    return;
+  }
+
+  try {
+    const [totalsRes, byFeatureRes, byModelRes] = await Promise.all([
+      pool.query<{
+        today_requests: string;
+        today_prompt_tokens: string;
+        today_completion_tokens: string;
+        today_total_tokens: string;
+        month_requests: string;
+        month_prompt_tokens: string;
+        month_completion_tokens: string;
+        month_total_tokens: string;
+        all_requests: string;
+        all_prompt_tokens: string;
+        all_completion_tokens: string;
+        all_total_tokens: string;
+      }>(
+        `SELECT
+           COUNT(*) FILTER (
+             WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date =
+                   (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
+           ) AS today_requests,
+           COALESCE(SUM(prompt_tokens) FILTER (
+             WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date =
+                   (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
+           ), 0) AS today_prompt_tokens,
+           COALESCE(SUM(completion_tokens) FILTER (
+             WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date =
+                   (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
+           ), 0) AS today_completion_tokens,
+           COALESCE(SUM(total_tokens) FILTER (
+             WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date =
+                   (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
+           ), 0) AS today_total_tokens,
+
+           COUNT(*) FILTER (
+             WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'America/Sao_Paulo') =
+                   DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Sao_Paulo')
+           ) AS month_requests,
+           COALESCE(SUM(prompt_tokens) FILTER (
+             WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'America/Sao_Paulo') =
+                   DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Sao_Paulo')
+           ), 0) AS month_prompt_tokens,
+           COALESCE(SUM(completion_tokens) FILTER (
+             WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'America/Sao_Paulo') =
+                   DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Sao_Paulo')
+           ), 0) AS month_completion_tokens,
+           COALESCE(SUM(total_tokens) FILTER (
+             WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'America/Sao_Paulo') =
+                   DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Sao_Paulo')
+           ), 0) AS month_total_tokens,
+
+           COUNT(*) AS all_requests,
+           COALESCE(SUM(prompt_tokens), 0) AS all_prompt_tokens,
+           COALESCE(SUM(completion_tokens), 0) AS all_completion_tokens,
+           COALESCE(SUM(total_tokens), 0) AS all_total_tokens
+         FROM ai_usage_logs`
+      ),
+      pool.query<{
+        feature: string;
+        requests: string;
+        prompt_tokens: string;
+        completion_tokens: string;
+        total_tokens: string;
+        today_total_tokens: string;
+        month_total_tokens: string;
+      }>(
+        `SELECT
+           feature,
+           COUNT(*) AS requests,
+           COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+           COALESCE(SUM(total_tokens), 0) AS total_tokens,
+           COALESCE(SUM(total_tokens) FILTER (
+             WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date =
+                   (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
+           ), 0) AS today_total_tokens,
+           COALESCE(SUM(total_tokens) FILTER (
+             WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'America/Sao_Paulo') =
+                   DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Sao_Paulo')
+           ), 0) AS month_total_tokens
+         FROM ai_usage_logs
+         GROUP BY feature
+         ORDER BY SUM(total_tokens) DESC`
+      ),
+      pool.query<{
+        model: string;
+        requests: string;
+        prompt_tokens: string;
+        completion_tokens: string;
+        total_tokens: string;
+      }>(
+        `SELECT
+           model,
+           COUNT(*) AS requests,
+           COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+           COALESCE(SUM(total_tokens), 0) AS total_tokens
+         FROM ai_usage_logs
+         GROUP BY model
+         ORDER BY SUM(total_tokens) DESC`
+      ),
+    ]);
+
+    const t = totalsRes.rows[0];
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      generatedAt: new Date().toISOString(),
+      timezone: 'America/Sao_Paulo',
+      today: {
+        requests: Number(t?.today_requests) || 0,
+        promptTokens: Number(t?.today_prompt_tokens) || 0,
+        completionTokens: Number(t?.today_completion_tokens) || 0,
+        totalTokens: Number(t?.today_total_tokens) || 0,
+      },
+      thisMonth: {
+        requests: Number(t?.month_requests) || 0,
+        promptTokens: Number(t?.month_prompt_tokens) || 0,
+        completionTokens: Number(t?.month_completion_tokens) || 0,
+        totalTokens: Number(t?.month_total_tokens) || 0,
+      },
+      allTime: {
+        requests: Number(t?.all_requests) || 0,
+        promptTokens: Number(t?.all_prompt_tokens) || 0,
+        completionTokens: Number(t?.all_completion_tokens) || 0,
+        totalTokens: Number(t?.all_total_tokens) || 0,
+      },
+      byFeature: byFeatureRes.rows.map((r) => ({
+        feature: r.feature,
+        requests: Number(r.requests) || 0,
+        promptTokens: Number(r.prompt_tokens) || 0,
+        completionTokens: Number(r.completion_tokens) || 0,
+        totalTokens: Number(r.total_tokens) || 0,
+        todayTokens: Number(r.today_total_tokens) || 0,
+        monthTokens: Number(r.month_total_tokens) || 0,
+      })),
+      byModel: byModelRes.rows.map((r) => ({
+        model: r.model,
+        requests: Number(r.requests) || 0,
+        promptTokens: Number(r.prompt_tokens) || 0,
+        completionTokens: Number(r.completion_tokens) || 0,
+        totalTokens: Number(r.total_tokens) || 0,
+      })),
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao consultar consumo interno de tokens da IA.';
+    res.status(500).json({ error: message });
   }
 });
 

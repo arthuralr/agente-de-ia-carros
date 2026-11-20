@@ -4,10 +4,12 @@ import {
   ChatAudioMeta,
   ChatMessage,
   ChatReplyContext,
+  ChatTriageStage,
   DealershipSettings,
   Lead,
   Vehicle,
 } from '../types';
+import { formatBrazilianPhone } from '../utils/chatTags';
 import { formatBRL, formatKm } from '../utils/formatters';
 import {
   clearLocalChatState,
@@ -36,23 +38,78 @@ export interface SendRichMessagePayload {
   replyTo?: ChatReplyContext | null;
 }
 
+export interface IncomingVisitorNotification {
+  id: string;
+  title: string;
+  body: string;
+}
+
+const LAST_BROADCAST_KEY_PREFIX = 'armazem_last_broadcast_id_';
+
 function createChatSessionId(): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `sess-${Date.now().toString(36)}-${rand}`;
 }
 
-function createWelcomeMessage(tradeName: string): ChatMessage {
-  const now = new Date().toLocaleTimeString('pt-BR', {
+function nowTimePt(): string {
+  return new Date().toLocaleTimeString('pt-BR', {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function createWelcomeMessage(tradeName: string): ChatMessage {
   return {
     id: `msg-ia-welcome-${Date.now()}`,
     sender: 'ia',
     text: `Olá! Sou o **Consultor Oficial** da **${tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
 
-Antes de começarmos, **como posso te chamar?** Se preferir, já pode tocar em uma opção abaixo ou **enviar sua dúvida por texto, áudio ou foto** direto!`,
-    timestamp: now,
+Como posso te ajudar hoje? Toque em uma opção abaixo ou **envie sua dúvida por texto, áudio ou foto** direto!`,
+    timestamp: nowTimePt(),
+  };
+}
+
+function createTriageAskNameMessage(tradeName: string): ChatMessage {
+  return {
+    id: `msg-ia-triage-name-${Date.now()}`,
+    sender: 'ia',
+    text: `Olá! Bem-vindo à **${tradeName}**. Para começarmos seu atendimento, qual é o seu **nome**?`,
+    timestamp: nowTimePt(),
+  };
+}
+
+function createTriageAskPhoneMessage(leadName: string): ChatMessage {
+  const firstName = getFirstName(leadName);
+  return {
+    id: `msg-ia-triage-phone-${Date.now()}`,
+    sender: 'ia',
+    text: `Prazer, **${firstName}**! Qual é o seu **WhatsApp com DDD** para contato e envio de simulações?
+
+_Ao informar seu número, você concorda com o contato comercial conforme nossa Política de Privacidade (LGPD)._`,
+    timestamp: nowTimePt(),
+  };
+}
+
+function createTriageInvalidPhoneMessage(leadName: string): ChatMessage {
+  const firstName = getFirstName(leadName);
+  return {
+    id: `msg-ia-triage-phone-retry-${Date.now()}`,
+    sender: 'ia',
+    text: `Não consegui identificar um WhatsApp válido com DDD, **${firstName}**. Pode enviar no formato **(11) 99999-9999**?`,
+    timestamp: nowTimePt(),
+  };
+}
+
+function createTriageCompleteMessage(
+  tradeName: string,
+  leadName: string
+): ChatMessage {
+  const firstName = getFirstName(leadName);
+  return {
+    id: `msg-ia-triage-complete-${Date.now()}`,
+    sender: 'ia',
+    text: `Perfeito, **${firstName}**! Cadastro confirmado. Como posso te ajudar hoje na **${tradeName}**? Escolha uma opção abaixo ou envie sua dúvida por texto, áudio ou foto:`,
+    timestamp: nowTimePt(),
   };
 }
 
@@ -68,33 +125,66 @@ function normalizeNameForComparison(name: string): string {
     .toLowerCase();
 }
 
-function createIdentifiedWelcomeMessage(
-  tradeName: string,
-  leadName: string
-): ChatMessage {
-  const now = new Date().toLocaleTimeString('pt-BR', {
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-  const firstName = getFirstName(leadName);
-  return {
-    id: `msg-ia-welcome-${Date.now()}`,
-    sender: 'ia',
-    text: `Olá, **${firstName}**! Seja bem-vindo(a) à **${tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
+function hasValidPhoneDigits(phone: string): boolean {
+  const digits = phone.replace(/\D/g, '');
+  return digits.length >= 10 && digits.length <= 13;
+}
 
-Como posso te ajudar hoje? Toque em uma opção abaixo ou **envie sua dúvida por texto, áudio ou foto** direto!`,
-    timestamp: now,
-  };
+function extractValidBrazilianPhone(raw: string): string | null {
+  let digits = raw.replace(/\D/g, '');
+  if (digits.startsWith('55') && (digits.length === 12 || digits.length === 13)) {
+    digits = digits.slice(2);
+  }
+  if (digits.length < 10 || digits.length > 11) {
+    return null;
+  }
+  // Reject obvious repeated fake sequences like 0000000000 or 11111111111
+  if (/^(\d)\1+$/.test(digits)) {
+    return null;
+  }
+  return formatBrazilianPhone(digits);
+}
+
+function extractTriageName(raw: string): string | null {
+  let cleaned = raw.replace(/\s+/g, ' ').trim();
+  if (!cleaned) return null;
+
+  cleaned = cleaned
+    .replace(
+      /^(?:ol[áa]|oi|bom\s+dia|boa\s+tarde|boa\s+noite)[,!.\s-]*/i,
+      ''
+    )
+    .replace(
+      /^(?:me\s+chamo|meu\s+nome\s+(?:é|e)|pode\s+me\s+chamar\s+de|aqui\s+(?:é|e)\s+(?:o|a)?|eu\s+sou\s+(?:o|a)?|sou\s+(?:o|a)?)\s+/i,
+      ''
+    )
+    .replace(/[!?.:,;]+$/g, '')
+    .trim();
+
+  // Reject messages that are mostly digits (e.g., phone entered instead of name)
+  const lettersOnly = cleaned.replace(/[^A-Za-zÀ-ÿ]/g, '');
+  if (lettersOnly.length < 2) return null;
+
+  const words = cleaned
+    .split(/\s+/)
+    .map((w) => w.replace(/[^A-Za-zÀ-ÿ'-]/g, ''))
+    .filter((w) => w.length >= 1);
+
+  if (words.length === 0) return null;
+
+  const formatted = words
+    .slice(0, 4)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ')
+    .slice(0, 80);
+
+  return formatted.replace(/[^A-Za-zÀ-ÿ]/g, '').length >= 2 ? formatted : null;
 }
 
 function createReturningWelcomeMessage(
   tradeName: string,
   leadName: string
 ): ChatMessage {
-  const now = new Date().toLocaleTimeString('pt-BR', {
-    hour: '2-digit',
-    minute: '2-digit',
-  });
   const firstName = getFirstName(leadName);
   return {
     id: `msg-ia-return-welcome-${Date.now()}`,
@@ -102,13 +192,12 @@ function createReturningWelcomeMessage(
     text: `Olá novamente, **${firstName}**! Que bom ter você de volta à **${tradeName}**.
 
 Em que posso ajudar hoje? Escolha uma opção rápida abaixo ou **envie sua dúvida por texto, áudio ou foto** direto!`,
-    timestamp: now,
+    timestamp: nowTimePt(),
   };
 }
 
 /**
- * Adapts restored chat history for a returning identified visitor:
- * - Removes any previous "como posso te chamar?" prompt from the opening bubble.
+ * Adapts restored chat history for a returning fully identified visitor:
  * - Shows a single personalized returning-visitor greeting with the Quick Menu
  *   alongside the preserved conversation history (never duplicating on repeated reloads).
  */
@@ -123,12 +212,12 @@ function personalizeRestoredHistory(
   const firstName = getFirstName(cleanLead);
   const returningBubble = createReturningWelcomeMessage(tradeName, cleanLead);
 
-  // Only a welcome bubble existed so far -> replace with personalized returning greeting
   if (
     history.length === 1 &&
     history[0].sender === 'ia' &&
     (history[0].id.startsWith('msg-ia-welcome') ||
-      history[0].id.startsWith('msg-ia-return-welcome'))
+      history[0].id.startsWith('msg-ia-return-welcome') ||
+      history[0].id.startsWith('msg-ia-triage-name'))
   ) {
     return [returningBubble];
   }
@@ -166,11 +255,6 @@ const SWITCH_NAME_BLOCKLIST = new Set([
   'simular', 'quero', 'preciso', 'gostaria', 'obrigado', 'obrigada',
 ]);
 
-/**
- * Detects when a visitor explicitly introduces a DIFFERENT person's name
- * (e.g., "Me chamo Camila" while browser was linked to "Pedro") so we isolate
- * the session and never mix conversations of different people.
- */
 function detectExplicitDifferentUserName(
   text: string,
   currentName: string
@@ -204,10 +288,6 @@ function detectExplicitDifferentUserName(
   return null;
 }
 
-/**
- * Strips heavy inline base64 media URLs before syncing to leads.chat_history,
- * since full audio/attachments are persisted in chat_messages.
- */
 function buildLightweightLeadHistory(transcript: ChatMessage[]): ChatMessage[] {
   return transcript.map((m) => ({
     id: m.id,
@@ -224,6 +304,30 @@ function buildLightweightLeadHistory(transcript: ChatMessage[]): ChatMessage[] {
     timestamp: m.timestamp,
     ...(m.replyTo ? { replyTo: m.replyTo } : {}),
   }));
+}
+
+function playSubtleChime(): void {
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(784, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1046, ctx.currentTime + 0.12);
+    gain.gain.setValueAtTime(0.05, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.24);
+  } catch {
+    // Ignore autoplay/audio restrictions
+  }
 }
 
 export function useVirtualConsultant({
@@ -257,22 +361,42 @@ export function useVirtualConsultant({
       loadLocalChatStateSync(persistStorageKey)?.customerWhatsapp || ''
     ).trim();
   });
-  const [isIdentifying, setIsIdentifying] = useState(false);
-  const [lgpdConsent, setLgpdConsent] = useState(false);
+  const [lgpdConsent, setLgpdConsent] = useState<boolean>(() => {
+    if (!persistStorageKey || targetVehicle) return false;
+    const savedPhone = (
+      loadLocalChatStateSync(persistStorageKey)?.customerWhatsapp || ''
+    ).trim();
+    return hasValidPhoneDigits(savedPhone);
+  });
   const [isSavingLead, setIsSavingLead] = useState(false);
   const [leadSaveError, setLeadSaveError] = useState<string | null>(null);
   const [leadSaved, setLeadSaved] = useState(false);
   const [persistedLeadId, setPersistedLeadId] = useState<string | null>(null);
+  const [incomingNotification, setIncomingNotification] =
+    useState<IncomingVisitorNotification | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const lastTriggerRef = useRef<string | null>(null);
   const persistedLeadIdRef = useRef<string | null>(null);
   const customerNameRef = useRef<string>(customerName);
+  const customerWhatsappRef = useRef<string>(customerWhatsapp);
   const abortControllerRef = useRef<AbortController | null>(null);
   const sessionIdRef = useRef<string>(createChatSessionId());
   const storageReadyRef = useRef<boolean>(false);
   const storageVersionRef = useRef<number>(0);
   const userMutatedRef = useRef<boolean>(false);
+  const lastConsultantMsgIdRef = useRef<number>(0);
+  const lastBroadcastIdRef = useRef<number>(0);
+
+  // Derived 2-step conversational triage stage (active only for standalone /chat)
+  const triageStage: ChatTriageStage =
+    !persistStorageKey || targetVehicle
+      ? 'complete'
+      : customerName.trim().length < 2
+        ? 'ask_name'
+        : !hasValidPhoneDigits(customerWhatsapp)
+          ? 'ask_phone'
+          : 'complete';
 
   useEffect(() => {
     persistedLeadIdRef.current = persistedLeadId;
@@ -281,6 +405,10 @@ export function useVirtualConsultant({
   useEffect(() => {
     customerNameRef.current = customerName;
   }, [customerName]);
+
+  useEffect(() => {
+    customerWhatsappRef.current = customerWhatsapp;
+  }, [customerWhatsapp]);
 
   useEffect(() => {
     if (!active) {
@@ -295,6 +423,30 @@ export function useVirtualConsultant({
   const clearReply = useCallback(() => {
     setReplyingTo(null);
   }, []);
+
+  const dismissIncomingNotification = useCallback(() => {
+    setIncomingNotification(null);
+  }, []);
+
+  const syncVisitorIdentityToServer = useCallback(
+    async (leadName: string, leadPhone?: string) => {
+      try {
+        await fetch('/api/public/chat-session/identify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: sessionIdRef.current,
+            leadName,
+            leadPhone: leadPhone || undefined,
+            origem: originLabel,
+          }),
+        });
+      } catch {
+        // Silent fallback if offline; local state still persists
+      }
+    },
+    [originLabel]
+  );
 
   const sendMessageToAi = useCallback(
     async (
@@ -428,10 +580,7 @@ export function useVirtualConsultant({
         }
 
         const aiMsgId = `msg-ia-${Date.now()}`;
-        const aiTimestamp = new Date().toLocaleTimeString('pt-BR', {
-          hour: '2-digit',
-          minute: '2-digit',
-        });
+        const aiTimestamp = nowTimePt();
 
         let workingMessages = nextMessages;
         const applyTranscriptionToUserMsg = (transcription: string) => {
@@ -635,15 +784,11 @@ export function useVirtualConsultant({
       persistedLeadIdRef.current = null;
       setErrorMsg(null);
 
-      const now = new Date().toLocaleTimeString('pt-BR', {
-        hour: '2-digit',
-        minute: '2-digit',
-      });
       const autoUserMsg: ChatMessage = {
         id: `msg-cli-${Date.now()}`,
         sender: 'cliente',
         text: `Olá! Tenho interesse no **${targetVehicle.brand} ${targetVehicle.model} ${targetVehicle.version}** (**${targetVehicle.year}** · **${formatBRL(targetVehicle.price)}**). Ele está disponível para visita e financiamento?`,
-        timestamp: now,
+        timestamp: nowTimePt(),
       };
       setMessages([autoUserMsg]);
       void sendMessageToAi([autoUserMsg], targetVehicle, {
@@ -654,36 +799,74 @@ export function useVirtualConsultant({
 
     if (persistStorageKey) {
       const savedSync = loadLocalChatStateSync(persistStorageKey);
-      let activeSessionId: string;
-      let initialKnownName = '';
+
+      // Initialize last seen broadcast ID so historical broadcasts don't duplicate
+      try {
+        const storedBroadcastId = Number(
+          window.localStorage.getItem(
+            `${LAST_BROADCAST_KEY_PREFIX}${persistStorageKey}`
+          ) || '0'
+        );
+        lastBroadcastIdRef.current = Number.isFinite(storedBroadcastId)
+          ? storedBroadcastId
+          : 0;
+      } catch {
+        lastBroadcastIdRef.current = 0;
+      }
 
       if (savedSync && savedSync.messages.length > 0) {
-        activeSessionId = savedSync.sessionId;
         sessionIdRef.current = savedSync.sessionId;
-        initialKnownName = (savedSync.customerName || '').trim();
+        const initialKnownName = (savedSync.customerName || '').trim();
+        const initialKnownPhone = (savedSync.customerWhatsapp || '').trim();
+        const isFullyIdentified =
+          initialKnownName.length >= 2 && hasValidPhoneDigits(initialKnownPhone);
 
-        const restoredMessages = initialKnownName
-          ? personalizeRestoredHistory(
-              savedSync.messages,
-              settings.tradeName,
-              initialKnownName
-            )
-          : savedSync.messages;
+        // Track highest dbId already restored in local history
+        const maxRestoredDbId = savedSync.messages.reduce(
+          (max, m) => (m.dbId && m.dbId > max ? m.dbId : max),
+          0
+        );
+        lastConsultantMsgIdRef.current = maxRestoredDbId;
+
+        let restoredMessages: ChatMessage[];
+        if (isFullyIdentified) {
+          restoredMessages = personalizeRestoredHistory(
+            savedSync.messages,
+            settings.tradeName,
+            initialKnownName
+          );
+        } else if (initialKnownName.length >= 2) {
+          const lastMsg = savedSync.messages[savedSync.messages.length - 1];
+          const alreadyAskingPhone =
+            lastMsg?.sender === 'ia' &&
+            lastMsg.id.startsWith('msg-ia-triage-phone');
+          restoredMessages = alreadyAskingPhone
+            ? savedSync.messages
+            : [
+                ...savedSync.messages,
+                createTriageAskPhoneMessage(initialKnownName),
+              ];
+        } else {
+          // No name saved yet -> start clean 2-step triage
+          restoredMessages = [createTriageAskNameMessage(settings.tradeName)];
+        }
 
         setMessages(restoredMessages);
         setLeadSaved(Boolean(savedSync.leadSaved));
         setPersistedLeadId(savedSync.persistedLeadId ?? null);
         persistedLeadIdRef.current = savedSync.persistedLeadId ?? null;
         customerNameRef.current = initialKnownName;
+        customerWhatsappRef.current = initialKnownPhone;
         setCustomerName(initialKnownName);
-        setCustomerWhatsapp(savedSync.customerWhatsapp || '');
+        setCustomerWhatsapp(initialKnownPhone);
+        setLgpdConsent(hasValidPhoneDigits(initialKnownPhone));
         setLeadSaveError(null);
         setReplyingTo(null);
         setErrorMsg(null);
         storageReadyRef.current = true;
       } else {
-        activeSessionId = createChatSessionId();
-        sessionIdRef.current = activeSessionId;
+        sessionIdRef.current = createChatSessionId();
+        lastConsultantMsgIdRef.current = 0;
         setLeadSaved(false);
         setLeadSaveError(null);
         setLgpdConsent(false);
@@ -691,10 +874,11 @@ export function useVirtualConsultant({
         setReplyingTo(null);
         persistedLeadIdRef.current = null;
         customerNameRef.current = '';
+        customerWhatsappRef.current = '';
         setCustomerName('');
         setCustomerWhatsapp('');
         setErrorMsg(null);
-        setMessages([createWelcomeMessage(settings.tradeName)]);
+        setMessages([createTriageAskNameMessage(settings.tradeName)]);
         storageReadyRef.current = true;
       }
 
@@ -713,41 +897,51 @@ export function useVirtualConsultant({
           savedAsync.customerName ||
           ''
         ).trim();
+        const resolvedPhone = (
+          customerWhatsappRef.current ||
+          savedAsync.customerWhatsapp ||
+          ''
+        ).trim();
+        const isFullyIdentified =
+          resolvedName.length >= 2 && hasValidPhoneDigits(resolvedPhone);
+
+        const maxAsyncDbId = savedAsync.messages.reduce(
+          (max, m) => (m.dbId && m.dbId > max ? m.dbId : max),
+          lastConsultantMsgIdRef.current
+        );
+        lastConsultantMsgIdRef.current = maxAsyncDbId;
 
         if (savedSync) {
           if (
             savedAsync.sessionId === savedSync.sessionId &&
-            savedAsync.messages.length >= savedSync.messages.length
+            savedAsync.messages.length >= savedSync.messages.length &&
+            isFullyIdentified
           ) {
-            const hydrated = resolvedName
-              ? personalizeRestoredHistory(
-                  savedAsync.messages,
-                  settings.tradeName,
-                  resolvedName
-                )
-              : savedAsync.messages;
-            setMessages(hydrated);
-            if (resolvedName && !customerNameRef.current) {
-              customerNameRef.current = resolvedName;
-              setCustomerName(resolvedName);
-            }
-          }
-        } else {
-          sessionIdRef.current = savedAsync.sessionId;
-          const hydrated = resolvedName
-            ? personalizeRestoredHistory(
+            setMessages(
+              personalizeRestoredHistory(
                 savedAsync.messages,
                 settings.tradeName,
                 resolvedName
               )
-            : savedAsync.messages;
-          setMessages(hydrated);
+            );
+          }
+        } else if (isFullyIdentified) {
+          sessionIdRef.current = savedAsync.sessionId;
+          setMessages(
+            personalizeRestoredHistory(
+              savedAsync.messages,
+              settings.tradeName,
+              resolvedName
+            )
+          );
           setLeadSaved(Boolean(savedAsync.leadSaved));
           setPersistedLeadId(savedAsync.persistedLeadId ?? null);
           persistedLeadIdRef.current = savedAsync.persistedLeadId ?? null;
           customerNameRef.current = resolvedName;
+          customerWhatsappRef.current = resolvedPhone;
           setCustomerName(resolvedName);
-          setCustomerWhatsapp(savedAsync.customerWhatsapp || '');
+          setCustomerWhatsapp(resolvedPhone);
+          setLgpdConsent(true);
         }
       });
 
@@ -775,16 +969,30 @@ export function useVirtualConsultant({
               }
               const serverName = data.leadName?.trim() || '';
               const serverPhone = data.leadPhone?.trim() || '';
+              const finalName = customerNameRef.current.trim() || serverName;
+              const finalPhone =
+                customerWhatsappRef.current.trim() || serverPhone;
+
               if (serverName && !customerNameRef.current.trim()) {
                 customerNameRef.current = serverName;
                 setCustomerName(serverName);
-                setMessages((prev) =>
-                  personalizeRestoredHistory(prev, settings.tradeName, serverName)
-                );
               }
-              if (serverPhone) {
-                setCustomerWhatsapp((prev) => prev || serverPhone);
-                setLeadSaved(true);
+              if (serverPhone && !customerWhatsappRef.current.trim()) {
+                customerWhatsappRef.current = serverPhone;
+                setCustomerWhatsapp(serverPhone);
+                if (hasValidPhoneDigits(serverPhone)) {
+                  setLgpdConsent(true);
+                }
+              }
+              if (
+                finalName.length >= 2 &&
+                hasValidPhoneDigits(finalPhone) &&
+                (!customerNameRef.current.trim() ||
+                  !hasValidPhoneDigits(customerWhatsappRef.current))
+              ) {
+                setMessages((prev) =>
+                  personalizeRestoredHistory(prev, settings.tradeName, finalName)
+                );
               }
             }
           )
@@ -845,6 +1053,156 @@ export function useVirtualConsultant({
     targetVehicle,
   ]);
 
+  // Lightweight polling for live Consultant Messages & Store Broadcasts on /chat
+  useEffect(() => {
+    if (!active || !persistStorageKey || targetVehicle) return;
+
+    let cancelled = false;
+    const pollUpdates = async () => {
+      const currentSession = sessionIdRef.current;
+      if (!currentSession || cancelled) return;
+      try {
+        const res = await fetch(
+          `/api/public/chat-session/${encodeURIComponent(
+            currentSession
+          )}/updates?afterMessageId=${lastConsultantMsgIdRef.current}&afterBroadcastId=${lastBroadcastIdRef.current}`
+        );
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          consultantMessages?: Array<{
+            id: number;
+            content: string;
+            senderLabel: string;
+            createdAt: string;
+          }>;
+          broadcasts?: Array<{
+            id: number;
+            title: string | null;
+            message: string;
+            createdBy: string | null;
+            createdAt: string;
+          }>;
+        };
+
+        const newConsultantMsgs = Array.isArray(data.consultantMessages)
+          ? data.consultantMessages
+          : [];
+        const newBroadcasts = Array.isArray(data.broadcasts)
+          ? data.broadcasts
+          : [];
+
+        if (newConsultantMsgs.length === 0 && newBroadcasts.length === 0) {
+          return;
+        }
+
+        const appendedBubbles: ChatMessage[] = [];
+        let latestToast: IncomingVisitorNotification | null = null;
+
+        for (const cm of newConsultantMsgs) {
+          if (cm.id > lastConsultantMsgIdRef.current) {
+            lastConsultantMsgIdRef.current = cm.id;
+          }
+          appendedBubbles.push({
+            id: `msg-consultant-${cm.id}`,
+            dbId: cm.id,
+            sender: 'ia',
+            text: cm.content,
+            timestamp: new Date(cm.createdAt).toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            isHumanConsultant: true,
+            senderLabel: cm.senderLabel || 'Consultor da Loja',
+          });
+          latestToast = {
+            id: `toast-cm-${cm.id}`,
+            title: cm.senderLabel || `Consultor · ${settings.tradeName}`,
+            body: cm.content.slice(0, 140),
+          };
+        }
+
+        for (const bc of newBroadcasts) {
+          if (bc.id > lastBroadcastIdRef.current) {
+            lastBroadcastIdRef.current = bc.id;
+          }
+          const formattedText = bc.title
+            ? `**${bc.title}**\n\n${bc.message}`
+            : bc.message;
+          appendedBubbles.push({
+            id: `msg-broadcast-${bc.id}`,
+            broadcastId: bc.id,
+            sender: 'ia',
+            text: formattedText,
+            timestamp: new Date(bc.createdAt).toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            isHumanConsultant: true,
+            senderLabel: bc.title || `Aviso · ${settings.tradeName}`,
+          });
+          latestToast = {
+            id: `toast-bc-${bc.id}`,
+            title: bc.title || `Aviso da ${settings.tradeName}`,
+            body: bc.message.slice(0, 140),
+          };
+        }
+
+        if (lastBroadcastIdRef.current > 0) {
+          try {
+            window.localStorage.setItem(
+              `${LAST_BROADCAST_KEY_PREFIX}${persistStorageKey}`,
+              String(lastBroadcastIdRef.current)
+            );
+          } catch {
+            // Ignore storage errors
+          }
+        }
+
+        if (appendedBubbles.length > 0 && !cancelled) {
+          userMutatedRef.current = true;
+          setMessages((prev) => {
+            const existingIds = new Set(prev.map((m) => m.id));
+            const uniqueNew = appendedBubbles.filter(
+              (m) => !existingIds.has(m.id)
+            );
+            if (uniqueNew.length === 0) return prev;
+            return [...prev, ...uniqueNew];
+          });
+
+          if (latestToast) {
+            setIncomingNotification(latestToast);
+            playSubtleChime();
+            if (
+              typeof window !== 'undefined' &&
+              'Notification' in window &&
+              Notification.permission === 'granted' &&
+              document.hidden
+            ) {
+              try {
+                new Notification(latestToast.title, {
+                  body: latestToast.body,
+                  icon: '/pwa-192x192.png',
+                });
+              } catch {
+                // Ignore browser notification exceptions
+              }
+            }
+          }
+        }
+      } catch {
+        // Silent polling failure
+      }
+    };
+
+    const initialTimeout = window.setTimeout(() => void pollUpdates(), 2500);
+    const intervalId = window.setInterval(() => void pollUpdates(), 8000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(initialTimeout);
+      window.clearInterval(intervalId);
+    };
+  }, [active, persistStorageKey, settings.tradeName, targetVehicle]);
+
   const resetConversation = useCallback(() => {
     abortControllerRef.current?.abort();
     storageVersionRef.current += 1;
@@ -855,6 +1213,7 @@ export function useVirtualConsultant({
     }
 
     sessionIdRef.current = createChatSessionId();
+    lastConsultantMsgIdRef.current = 0;
     setIsSending(false);
     setIsProcessingAudio(false);
     setActiveAudioMessageId(null);
@@ -862,100 +1221,23 @@ export function useVirtualConsultant({
     setInput('');
     setReplyingTo(null);
     setErrorMsg(null);
+    setIncomingNotification(null);
     setLeadSaved(false);
     setLeadSaveError(null);
     setLgpdConsent(false);
     setPersistedLeadId(null);
     persistedLeadIdRef.current = null;
     customerNameRef.current = '';
+    customerWhatsappRef.current = '';
     setCustomerName('');
     setCustomerWhatsapp('');
-    setMessages([createWelcomeMessage(settings.tradeName)]);
+    setMessages([
+      persistStorageKey
+        ? createTriageAskNameMessage(settings.tradeName)
+        : createWelcomeMessage(settings.tradeName),
+    ]);
     storageReadyRef.current = true;
   }, [persistStorageKey, settings.tradeName]);
-
-  const completeInitialIdentification = useCallback(
-    async (rawName: string, rawPhone?: string): Promise<void> => {
-      const cleanName = rawName.replace(/\s+/g, ' ').trim().slice(0, 120);
-      if (cleanName.length < 2) return;
-
-      const cleanPhone = (rawPhone || '').trim().slice(0, 40);
-      const phoneDigits = cleanPhone.replace(/\D/g, '');
-      const validPhone = phoneDigits.length >= 8 ? cleanPhone : '';
-
-      setIsIdentifying(true);
-      try {
-        try {
-          await fetch('/api/public/chat-session/identify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId: sessionIdRef.current,
-              leadName: cleanName,
-              leadPhone: validPhone || undefined,
-              origem: originLabel,
-            }),
-          });
-        } catch {
-          // Graceful fallback if offline; local state still persists
-        }
-
-        userMutatedRef.current = true;
-        customerNameRef.current = cleanName;
-        setCustomerName(cleanName);
-        if (validPhone) {
-          setCustomerWhatsapp(validPhone);
-        }
-
-        const personalizedWelcome = createIdentifiedWelcomeMessage(
-          settings.tradeName,
-          cleanName
-        );
-        let nextMessagesForStorage: ChatMessage[] = [personalizedWelcome];
-
-        setMessages((prev) => {
-          if (
-            prev.length === 0 ||
-            (prev.length === 1 &&
-              prev[0].sender === 'ia' &&
-              prev[0].id.startsWith('msg-ia-welcome'))
-          ) {
-            nextMessagesForStorage = [personalizedWelcome];
-            return nextMessagesForStorage;
-          }
-          nextMessagesForStorage = prev;
-          return prev;
-        });
-
-        if (persistStorageKey && !targetVehicle) {
-          saveLocalChatState(persistStorageKey, {
-            version: 1,
-            sessionId: sessionIdRef.current,
-            messages: nextMessagesForStorage,
-            leadSaved,
-            persistedLeadId: persistedLeadIdRef.current,
-            customerName: cleanName,
-            customerWhatsapp: validPhone || customerWhatsapp,
-            updatedAt: Date.now(),
-          });
-        }
-      } finally {
-        setIsIdentifying(false);
-      }
-    },
-    [
-      customerWhatsapp,
-      leadSaved,
-      originLabel,
-      persistStorageKey,
-      settings.tradeName,
-      targetVehicle,
-    ]
-  );
-
-  const needsInitialIdentification = Boolean(
-    persistStorageKey && !targetVehicle && !customerName.trim()
-  );
 
   const sendRichMessage = useCallback(
     (payload: SendRichMessagePayload) => {
@@ -973,17 +1255,93 @@ export function useVirtualConsultant({
         id: userMsgId,
         sender: 'cliente',
         text: trimmedText,
-        timestamp: new Date().toLocaleTimeString('pt-BR', {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
+        timestamp: nowTimePt(),
         ...(effectiveReply ? { replyTo: effectiveReply } : {}),
         ...(payload.audio ? { audio: payload.audio } : {}),
         ...(payload.attachment ? { attachment: payload.attachment } : {}),
       };
 
+      // 2-Step Conversational Triage (Zero Gemini tokens consumed!)
+      if (persistStorageKey && !targetVehicle && triageStage !== 'complete') {
+        userMutatedRef.current = true;
+        setInput('');
+        setReplyingTo(null);
+
+        if (triageStage === 'ask_name') {
+          const extractedName = extractTriageName(trimmedText);
+          if (!extractedName) {
+            const retryBubble: ChatMessage = {
+              id: `msg-ia-triage-name-retry-${Date.now()}`,
+              sender: 'ia',
+              text: 'Para começarmos, pode digitar apenas o seu **nome**?',
+              timestamp: nowTimePt(),
+            };
+            const nextMsgs = [...messages, userMsg, retryBubble];
+            setMessages(nextMsgs);
+            return;
+          }
+
+          customerNameRef.current = extractedName;
+          setCustomerName(extractedName);
+          void syncVisitorIdentityToServer(extractedName);
+
+          const askPhoneBubble = createTriageAskPhoneMessage(extractedName);
+          const nextMsgs = [...messages, userMsg, askPhoneBubble];
+          setMessages(nextMsgs);
+          saveLocalChatState(persistStorageKey, {
+            version: 1,
+            sessionId: sessionIdRef.current,
+            messages: nextMsgs,
+            leadSaved,
+            persistedLeadId: persistedLeadIdRef.current,
+            customerName: extractedName,
+            customerWhatsapp: customerWhatsappRef.current,
+            updatedAt: Date.now(),
+          });
+          return;
+        }
+
+        if (triageStage === 'ask_phone') {
+          const validPhone = extractValidBrazilianPhone(trimmedText);
+          if (!validPhone) {
+            const retryPhoneBubble = createTriageInvalidPhoneMessage(
+              customerNameRef.current || 'visitante'
+            );
+            const nextMsgs = [...messages, userMsg, retryPhoneBubble];
+            setMessages(nextMsgs);
+            return;
+          }
+
+          customerWhatsappRef.current = validPhone;
+          setCustomerWhatsapp(validPhone);
+          setLgpdConsent(true);
+          void syncVisitorIdentityToServer(
+            customerNameRef.current,
+            validPhone
+          );
+
+          const completeBubble = createTriageCompleteMessage(
+            settings.tradeName,
+            customerNameRef.current
+          );
+          const nextMsgs = [...messages, userMsg, completeBubble];
+          setMessages(nextMsgs);
+          saveLocalChatState(persistStorageKey, {
+            version: 1,
+            sessionId: sessionIdRef.current,
+            messages: nextMsgs,
+            leadSaved,
+            persistedLeadId: persistedLeadIdRef.current,
+            customerName: customerNameRef.current,
+            customerWhatsapp: validPhone,
+            updatedAt: Date.now(),
+          });
+          return;
+        }
+      }
+
       // If another person explicitly introduces a different name in the same browser,
-      // clear the previous identity link and isolate into a brand-new session_id.
+      // isolate into a brand-new session_id and ask for their WhatsApp cleanly.
       const switchedUserName =
         persistStorageKey && !targetVehicle && trimmedText
           ? detectExplicitDifferentUserName(trimmedText, customerNameRef.current)
@@ -993,7 +1351,7 @@ export function useVirtualConsultant({
       let effectiveCustomerName = customerNameRef.current;
       let effectiveLeadSaved = leadSaved;
       let effectivePersistedLeadId = persistedLeadIdRef.current;
-      let effectiveCustomerWhatsapp = customerWhatsapp;
+      let effectiveCustomerWhatsapp = customerWhatsappRef.current;
 
       if (switchedUserName) {
         if (persistStorageKey) {
@@ -1001,12 +1359,14 @@ export function useVirtualConsultant({
         }
         storageVersionRef.current += 1;
         sessionIdRef.current = createChatSessionId();
+        lastConsultantMsgIdRef.current = 0;
         effectiveCustomerName = switchedUserName;
         effectiveLeadSaved = false;
         effectivePersistedLeadId = null;
         effectiveCustomerWhatsapp = '';
 
         customerNameRef.current = switchedUserName;
+        customerWhatsappRef.current = '';
         persistedLeadIdRef.current = null;
         setCustomerName(switchedUserName);
         setCustomerWhatsapp('');
@@ -1015,14 +1375,33 @@ export function useVirtualConsultant({
         setLgpdConsent(false);
         setPersistedLeadId(null);
 
+        void syncVisitorIdentityToServer(switchedUserName);
+        const askPhoneBubble = createTriageAskPhoneMessage(switchedUserName);
         nextMessages = [
-          createWelcomeMessage(settings.tradeName),
+          createTriageAskNameMessage(settings.tradeName),
           { ...userMsg, replyTo: undefined },
+          askPhoneBubble,
         ];
-      } else {
-        nextMessages = [...messages, userMsg];
+        userMutatedRef.current = true;
+        setMessages(nextMessages);
+        setInput('');
+        setReplyingTo(null);
+        if (persistStorageKey) {
+          saveLocalChatState(persistStorageKey, {
+            version: 1,
+            sessionId: sessionIdRef.current,
+            messages: nextMessages,
+            leadSaved: false,
+            persistedLeadId: null,
+            customerName: switchedUserName,
+            customerWhatsapp: '',
+            updatedAt: Date.now(),
+          });
+        }
+        return;
       }
 
+      nextMessages = [...messages, userMsg];
       userMutatedRef.current = true;
       setMessages(nextMessages);
       setInput('');
@@ -1050,13 +1429,12 @@ export function useVirtualConsultant({
 
       void sendMessageToAi(nextMessages, targetVehicle, {
         userMessageId: userMsgId,
-        replyTo: switchedUserName ? null : (effectiveReply ?? null),
+        replyTo: effectiveReply ?? null,
         audio: payload.audio ?? null,
         attachment: payload.attachment ?? null,
       });
     },
     [
-      customerWhatsapp,
       isSending,
       leadSaved,
       messages,
@@ -1065,7 +1443,9 @@ export function useVirtualConsultant({
       replyingTo,
       sendMessageToAi,
       settings.tradeName,
+      syncVisitorIdentityToServer,
       targetVehicle,
+      triageStage,
     ]
   );
 
@@ -1170,9 +1550,9 @@ export function useVirtualConsultant({
     setCustomerName,
     customerWhatsapp,
     setCustomerWhatsapp,
-    needsInitialIdentification,
-    isIdentifying,
-    completeInitialIdentification,
+    triageStage,
+    incomingNotification,
+    dismissIncomingNotification,
     lgpdConsent,
     setLgpdConsent,
     isSavingLead,

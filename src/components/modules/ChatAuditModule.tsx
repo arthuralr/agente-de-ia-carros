@@ -12,9 +12,11 @@ import {
   ExternalLink,
   Eye,
   FileText,
+  Headset,
   Image as ImageIcon,
   Kanban,
   Loader2,
+  Megaphone,
   MessageCircle,
   MessageSquareText,
   Mic,
@@ -23,6 +25,7 @@ import {
   RefreshCw,
   Reply,
   Search,
+  Send,
   Sparkles,
   Tag,
   User,
@@ -30,6 +33,7 @@ import {
 } from 'lucide-react';
 import {
   ChatAuditMessage,
+  ChatBroadcastRecord,
   ChatSessionSummary,
   DealershipSettings,
   Lead,
@@ -49,6 +53,8 @@ interface ChatAuditModuleProps {
   onUnauthorized: () => void;
   onLeadSyncedFromChat?: (lead: Lead, action: 'created' | 'updated') => void;
   onOpenCrm?: (leadId?: string) => void;
+  preselectedSessionId?: string | null;
+  onClearPreselectedSession?: () => void;
 }
 
 interface AttachmentPreviewModalState {
@@ -134,13 +140,15 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
   onUnauthorized,
   onLeadSyncedFromChat,
   onOpenCrm,
+  preselectedSessionId,
+  onClearPreselectedSession,
 }) => {
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
 
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
-    null
+    preselectedSessionId || null
   );
   const [messages, setMessages] = useState<ChatAuditMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -174,6 +182,27 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
     message: string;
     leadId?: string;
   } | null>(null);
+
+  // Consultant direct message to visitor (/chat)
+  const [consultantDraft, setConsultantDraft] = useState('');
+  const [sendingConsultantMsg, setSendingConsultantMsg] = useState(false);
+  const [consultantMsgFeedback, setConsultantMsgFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+
+  // Global notice / quick campaign broadcast to all active /chat visitors
+  const [broadcastModalOpen, setBroadcastModalOpen] = useState(false);
+  const [broadcastTitle, setBroadcastTitle] = useState('');
+  const [broadcastMessage, setBroadcastMessage] = useState('');
+  const [sendingBroadcast, setSendingBroadcast] = useState(false);
+  const [broadcastFeedback, setBroadcastFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+  const [recentBroadcasts, setRecentBroadcasts] = useState<
+    ChatBroadcastRecord[]
+  >([]);
 
   const createdBlobUrlsRef = useRef<string[]>([]);
 
@@ -363,7 +392,15 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
   }, [fetchSessions]);
 
   useEffect(() => {
+    if (preselectedSessionId) {
+      setSelectedSessionId(preselectedSessionId);
+      onClearPreselectedSession?.();
+    }
+  }, [preselectedSessionId, onClearPreselectedSession]);
+
+  useEffect(() => {
     if (selectedSessionId) {
+      setConsultantMsgFeedback(null);
       void fetchSessionMessages(selectedSessionId);
     } else {
       setMessages([]);
@@ -570,6 +607,130 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
     }));
   };
 
+  const handleSendConsultantMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeSession || sendingConsultantMsg) return;
+    const text = consultantDraft.trim();
+    if (!text) return;
+
+    setSendingConsultantMsg(true);
+    setConsultantMsgFeedback(null);
+    try {
+      const res = await adminFetch(
+        `/api/admin/chat-sessions/${encodeURIComponent(
+          activeSession.sessionId
+        )}/consultant-message`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text }),
+        }
+      );
+      if (res.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(
+          err.error || 'Não foi possível enviar a notificação ao visitante.'
+        );
+      }
+
+      const created = (await res.json()) as ChatAuditMessage;
+      setMessages((prev) => [...prev, created]);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.sessionId === activeSession.sessionId
+            ? {
+                ...s,
+                messageCount: s.messageCount + 1,
+                lastMessage: created.content,
+                lastSender: 'assistant',
+                updatedAt: created.createdAt,
+              }
+            : s
+        )
+      );
+      setConsultantDraft('');
+      setConsultantMsgFeedback({
+        type: 'success',
+        text: 'Mensagem entregue ao chat do visitante!',
+      });
+    } catch (err: unknown) {
+      setConsultantMsgFeedback({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Erro ao enviar mensagem do consultor.',
+      });
+    } finally {
+      setSendingConsultantMsg(false);
+    }
+  };
+
+  const openBroadcastModal = async () => {
+    setBroadcastModalOpen(true);
+    setBroadcastFeedback(null);
+    try {
+      const res = await adminFetch('/api/admin/chat-broadcasts');
+      if (res.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      if (res.ok) {
+        const rows = (await res.json()) as ChatBroadcastRecord[];
+        setRecentBroadcasts(Array.isArray(rows) ? rows : []);
+      }
+    } catch {
+      // Ignore list errors
+    }
+  };
+
+  const handlePublishBroadcast = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (sendingBroadcast || !broadcastMessage.trim()) return;
+    setSendingBroadcast(true);
+    setBroadcastFeedback(null);
+    try {
+      const res = await adminFetch('/api/admin/chat-broadcasts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: broadcastTitle.trim() || 'Aviso da Loja',
+          message: broadcastMessage.trim(),
+        }),
+      });
+      if (res.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(err.error || 'Erro ao enviar aviso para o /chat.');
+      }
+      const created = (await res.json()) as ChatBroadcastRecord;
+      setRecentBroadcasts((prev) => [created, ...prev]);
+      setBroadcastTitle('');
+      setBroadcastMessage('');
+      setBroadcastFeedback({
+        type: 'success',
+        text: 'Aviso enviado para os visitantes ativos no /chat!',
+      });
+    } catch (err: unknown) {
+      setBroadcastFeedback({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Falha ao publicar aviso global.',
+      });
+    } finally {
+      setSendingBroadcast(false);
+    }
+  };
+
   return (
     <div className="space-y-5">
       {/* Toolbar */}
@@ -604,17 +765,28 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={() => void fetchSessions()}
-          disabled={loadingSessions}
-          className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-medium text-zinc-200 bg-[#111114] hover:bg-white/[0.06] border border-white/[0.08] transition-colors whitespace-nowrap shrink-0 disabled:opacity-60"
-        >
-          <RefreshCw
-            className={`w-3.5 h-3.5 ${loadingSessions ? 'animate-spin' : ''}`}
-          />
-          <span>Atualizar Conversas</span>
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => void openBroadcastModal()}
+            className="inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium text-emerald-200 bg-emerald-600/15 hover:bg-emerald-600/25 border border-emerald-500/35 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Megaphone className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Enviar Aviso (/chat)</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void fetchSessions()}
+            disabled={loadingSessions}
+            className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-medium text-zinc-200 bg-[#111114] hover:bg-white/[0.06] border border-white/[0.08] transition-colors whitespace-nowrap shrink-0 disabled:opacity-60"
+          >
+            <RefreshCw
+              className={`w-3.5 h-3.5 ${loadingSessions ? 'animate-spin' : ''}`}
+            />
+            <span>Atualizar Conversas</span>
+          </button>
+        </div>
       </div>
 
       {sessionsError && (
@@ -1050,10 +1222,19 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                       >
                         <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 mb-1">
                           {isAssistant ? (
-                            <>
-                              <Bot className="w-3 h-3 text-red-500" />
-                              <span>{settings.aiAssistantName}</span>
-                            </>
+                            msg.isHumanConsultant ? (
+                              <>
+                                <Headset className="w-3 h-3 text-emerald-400" />
+                                <span className="text-emerald-300 font-medium">
+                                  {msg.senderLabel || 'Consultor da Loja'}
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <Bot className="w-3 h-3 text-red-500" />
+                                <span>{settings.aiAssistantName}</span>
+                              </>
+                            )
                           ) : (
                             <>
                               <User className="w-3 h-3 text-zinc-400" />
@@ -1071,7 +1252,9 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                         <div
                           className={`max-w-[88%] rounded-xl px-4 py-3 space-y-2.5 ${
                             isAssistant
-                              ? 'bg-[#18181C] text-zinc-200 border border-white/[0.08]'
+                              ? msg.isHumanConsultant
+                                ? 'bg-emerald-950/35 text-zinc-100 border border-emerald-500/40'
+                                : 'bg-[#18181C] text-zinc-200 border border-white/[0.08]'
                               : 'bg-emerald-950/50 text-zinc-100 border border-emerald-500/30'
                           }`}
                         >
@@ -1265,10 +1448,190 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                   })
                 )}
               </div>
+
+              {/* Send Direct Consultant Message / Notification to Visitor on /chat */}
+              <div className="px-4 py-3 border-t border-white/[0.08] bg-[#0D0D10] space-y-2">
+                {consultantMsgFeedback && (
+                  <div
+                    className={`px-3 py-1.5 rounded-lg text-[11.5px] flex items-center justify-between gap-2 ${
+                      consultantMsgFeedback.type === 'success'
+                        ? 'bg-emerald-950/50 border border-emerald-500/35 text-emerald-200'
+                        : 'bg-red-950/50 border border-red-500/35 text-red-200'
+                    }`}
+                  >
+                    <span>{consultantMsgFeedback.text}</span>
+                    <button
+                      type="button"
+                      onClick={() => setConsultantMsgFeedback(null)}
+                      className="text-zinc-400 hover:text-white"
+                      aria-label="Fechar aviso"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+
+                <form
+                  onSubmit={(e) => void handleSendConsultantMessage(e)}
+                  className="flex items-center gap-2"
+                >
+                  <div className="relative flex-1 min-w-0">
+                    <Headset className="w-4 h-4 text-emerald-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={consultantDraft}
+                      onChange={(e) => setConsultantDraft(e.target.value)}
+                      disabled={sendingConsultantMsg}
+                      placeholder="Enviar notificação ou mensagem direta do consultor para o visitante no /chat..."
+                      className="w-full pl-9 pr-3 py-2.5 bg-[#141418] border border-white/[0.1] focus:border-emerald-500/60 rounded-lg text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={sendingConsultantMsg || !consultantDraft.trim()}
+                    className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {sendingConsultantMsg ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Send className="w-3.5 h-3.5" />
+                    )}
+                    <span>Enviar ao Visitante</span>
+                  </button>
+                </form>
+              </div>
             </>
           )}
         </section>
       </div>
+
+      {/* Global Broadcast / Quick Campaign Modal for /chat */}
+      {broadcastModalOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
+          onClick={() => setBroadcastModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-lg bg-[#111114] border border-white/[0.12] rounded-xl shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-4 border-b border-white/[0.08] bg-[#0D0D10] flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <Megaphone className="w-4 h-4 text-emerald-400" />
+                <div>
+                  <h3 className="font-display text-sm font-semibold text-white">
+                    Enviar Aviso / Campanha Rápida no /chat
+                  </h3>
+                  <p className="text-[11px] text-zinc-400">
+                    Aparece como notificação e mensagem para visitantes ativos no
+                    atendimento.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setBroadcastModalOpen(false)}
+                aria-label="Fechar modal"
+                className="w-8 h-8 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-zinc-300 flex items-center justify-center"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form
+              onSubmit={(e) => void handlePublishBroadcast(e)}
+              className="p-5 space-y-3.5"
+            >
+              {broadcastFeedback && (
+                <div
+                  className={`p-2.5 rounded-lg text-xs border ${
+                    broadcastFeedback.type === 'success'
+                      ? 'bg-emerald-950/50 border-emerald-500/35 text-emerald-200'
+                      : 'bg-red-950/50 border-red-500/35 text-red-200'
+                  }`}
+                >
+                  {broadcastFeedback.text}
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">
+                  Título do Aviso
+                </label>
+                <input
+                  type="text"
+                  value={broadcastTitle}
+                  onChange={(e) => setBroadcastTitle(e.target.value)}
+                  placeholder="Ex: Condição Especial de Financiamento Hoje"
+                  maxLength={120}
+                  className="w-full px-3.5 py-2 bg-[#18181C] border border-white/[0.1] focus:border-emerald-500/60 rounded-lg text-xs text-white placeholder:text-zinc-500 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">
+                  Mensagem para os visitantes *
+                </label>
+                <textarea
+                  rows={3}
+                  required
+                  value={broadcastMessage}
+                  onChange={(e) => setBroadcastMessage(e.target.value)}
+                  placeholder="Ex: Plantão de sábado até 16h com avaliação bônus na troca e laudo cautelar grátis."
+                  maxLength={1200}
+                  className="w-full px-3.5 py-2 bg-[#18181C] border border-white/[0.1] focus:border-emerald-500/60 rounded-lg text-xs text-white placeholder:text-zinc-500 focus:outline-none resize-none"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setBroadcastModalOpen(false)}
+                  className="px-3.5 py-2 rounded-lg text-xs font-medium text-zinc-300 hover:bg-white/[0.06]"
+                >
+                  Fechar
+                </button>
+                <button
+                  type="submit"
+                  disabled={sendingBroadcast || !broadcastMessage.trim()}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 cursor-pointer"
+                >
+                  {sendingBroadcast ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Send className="w-3.5 h-3.5" />
+                  )}
+                  <span>Publicar Aviso</span>
+                </button>
+              </div>
+            </form>
+
+            {recentBroadcasts.length > 0 && (
+              <div className="px-5 py-3.5 border-t border-white/[0.08] bg-[#0D0D10] max-h-44 overflow-y-auto space-y-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+                  Últimos avisos enviados
+                </p>
+                {recentBroadcasts.slice(0, 5).map((b) => (
+                  <div
+                    key={b.id}
+                    className="p-2.5 rounded-lg bg-[#141418] border border-white/[0.06] text-xs"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-zinc-200 truncate">
+                        {b.title || 'Aviso da Loja'}
+                      </span>
+                      <span className="text-[10.5px] font-mono text-zinc-500 shrink-0">
+                        {formatDateTimePt(b.createdAt)}
+                      </span>
+                    </div>
+                    <p className="text-zinc-400 mt-1 line-clamp-2">{b.message}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Admin Attachment Viewer Modal (Supports PDF inline iframe + Image Lightbox + New Tab + Direct Download) */}
       {previewModal && (

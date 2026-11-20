@@ -37,6 +37,7 @@ import { VehicleDetailModal } from './components/public/VehicleDetailModal';
 import { AiChatDrawer } from './components/public/AiChatDrawer';
 import { StandaloneChatPage } from './components/public/StandaloneChatPage';
 import { PrivacyPolicyPage } from './components/public/PrivacyPolicyPage';
+import { PWAInstallBanner } from './components/public/PWAInstallBanner';
 import { AdminLoginPage } from './components/auth/AdminLoginPage';
 import { adminFetch, clearAdminSessionToken } from './utils/authSession';
 
@@ -118,6 +119,9 @@ export default function App() {
     initialRoute.module
   );
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [preselectedChatSessionId, setPreselectedChatSessionId] = useState<
+    string | null
+  >(null);
 
   // Auth Session State
   const [authUser, setAuthUser] = useState<AdminUser | null>(null);
@@ -862,6 +866,11 @@ export default function App() {
           }}
           onOpenPrivacy={() => navigateTo('privacy')}
         />
+
+        <PWAInstallBanner
+          variant="storefront"
+          appName={settings.tradeName}
+        />
       </>
     );
   }
@@ -921,6 +930,15 @@ export default function App() {
             void hydratePublicVehicles();
             navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog');
           }}
+          onUnauthorized={() => handleUnauthorizedSession()}
+          onOpenChatSession={(sessionId) => {
+            setPreselectedChatSessionId(sessionId);
+            handleSelectAdminModule('chat_audit');
+          }}
+          onOpenCrmLead={(leadId) => {
+            if (leadId) setPreselectedLeadId(leadId);
+            handleSelectAdminModule('crm');
+          }}
         />
 
         <main className="flex-1 p-5 sm:p-6 lg:p-8 max-w-[1440px] w-full mx-auto">
@@ -974,6 +992,8 @@ export default function App() {
             <ChatAuditModule
               settings={settings}
               onUnauthorized={() => handleUnauthorizedSession()}
+              preselectedSessionId={preselectedChatSessionId}
+              onClearPreselectedSession={() => setPreselectedChatSessionId(null)}
               onLeadSyncedFromChat={(syncedLead, action) => {
                 setLeads((prev) => {
                   const exists = prev.some((l) => l.id === syncedLead.id);

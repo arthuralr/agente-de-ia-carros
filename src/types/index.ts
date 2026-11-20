@@ -90,6 +90,8 @@ export interface ChatAudioMeta {
   transcription?: string;
 }
 
+export type ChatTriageStage = 'ask_name' | 'ask_phone' | 'complete';
+
 export interface ChatMessage {
   id: string;
   sender: 'ia' | 'cliente';
@@ -98,6 +100,10 @@ export interface ChatMessage {
   replyTo?: ChatReplyContext;
   audio?: ChatAudioMeta;
   attachment?: ChatAttachment;
+  isHumanConsultant?: boolean;
+  senderLabel?: string;
+  dbId?: number;
+  broadcastId?: number;
 }
 
 export interface Lead {
@@ -155,6 +161,28 @@ export interface ChatAuditMessage {
   attachmentName?: string | null;
   attachmentMime?: string | null;
   attachmentDownloadUrl?: string | null;
+  senderLabel?: string | null;
+  isHumanConsultant?: boolean;
+  createdAt: string;
+}
+
+export interface AdminNotificationItem {
+  id: string;
+  type: 'chat_message' | 'new_lead';
+  title: string;
+  preview: string;
+  sessionId?: string | null;
+  leadId?: string | null;
+  leadPhone?: string | null;
+  origem?: string | null;
+  createdAt: string;
+}
+
+export interface ChatBroadcastRecord {
+  id: number;
+  title: string | null;
+  message: string;
+  createdBy: string | null;
   createdAt: string;
 }
 

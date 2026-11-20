@@ -73,6 +73,8 @@ export interface DbChatMessageRow {
   attachment_url?: string | null;
   attachment_name?: string | null;
   attachment_mime?: string | null;
+  sender_label?: string | null;
+  is_human_consultant?: boolean | null;
   created_at: Date;
 }
 
@@ -130,11 +132,26 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
       ADD COLUMN IF NOT EXISTS transcription TEXT,
       ADD COLUMN IF NOT EXISTS attachment_url TEXT,
       ADD COLUMN IF NOT EXISTS attachment_name VARCHAR(255),
-      ADD COLUMN IF NOT EXISTS attachment_mime VARCHAR(128)
+      ADD COLUMN IF NOT EXISTS attachment_mime VARCHAR(128),
+      ADD COLUMN IF NOT EXISTS sender_label VARCHAR(120),
+      ADD COLUMN IF NOT EXISTS is_human_consultant BOOLEAN NOT NULL DEFAULT false
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id
       ON chat_messages(session_id, id)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS chat_broadcasts (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(160),
+        message TEXT NOT NULL,
+        created_by VARCHAR(120),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_chat_broadcasts_created_at
+      ON chat_broadcasts(created_at DESC)
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS app_settings (
@@ -142,6 +159,26 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
         value TEXT NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ai_usage_logs (
+        id SERIAL PRIMARY KEY,
+        session_id VARCHAR(128),
+        feature VARCHAR(64) NOT NULL,
+        model VARCHAR(128) NOT NULL,
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_created_at
+      ON ai_usage_logs(created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_feature
+      ON ai_usage_logs(feature)
     `);
     const vehCount = await client.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM vehicles'
