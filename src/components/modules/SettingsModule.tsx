@@ -10,18 +10,23 @@ import {
 } from 'lucide-react';
 import { DealershipSettings, OperationMode } from '../../types';
 import { INITIAL_SETTINGS } from '../../data/mockData';
+import { normalizeStoreWhatsAppNumber } from '../../utils/whatsappHandoff';
 
 interface SettingsModuleProps {
   settings: DealershipSettings;
   operationMode: OperationMode;
+  storeWhatsappNumber: string;
   onChangeOperationMode: (mode: OperationMode) => Promise<void>;
+  onSaveStoreWhatsappNumber: (nextNumber: string) => Promise<void>;
   onSaveSettings: (next: DealershipSettings) => void;
 }
 
 export const SettingsModule: React.FC<SettingsModuleProps> = ({
   settings,
   operationMode,
+  storeWhatsappNumber,
   onChangeOperationMode,
+  onSaveStoreWhatsappNumber,
   onSaveSettings,
 }) => {
   const [form, setForm] = useState<DealershipSettings>(settings);
@@ -29,11 +34,48 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   const [savingMode, setSavingMode] = useState(false);
   const [modeSavedNotice, setModeSavedNotice] = useState(false);
   const [modeError, setModeError] = useState<string | null>(null);
+  const [whatsappInput, setWhatsappInput] = useState<string>(storeWhatsappNumber);
+  const [savingWhatsapp, setSavingWhatsapp] = useState(false);
+  const [whatsappSavedNotice, setWhatsappSavedNotice] = useState(false);
+  const [whatsappError, setWhatsappError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState(false);
 
   useEffect(() => {
     setSelectedMode(operationMode);
   }, [operationMode]);
+
+  useEffect(() => {
+    setWhatsappInput(storeWhatsappNumber);
+  }, [storeWhatsappNumber]);
+
+  const normalizedPreviewNumber = normalizeStoreWhatsAppNumber(whatsappInput);
+
+  const handleSaveStoreWhatsapp = async () => {
+    const normalized = normalizeStoreWhatsAppNumber(whatsappInput);
+    if (normalized.length < 10) {
+      setWhatsappError(
+        'Informe um número válido com DDI + DDD + número (ex: 5551999999999).'
+      );
+      return;
+    }
+    setSavingWhatsapp(true);
+    setWhatsappError(null);
+    setWhatsappSavedNotice(false);
+    try {
+      await onSaveStoreWhatsappNumber(normalized);
+      setWhatsappInput(normalized);
+      setWhatsappSavedNotice(true);
+      setTimeout(() => setWhatsappSavedNotice(false), 3000);
+    } catch (err: unknown) {
+      setWhatsappError(
+        err instanceof Error
+          ? err.message
+          : 'Erro ao salvar WhatsApp comercial da loja no banco Neon.'
+      );
+    } finally {
+      setSavingWhatsapp(false);
+    }
+  };
 
   const handleModeSelect = async (nextMode: OperationMode) => {
     if (nextMode === operationMode && !modeError) {
@@ -159,6 +201,82 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
             </p>
           </button>
         </div>
+      </div>
+
+      {/* Store Commercial WhatsApp Number for Direct wa.me Handoff (Persisted in Neon) */}
+      <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="font-display text-base font-semibold text-white">
+              WhatsApp Comercial da Loja (DDI + DDD + Número)
+            </h2>
+            <p className="text-xs text-zinc-400 mt-0.5">
+              Número de destino usado no transbordo direto do <span className="font-mono text-zinc-300">/chat</span> para o WhatsApp da equipe (<span className="font-mono text-zinc-300">wa.me</span>), sem custo de API e sem gasto de tokens.
+            </p>
+          </div>
+
+          {savingWhatsapp && (
+            <span className="inline-flex items-center gap-1.5 text-xs text-zinc-300">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+              <span>Salvando número...</span>
+            </span>
+          )}
+          {!savingWhatsapp && whatsappSavedNotice && (
+            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400">
+              <Check className="w-4 h-4" />
+              <span>WhatsApp salvo no Neon</span>
+            </span>
+          )}
+        </div>
+
+        {whatsappError && (
+          <div className="p-3 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center gap-2 text-xs text-red-200">
+            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>{whatsappError}</span>
+          </div>
+        )}
+
+        <div className="flex flex-col sm:flex-row sm:items-end gap-3">
+          <div className="flex-1 min-w-0">
+            <label className="block text-xs font-medium text-zinc-300 mb-1">
+              Número oficial para transbordo (somente dígitos com DDI 55)
+            </label>
+            <input
+              type="tel"
+              value={whatsappInput}
+              onChange={(e) => {
+                setWhatsappInput(e.target.value);
+                if (whatsappError) setWhatsappError(null);
+              }}
+              placeholder="5551999999999"
+              disabled={savingWhatsapp}
+              className="w-full px-3.5 py-2.5 bg-[#09090B] border border-white/[0.1] focus:border-emerald-500 rounded-lg text-sm text-white font-mono focus:outline-none"
+            />
+          </div>
+
+          <button
+            type="button"
+            disabled={savingWhatsapp}
+            onClick={() => void handleSaveStoreWhatsapp()}
+            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 transition-colors shrink-0 cursor-pointer"
+          >
+            {savingWhatsapp ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <MessageCircle className="w-4 h-4" />
+            )}
+            <span>Salvar WhatsApp da Loja</span>
+          </button>
+        </div>
+
+        <p className="text-[11px] text-zinc-400 font-mono truncate">
+          Link direto gerado:{' '}
+          <span className="text-emerald-400">
+            {normalizedPreviewNumber
+              ? `https://wa.me/${normalizedPreviewNumber}?text=...`
+              : 'Informe DDI + DDD + número (ex: 5551999999999)'}
+          </span>
+        </p>
       </div>
 
       {/* Dealership Data */}

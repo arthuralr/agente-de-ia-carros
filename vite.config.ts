@@ -15,9 +15,10 @@ export default defineConfig(() => {
         injectRegister: 'auto',
         devOptions: {
           enabled: true,
-          type: 'module',
+          type: 'classic',
         },
         includeAssets: [
+          'push-sw.js',
           'icon.svg',
           'apple-touch-icon.png',
           'pwa-192x192.png',
@@ -59,6 +60,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          importScripts: ['/push-sw.js'],
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
           navigateFallback: '/index.html',
           navigateFallbackDenylist: [/^\/api\//],

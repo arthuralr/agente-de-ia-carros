@@ -140,6 +140,8 @@ export interface ChatSessionSummary {
   tag?: string | null;
   aiSummary?: string | null;
   aiSummaryUpdatedAt?: string | null;
+  whatsappHandoffAt?: string | null;
+  handoffStatus?: string | null;
   createdAt: string;
   updatedAt: string;
   messageCount: number;

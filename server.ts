@@ -28,6 +28,18 @@ import {
   verifyPublicLeadChatToken,
   verifySessionToken,
 } from './src/db/auth';
+import {
+  buildWhatsAppHandoffUrl,
+  normalizeStoreWhatsAppNumber,
+} from './src/utils/whatsappHandoff';
+import {
+  getPublicVapidKey,
+  isWebPushConfigured,
+  triggerAdminPushInBackground,
+  triggerAllVisitorsPushInBackground,
+  triggerVisitorSessionPushInBackground,
+  upsertPushSubscription,
+} from './src/utils/webPushServer';
 
 if (fs.existsSync('.env.local')) {
   dotenv.config({ path: '.env.local', override: true });
@@ -278,6 +290,39 @@ async function recordChatAuditTurn(
         meta?.attachmentMime ?? null,
       ]
     );
+
+    // Fire-and-forget native Web Push for Admin devices whenever a visitor sends a message/audio/attachment
+    if (sender === 'user' && isWebPushConfigured()) {
+      void (async () => {
+        try {
+          const sessRes = await pool.query<{ lead_name: string | null }>(
+            'SELECT lead_name FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+            [sessionId]
+          );
+          const visitorLabel =
+            sessRes.rows[0]?.lead_name?.trim() || `Visitante (${origem})`;
+          const hasAttachment = Boolean(meta?.attachmentName || meta?.attachmentUrl);
+          const previewBody = (
+            meta?.transcription?.trim() ||
+            safeContent ||
+            (meta?.attachmentName ? `Enviou anexo: ${meta.attachmentName}` : 'Nova interação no chat')
+          )
+            .replace(/\s+/g, ' ')
+            .slice(0, 140);
+
+          triggerAdminPushInBackground({
+            title: hasAttachment
+              ? `Novo anexo de ${visitorLabel}`
+              : `Nova mensagem de ${visitorLabel}`,
+            body: previewBody,
+            url: `/admin/conversas?session=${encodeURIComponent(sessionId)}`,
+            tag: `admin-msg-${sessionId}`,
+          });
+        } catch {
+          // Never interrupt chat flow
+        }
+      })();
+    }
   } catch (err) {
     console.error('[Chat Audit Log Error]', err);
   }
@@ -438,6 +483,21 @@ async function getPersistedOperationMode(): Promise<OperationMode> {
     return envDefault;
   } catch {
     return envDefault;
+  }
+}
+
+async function getPersistedStoreWhatsAppNumber(): Promise<string> {
+  const envFallback =
+    normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) ||
+    '5511994821040';
+  try {
+    const res = await pool.query<{ value: string }>(
+      "SELECT value FROM app_settings WHERE key = 'store_whatsapp_number' LIMIT 1"
+    );
+    const persisted = normalizeStoreWhatsAppNumber(res.rows[0]?.value);
+    return persisted.length >= 10 ? persisted : envFallback;
+  } catch {
+    return envFallback;
   }
 }
 
@@ -1022,12 +1082,21 @@ app.get('/api/public/vehicles', async (_req, res) => {
 
 app.get('/api/public/config', async (_req, res) => {
   try {
-    const operationMode = await getPersistedOperationMode();
-    res.json({ operationMode });
+    const [operationMode, storeWhatsappNumber] = await Promise.all([
+      getPersistedOperationMode(),
+      getPersistedStoreWhatsAppNumber(),
+    ]);
+    res.json({ operationMode, storeWhatsappNumber });
   } catch {
     const fallback: OperationMode =
       process.env.OPERATION_MODE === 'agent_only' ? 'agent_only' : 'full';
-    res.json({ operationMode: fallback });
+    const fallbackPhone =
+      normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) ||
+      '5511994821040';
+    res.json({
+      operationMode: fallback,
+      storeWhatsappNumber: fallbackPhone,
+    });
   }
 });
 
@@ -1108,6 +1177,17 @@ app.post('/api/public/chat-session/identify', async (req, res) => {
     );
 
     const row = result.rows[0];
+
+    // Trigger Admin Web Push when visitor completes Step 2 of triage (Name + WhatsApp)
+    if (safePhone) {
+      triggerAdminPushInBackground({
+        title: `Novo Lead Qualificado · ${safeName}`,
+        body: `Informou o WhatsApp ${safePhone} no atendimento (${cleanOrigin}).`,
+        url: `/admin/conversas?session=${encodeURIComponent(cleanSessionId)}`,
+        tag: `admin-triage-${cleanSessionId}`,
+      });
+    }
+
     res.json({
       sessionId: row?.session_id ?? cleanSessionId,
       leadName: row?.lead_name ?? safeName,
@@ -1118,6 +1198,114 @@ app.post('/api/public/chat-session/identify', async (req, res) => {
       err instanceof Error
         ? err.message
         : 'Erro ao salvar identificação do visitante.';
+    res.status(500).json({ error: message });
+  }
+});
+
+function parsePushSubscriptionPayload(rawBody: unknown): {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+} | null {
+  if (!rawBody || typeof rawBody !== 'object') return null;
+  const record = rawBody as Record<string, unknown>;
+  const sub =
+    record.subscription && typeof record.subscription === 'object'
+      ? (record.subscription as Record<string, unknown>)
+      : record;
+  const endpoint = typeof sub.endpoint === 'string' ? sub.endpoint.trim() : '';
+  const keys =
+    sub.keys && typeof sub.keys === 'object'
+      ? (sub.keys as Record<string, unknown>)
+      : null;
+  const p256dh =
+    typeof keys?.p256dh === 'string'
+      ? keys.p256dh.trim()
+      : typeof sub.p256dh === 'string'
+        ? sub.p256dh.trim()
+        : '';
+  const auth =
+    typeof keys?.auth === 'string'
+      ? keys.auth.trim()
+      : typeof sub.auth === 'string'
+        ? sub.auth.trim()
+        : '';
+
+  if (!endpoint || !p256dh || !auth) return null;
+  if (!/^https?:\/\//i.test(endpoint)) return null;
+  return { endpoint, p256dh, auth };
+}
+
+app.get('/api/push/vapid-public-key', (_req, res) => {
+  res.json({
+    configured: isWebPushConfigured(),
+    publicKey: getPublicVapidKey(),
+  });
+});
+
+app.post('/api/push/subscribe/visitor', async (req, res) => {
+  try {
+    const cleanSessionId = sanitizeSessionId(req.body?.sessionId);
+    const parsedSub = parsePushSubscriptionPayload(req.body);
+
+    if (!cleanSessionId) {
+      res.status(400).json({ error: 'Identificador de sessão inválido.' });
+      return;
+    }
+    if (!parsedSub) {
+      res.status(400).json({ error: 'Assinatura Push inválida ou incompleta.' });
+      return;
+    }
+
+    const saved = await upsertPushSubscription({
+      role: 'visitor',
+      sessionId: cleanSessionId,
+      endpoint: parsedSub.endpoint,
+      p256dh: parsedSub.p256dh,
+      auth: parsedSub.auth,
+    });
+
+    res.status(201).json({
+      ok: true,
+      id: saved.id,
+      role: saved.role,
+      sessionId: saved.session_id,
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao salvar inscrição push do visitante.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/push/subscribe/admin', requireAdminAuth, async (req, res) => {
+  try {
+    const parsedSub = parsePushSubscriptionPayload(req.body);
+    if (!parsedSub) {
+      res.status(400).json({ error: 'Assinatura Push inválida ou incompleta.' });
+      return;
+    }
+
+    const saved = await upsertPushSubscription({
+      role: 'admin',
+      sessionId: null,
+      endpoint: parsedSub.endpoint,
+      p256dh: parsedSub.p256dh,
+      auth: parsedSub.auth,
+    });
+
+    res.status(201).json({
+      ok: true,
+      id: saved.id,
+      role: saved.role,
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao salvar inscrição push do administrador.';
     res.status(500).json({ error: message });
   }
 });
@@ -1219,6 +1407,284 @@ app.patch('/api/admin/settings/operation-mode', requireAdminAuth, async (req, re
   }
 });
 
+app.patch(
+  '/api/admin/settings/store-whatsapp',
+  requireAdminAuth,
+  async (req, res) => {
+    try {
+      const raw =
+        typeof req.body?.storeWhatsappNumber === 'string'
+          ? req.body.storeWhatsappNumber
+          : '';
+      const normalized = normalizeStoreWhatsAppNumber(raw);
+      if (normalized.length < 10 || normalized.length > 15) {
+        res.status(400).json({
+          error:
+            'Informe um WhatsApp comercial válido com DDI + DDD + Número (ex.: 5551999999999).',
+        });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('store_whatsapp_number', $1, NOW())
+         ON CONFLICT (key)
+         DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [normalized]
+      );
+
+      res.json({ storeWhatsappNumber: normalized });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Erro ao salvar WhatsApp comercial da loja no banco.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
+app.post('/api/chat/whatsapp-handoff', async (req, res) => {
+  try {
+    const cleanSessionId = sanitizeSessionId(req.body?.sessionId);
+    const rawName =
+      typeof req.body?.leadName === 'string'
+        ? req.body.leadName.replace(/\s+/g, ' ').trim().slice(0, 120)
+        : '';
+    const rawPhone =
+      typeof req.body?.leadPhone === 'string'
+        ? req.body.leadPhone.trim().slice(0, 40)
+        : '';
+    const rawContext =
+      typeof req.body?.contextSummary === 'string'
+        ? req.body.contextSummary.replace(/\s+/g, ' ').trim().slice(0, 220)
+        : '';
+    const cleanOrigin = sanitizeOrigin(req.body?.origem);
+    const storeName =
+      typeof req.body?.storeName === 'string' && req.body.storeName.trim()
+        ? req.body.storeName.trim().slice(0, 100)
+        : 'Armazém do Carro';
+
+    if (!cleanSessionId) {
+      res.status(400).json({ error: 'Sessão de atendimento inválida.' });
+      return;
+    }
+
+    const phoneDigits = rawPhone.replace(/\D/g, '');
+    const safePhone = phoneDigits.length >= 8 ? rawPhone : null;
+
+    // 1. Upsert chat_sessions with handoff timestamp + status (preserving existing name/phone)
+    const sessionRes = await pool.query<DbChatSessionRow>(
+      `INSERT INTO chat_sessions (
+         session_id,
+         lead_name,
+         lead_phone,
+         origem,
+         whatsapp_handoff_at,
+         handoff_status,
+         created_at,
+         updated_at
+       )
+       VALUES ($1, NULLIF($2, ''), $3, $4, NOW(), 'whatsapp', NOW(), NOW())
+       ON CONFLICT (session_id)
+       DO UPDATE SET
+         lead_name = COALESCE(NULLIF(BTRIM(EXCLUDED.lead_name), ''), chat_sessions.lead_name),
+         lead_phone = COALESCE(NULLIF(BTRIM(EXCLUDED.lead_phone), ''), chat_sessions.lead_phone),
+         whatsapp_handoff_at = NOW(),
+         handoff_status = 'whatsapp',
+         updated_at = NOW()
+       RETURNING *`,
+      [cleanSessionId, rawName, safePhone, cleanOrigin]
+    );
+    const session = sessionRes.rows[0];
+
+    const resolvedName =
+      session?.lead_name?.trim() ||
+      rawName ||
+      `Visitante #${session?.id ?? cleanSessionId.slice(-4)}`;
+    const resolvedPhone = session?.lead_phone?.trim() || rawPhone || '';
+    const normalizedLeadPhoneDigits = resolvedPhone.replace(/\D/g, '');
+
+    // Build lightweight chat_history snapshot from persisted chat_messages or request payload
+    const msgRes = await pool.query<{
+      id: number;
+      sender: 'user' | 'assistant';
+      content: string;
+      transcription: string | null;
+      attachment_name: string | null;
+      created_at: Date;
+    }>(
+      `SELECT id, sender, content, transcription, attachment_name, created_at
+       FROM chat_messages
+       WHERE session_id = $1
+       ORDER BY id ASC
+       LIMIT 60`,
+      [cleanSessionId]
+    );
+
+    const lightweightHistory = msgRes.rows.map((m) => ({
+      id: `audit-${m.id}`,
+      sender: m.sender === 'assistant' ? 'ia' : 'cliente',
+      text:
+        m.transcription?.trim()
+          ? `[Áudio] ${m.transcription.trim()}`
+          : m.content?.trim() ||
+            (m.attachment_name ? `[Anexo: ${m.attachment_name}]` : ''),
+      timestamp: new Date(m.created_at).toLocaleTimeString('pt-BR', {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    }));
+
+    const storeWhatsappNumber = await getPersistedStoreWhatsAppNumber();
+    const handoff = buildWhatsAppHandoffUrl({
+      storeWhatsappNumber,
+      storeName,
+      leadName: resolvedName,
+      leadPhone: resolvedPhone,
+      sessionId: cleanSessionId,
+      contextSummary: rawContext || undefined,
+      existingSummary: session?.ai_summary ?? null,
+    });
+
+    const handoffTimeLabel = new Date().toLocaleString('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    const handoffNoteLine = `📲 Encaminhado ao WhatsApp (${handoffTimeLabel}) · Ref #${handoff.shortRef} · Assunto: ${handoff.contextSummary}`;
+
+    // 2. Automatically upsert Lead card in CRM (dedup by chat_session_id or phone digits)
+    let existingLead: DbLeadRow | null = null;
+    const bySessionRes = await pool.query<DbLeadRow>(
+      'SELECT * FROM leads WHERE chat_session_id = $1 ORDER BY id DESC LIMIT 1',
+      [cleanSessionId]
+    );
+    if (bySessionRes.rows[0]) {
+      existingLead = bySessionRes.rows[0];
+    } else if (normalizedLeadPhoneDigits.length >= 8) {
+      const byPhoneRes = await pool.query<DbLeadRow>(
+        `SELECT *
+         FROM leads
+         WHERE REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g') = $1
+         ORDER BY id DESC
+         LIMIT 1`,
+        [normalizedLeadPhoneDigits]
+      );
+      if (byPhoneRes.rows[0]) {
+        existingLead = byPhoneRes.rows[0];
+      }
+    }
+
+    let crmAction: 'created' | 'updated' = 'created';
+    let savedLead: DbLeadRow;
+
+    if (existingLead) {
+      crmAction = 'updated';
+      const prevNotes = (existingLead.notes || '').trim();
+      const cleanedPrevNotes = prevNotes
+        .replace(/^📲 Encaminhado ao WhatsApp[^\n]*\n*/m, '')
+        .trim();
+      const mergedNotes = cleanedPrevNotes
+        ? `${handoffNoteLine}\n\n${cleanedPrevNotes}`
+        : handoffNoteLine;
+
+      const shouldUpgradeName =
+        Boolean(session?.lead_name?.trim() || rawName) &&
+        /^Visitante/i.test(existingLead.name || '');
+      const finalName = shouldUpgradeName
+        ? session?.lead_name?.trim() || rawName
+        : existingLead.name;
+      const finalPhone = existingLead.phone?.trim()
+        ? existingLead.phone
+        : resolvedPhone;
+
+      const updatedLeadRes = await pool.query<DbLeadRow>(
+        `UPDATE leads
+         SET name = $1,
+             phone = $2,
+             chat_session_id = COALESCE(chat_session_id, $3),
+             tag = COALESCE(tag, 'Lead Quente'),
+             notes = $4,
+             chat_history = CASE
+               WHEN $5::text <> '[]' THEN $5
+               ELSE chat_history
+             END
+         WHERE id = $6
+         RETURNING *`,
+        [
+          finalName,
+          finalPhone,
+          cleanSessionId,
+          mergedNotes,
+          JSON.stringify(lightweightHistory),
+          existingLead.id,
+        ]
+      );
+      savedLead = updatedLeadRes.rows[0];
+    } else {
+      const interestLabel = `${handoff.contextSummary} · Encaminhado ao WhatsApp`.slice(
+        0,
+        140
+      );
+      const insertedLeadRes = await pool.query<DbLeadRow>(
+        `INSERT INTO leads (
+           name,
+           phone,
+           vehicle_interest,
+           stage,
+           chat_history,
+           lgpd_consent,
+           lgpd_consent_at,
+           chat_session_id,
+           tag,
+           notes
+         )
+         VALUES ($1, $2, $3, 'Em Atendimento', $4, $5, $6, $7, 'Lead Quente', $8)
+         RETURNING *`,
+        [
+          resolvedName,
+          resolvedPhone,
+          interestLabel,
+          JSON.stringify(lightweightHistory),
+          Boolean(resolvedPhone),
+          resolvedPhone ? new Date() : null,
+          cleanSessionId,
+          handoffNoteLine,
+        ]
+      );
+      savedLead = insertedLeadRes.rows[0];
+    }
+
+    // Fire-and-forget Admin Web Push when visitor initiates WhatsApp handoff / simulation CTA
+    triggerAdminPushInBackground({
+      title: `Transbordo WhatsApp · ${resolvedName}`,
+      body: `Assunto: ${handoff.contextSummary} (Ref #${handoff.shortRef})`,
+      url: `/admin/conversas?session=${encodeURIComponent(cleanSessionId)}`,
+      tag: `admin-wa-${cleanSessionId}`,
+    });
+
+    res.json({
+      ok: true,
+      sessionId: cleanSessionId,
+      handoffStatus: 'whatsapp',
+      whatsappHandoffAt: session?.whatsapp_handoff_at ?? new Date().toISOString(),
+      whatsappUrl: handoff.url,
+      shortRef: handoff.shortRef,
+      crmAction,
+      leadId: savedLead?.id ? String(savedLead.id) : null,
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Erro ao registrar transbordo para o WhatsApp.';
+    res.status(500).json({ error: message });
+  }
+});
+
 app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
   try {
     const result = await pool.query<DbChatSessionRow>(
@@ -1231,6 +1697,8 @@ app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
           s.tag,
           s.ai_summary,
           s.ai_summary_updated_at,
+          s.whatsapp_handoff_at,
+          s.handoff_status,
           s.created_at,
           s.updated_at,
           COALESCE(m_agg.message_count, 0)::int AS message_count,
@@ -1269,6 +1737,8 @@ app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
         tag: row.tag ?? null,
         aiSummary: row.ai_summary ?? null,
         aiSummaryUpdatedAt: row.ai_summary_updated_at ?? null,
+        whatsappHandoffAt: row.whatsapp_handoff_at ?? null,
+        handoffStatus: row.handoff_status ?? null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         messageCount: Number(row.message_count) || 0,
@@ -1340,6 +1810,8 @@ app.get(
           tag: s.tag ?? null,
           aiSummary: s.ai_summary ?? null,
           aiSummaryUpdatedAt: s.ai_summary_updated_at ?? null,
+          whatsappHandoffAt: s.whatsapp_handoff_at ?? null,
+          handoffStatus: s.handoff_status ?? null,
           createdAt: s.created_at,
           updatedAt: s.updated_at,
         },
@@ -1428,6 +1900,15 @@ app.post(
       );
 
       const m = insertRes.rows[0];
+
+      // Trigger targeted Web Push exclusively to the visitor subscribed to this session_id
+      triggerVisitorSessionPushInBackground(sessionId, {
+        title: `${m.sender_label ?? customLabel} respondeu`,
+        body: safeMessage.slice(0, 140),
+        url: '/chat',
+        tag: `visitor-msg-${sessionId}`,
+      });
+
       res.status(201).json({
         id: m.id,
         sessionId: m.session_id,
@@ -1605,6 +2086,15 @@ app.post('/api/admin/chat-broadcasts', requireAdminAuth, async (req: Authenticat
       [safeTitle, safeMessage, createdBy]
     );
     const b = result.rows[0];
+
+    // Trigger broadcast Web Push to all subscribed visitor devices (role = 'visitor')
+    triggerAllVisitorsPushInBackground({
+      title: b.title || safeTitle,
+      body: safeMessage.slice(0, 140),
+      url: '/chat',
+      tag: `visitor-broadcast-${b.id}`,
+    });
+
     res.status(201).json({
       id: b.id,
       title: b.title,
@@ -2353,6 +2843,16 @@ app.post('/api/public/leads', async (req, res) => {
         sanitizeOrigin(origem)
       );
     }
+
+    // Fire-and-forget Admin Web Push when visitor requests a simulation / submits lead contact
+    triggerAdminPushInBackground({
+      title: `Solicitação de Simulação · ${cleanName}`,
+      body: `${resolvedVehicleInterest} · WhatsApp: ${cleanPhone}`,
+      url: safeSessionId
+        ? `/admin/conversas?session=${encodeURIComponent(safeSessionId)}`
+        : '/admin/crm',
+      tag: `admin-lead-${created.id}`,
+    });
 
     const chatToken = signPublicLeadChatToken(created.id);
     res.status(201).json({ ...created, chatToken });

@@ -3,6 +3,7 @@ import {
   AlertCircle,
   ArrowLeft,
   Bell,
+  BellRing,
   CalendarClock,
   Camera,
   Car,
@@ -11,6 +12,7 @@ import {
   ChevronRight,
   Copy,
   Download,
+  ExternalLink,
   FileText,
   Headset,
   Image as ImageIcon,
@@ -39,8 +41,11 @@ import {
   Lead,
   Vehicle,
 } from '../../types';
-import { formatWhatsAppLink } from '../../utils/formatters';
 import { formatBrazilianPhone } from '../../utils/chatTags';
+import {
+  buildWhatsAppHandoffUrl,
+  detectHumanHandoffIntent,
+} from '../../utils/whatsappHandoff';
 import {
   AUDIO_CAPTURE_CONSTRAINTS,
   AUDIO_RECORDING_BITRATE,
@@ -54,12 +59,14 @@ import {
   stripMarkdownForPreview,
 } from '../../utils/chatMedia';
 import { useVirtualConsultant } from '../../hooks/useVirtualConsultant';
+import { useWebPush } from '../../hooks/useWebPush';
 import { ChatMarkdown } from './ChatMarkdown';
 import { PWAInstallBanner } from './PWAInstallBanner';
 
 interface StandaloneChatPageProps {
   vehicles: Vehicle[];
   settings: DealershipSettings;
+  storeWhatsappNumber?: string;
   showBackToCatalog?: boolean;
   onCaptureLead: (lead: Lead) => Promise<Lead>;
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
@@ -70,6 +77,7 @@ interface StandaloneChatPageProps {
 export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   vehicles,
   settings,
+  storeWhatsappNumber,
   showBackToCatalog = true,
   onCaptureLead,
   onSyncLeadChat,
@@ -105,11 +113,19 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
-  const [notifPermission, setNotifPermission] = useState<string>(() => {
-    if (typeof window !== 'undefined' && 'Notification' in window) {
-      return Notification.permission;
+  const [manualHandoffCardOpen, setManualHandoffCardOpen] = useState(false);
+  const [handoffTrackedRef, setHandoffTrackedRef] = useState<string | null>(
+    null
+  );
+  const [pushBannerDismissed, setPushBannerDismissed] = useState<boolean>(() => {
+    try {
+      return (
+        window.sessionStorage.getItem('armazem_visitor_push_dismissed_v1') ===
+        '1'
+      );
+    } catch {
+      return false;
     }
-    return 'unsupported';
   });
 
   // Attachment state
@@ -136,15 +152,17 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const discardAudioRef = useRef<boolean>(false);
   const finalizedAudioRef = useRef<boolean>(false);
 
-  // Refs for inputs & swipe-to-reply
+  // Refs for inputs, handoff card & swipe-to-reply
   const textInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const pdfInputRef = useRef<HTMLInputElement>(null);
+  const handoffCardRef = useRef<HTMLDivElement>(null);
   const touchStartRef = useRef<{ x: number; y: number; msgId: string } | null>(
     null
   );
 
   const {
+    sessionId,
     messages,
     input,
     setInput,
@@ -189,6 +207,102 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
   const isTriageComplete = triageStage === 'complete';
 
+  const visitorPush = useWebPush({
+    role: 'visitor',
+    sessionId,
+  });
+
+  const handleActivateVisitorPush = async () => {
+    const ok = await visitorPush.subscribe();
+    if (ok) {
+      setPushBannerDismissed(true);
+    }
+  };
+
+  const handleDismissPushBanner = () => {
+    setPushBannerDismissed(true);
+    try {
+      window.sessionStorage.setItem('armazem_visitor_push_dismissed_v1', '1');
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
+  const effectiveStoreWhatsapp =
+    storeWhatsappNumber?.trim() || effectiveSettings.whatsapp;
+
+  // Assemble direct wa.me handoff link purely from captured session state (ZERO AI tokens)
+  const handoffData = useMemo(
+    () =>
+      buildWhatsAppHandoffUrl({
+        storeWhatsappNumber: effectiveStoreWhatsapp,
+        storeName: effectiveSettings.tradeName,
+        leadName: customerName,
+        leadPhone: customerWhatsapp,
+        sessionId,
+        messages,
+        vehicles,
+      }),
+    [
+      customerName,
+      customerWhatsapp,
+      effectiveSettings.tradeName,
+      effectiveStoreWhatsapp,
+      messages,
+      sessionId,
+      vehicles,
+    ]
+  );
+
+  // Trigger 2 (automatic): detect when visitor asks for human consultant, visit, negotiation, or simulation
+  const autoHandoffDetected = useMemo(() => {
+    if (!isTriageComplete) return false;
+    const recentClientMsgs = messages
+      .filter((m) => m.sender === 'cliente')
+      .slice(-4);
+    return recentClientMsgs.some((m) =>
+      detectHumanHandoffIntent(m.text || m.audio?.transcription || '')
+    );
+  }, [isTriageComplete, messages]);
+
+  const showInlineHandoffCard =
+    isTriageComplete && (manualHandoffCardOpen || autoHandoffDetected);
+
+  // Register handoff in Neon PostgreSQL + auto-create/update CRM card without blocking link navigation
+  const handleTrackWhatsAppHandoff = () => {
+    setHandoffTrackedRef(handoffData.shortRef);
+    void fetch('/api/chat/whatsapp-handoff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      keepalive: true,
+      body: JSON.stringify({
+        sessionId,
+        leadName: customerName.trim() || undefined,
+        leadPhone: customerWhatsapp.trim() || undefined,
+        contextSummary: handoffData.contextSummary,
+        origem: '/chat',
+        storeName: effectiveSettings.tradeName,
+      }),
+    }).catch(() => {
+      // Non-blocking: WhatsApp link always opens cleanly even if offline
+    });
+  };
+
+  // Trigger 1: "Solicitar uma Simulação" header CTA
+  const handleTriggerSimulationHandoff = () => {
+    if (isTriageComplete) {
+      setManualHandoffCardOpen(true);
+      window.setTimeout(() => {
+        handoffCardRef.current?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+        });
+      }, 60);
+    } else {
+      setLeadPanelOpen((prev) => !prev);
+    }
+  };
+
   const sendRichMessageRef = useRef(sendRichMessage);
   useEffect(() => {
     sendRichMessageRef.current = sendRichMessage;
@@ -224,17 +338,9 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setLightboxImage(null);
     setHeaderMenuOpen(false);
     setConfirmClearOpen(false);
+    setManualHandoffCardOpen(false);
+    setHandoffTrackedRef(null);
     resetConversation();
-  };
-
-  const handleRequestVisitorNotifications = async () => {
-    if (typeof window === 'undefined' || !('Notification' in window)) return;
-    try {
-      const result = await Notification.requestPermission();
-      setNotifPermission(result);
-    } catch {
-      // Ignore permission prompt errors
-    }
   };
 
   const buildReplyPreviewForMessage = (msg: ChatMessage): string => {
@@ -712,6 +818,36 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
         </form>
       )}
 
+      {/* Direct WhatsApp Handoff CTA inside Side Panel / Sheet */}
+      <div className="p-3.5 rounded-xl bg-[#E7FCEB] border border-[#25D366]/45 space-y-2.5">
+        <div>
+          <p className="text-xs font-semibold text-[#075E54]">
+            Prefere falar agora no WhatsApp da loja?
+          </p>
+          <p className="text-[11px] text-[#3B4A54] mt-0.5 leading-snug">
+            Já levamos seu nome, WhatsApp e o assunto{' '}
+            <strong className="text-[#111B21]">
+              ({handoffData.contextSummary})
+            </strong>{' '}
+            prontos para o consultor ·{' '}
+            <span className="font-mono text-[#075E54]">
+              Ref #{handoffData.shortRef}
+            </span>
+          </p>
+        </div>
+        <a
+          href={handoffData.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={handleTrackWhatsAppHandoff}
+          className="w-full min-h-[42px] py-2 px-3.5 rounded-xl text-xs font-semibold text-white bg-[#25D366] hover:bg-[#1EBE5D] shadow-xs transition-colors inline-flex items-center justify-center gap-2"
+        >
+          <MessageCircle className="w-4 h-4 shrink-0" />
+          <span>Falar com Consultor no WhatsApp</span>
+          <ExternalLink className="w-3.5 h-3.5 shrink-0 opacity-90" />
+        </a>
+      </div>
+
       {/* Dealership Assurance Info */}
       <div className="pt-4 border-t border-[#E9EDEF] space-y-3 text-xs text-[#54656F]">
         <div className="flex items-start gap-2.5">
@@ -828,10 +964,25 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
             {/* Header Right Actions */}
             <div className="flex items-center gap-1 shrink-0">
+              {/* Trigger 3: Always-accessible discreet WhatsApp Handoff quick button */}
+              <a
+                href={handoffData.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={handleTrackWhatsAppHandoff}
+                aria-label="Falar com Consultor no WhatsApp"
+                title={`Falar com Consultor no WhatsApp (Ref #${handoffData.shortRef})`}
+                className="min-h-[38px] px-2.5 sm:px-3 rounded-full bg-[#25D366] hover:bg-[#1EBE5D] text-[#052E16] text-xs font-semibold shadow-xs transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <MessageCircle className="w-4 h-4 shrink-0" />
+                <span className="hidden md:inline">WhatsApp</span>
+              </a>
+
+              {/* Trigger 1: Solicitar uma Simulação */}
               <button
                 type="button"
-                onClick={() => setLeadPanelOpen((prev) => !prev)}
-                className={`min-h-[40px] px-3 rounded-full text-xs font-medium transition-colors inline-flex items-center gap-1.5 whitespace-nowrap ${
+                onClick={handleTriggerSimulationHandoff}
+                className={`min-h-[38px] px-2.5 sm:px-3 rounded-full text-xs font-medium transition-colors inline-flex items-center gap-1.5 whitespace-nowrap ${
                   leadSaved
                     ? 'bg-[#25D366]/20 text-[#D9FDD3] hover:bg-[#25D366]/30'
                     : 'bg-white/12 text-white hover:bg-white/20'
@@ -840,12 +991,14 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 {leadSaved ? (
                   <>
                     <UserCheck className="w-3.5 h-3.5 text-[#25D366]" />
-                    <span className="hidden sm:inline">Contato salvo</span>
+                    <span className="hidden sm:inline">Solicitar Simulação</span>
                   </>
                 ) : (
                   <>
                     <UserPlus className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Simulação / Contato</span>
+                    <span className="hidden sm:inline">
+                      Solicitar uma Simulação
+                    </span>
                   </>
                 )}
               </button>
@@ -870,6 +1023,36 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                 )}
               </button>
 
+              {/* Discreet Visitor Web Push Bell Icon (role = 'visitor') */}
+              <button
+                type="button"
+                disabled={visitorPush.isSubscribing}
+                onClick={() => void handleActivateVisitorPush()}
+                aria-label={
+                  visitorPush.isSubscribed
+                    ? 'Alertas push ativos'
+                    : 'Ativar notificações de respostas e novidades'
+                }
+                title={
+                  visitorPush.isSubscribed
+                    ? 'Alertas push ativos neste aparelho'
+                    : 'Ativar alertas de respostas e novidades'
+                }
+                className={`relative w-9 h-9 rounded-full transition-colors inline-flex items-center justify-center shrink-0 disabled:opacity-60 ${
+                  visitorPush.isSubscribed
+                    ? 'bg-[#25D366]/20 text-[#D9FDD3] hover:bg-[#25D366]/30'
+                    : 'text-white/90 hover:text-white hover:bg-white/10'
+                }`}
+              >
+                {visitorPush.isSubscribing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : visitorPush.isSubscribed ? (
+                  <BellRing className="w-4 h-4 text-[#25D366]" />
+                ) : (
+                  <Bell className="w-4 h-4" />
+                )}
+              </button>
+
               {/* Discreet WhatsApp-style Overflow Menu (Limpar / Nova conversa) */}
               <div className="relative">
                 <button
@@ -884,12 +1067,12 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
                 {headerMenuOpen && (
                   <div className="absolute right-0 top-[46px] z-40 w-60 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
-                    {notifPermission === 'default' && (
+                    {!visitorPush.isSubscribed && (
                       <button
                         type="button"
                         onClick={() => {
                           setHeaderMenuOpen(false);
-                          void handleRequestVisitorNotifications();
+                          void handleActivateVisitorPush();
                         }}
                         className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-[#075E54] hover:bg-[#E7FCEB] flex items-center gap-2.5 transition-colors border-b border-[#E9EDEF]"
                       >
@@ -920,6 +1103,60 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             appName={effectiveSettings.tradeName}
           />
 
+          {/* Light Post-Triage Visitor Web Push Opt-In Banner (role = 'visitor') */}
+          {isTriageComplete &&
+            !visitorPush.isSubscribed &&
+            !pushBannerDismissed &&
+            visitorPush.isSupported &&
+            visitorPush.permission !== 'denied' &&
+            visitorPush.vapidConfigured !== false && (
+              <div className="shrink-0 bg-[#F0F2F5] border-b border-[#D1D7DB] px-3.5 py-2 flex items-center justify-between gap-2.5">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-7 h-7 rounded-full bg-[#00A884]/15 text-[#075E54] flex items-center justify-center shrink-0">
+                    <Bell className="w-3.5 h-3.5" />
+                  </span>
+                  <p className="text-[11.5px] text-[#3B4A54] leading-snug truncate">
+                    Ative alertas para ser avisado quando o consultor responder ou enviar novidades.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    disabled={visitorPush.isSubscribing}
+                    onClick={() => void handleActivateVisitorPush()}
+                    className="px-2.5 py-1.5 rounded-full bg-[#00A884] hover:bg-[#008F72] text-white text-[11px] font-semibold transition-colors whitespace-nowrap disabled:opacity-60"
+                  >
+                    {visitorPush.isSubscribing ? 'Ativando...' : 'Ativar alertas'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDismissPushBanner}
+                    aria-label="Dispensar convite de alertas"
+                    className="w-6 h-6 rounded-full hover:bg-black/5 text-[#667781] flex items-center justify-center"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+          {visitorPush.statusMessage && (
+            <div className="shrink-0 bg-[#FFF5C4] border-b border-amber-300/60 px-3.5 py-2 flex items-center justify-between gap-2 text-[11.5px] text-[#54656F]">
+              <span className="inline-flex items-center gap-1.5 min-w-0">
+                <AlertCircle className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                <span className="truncate">{visitorPush.statusMessage}</span>
+              </span>
+              <button
+                type="button"
+                onClick={visitorPush.clearStatusMessage}
+                aria-label="Fechar aviso"
+                className="text-[#54656F] hover:text-[#111B21] shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           {/* Live Notification Toast from Human Consultant or Store Broadcast */}
           {incomingNotification && (
             <div className="shrink-0 bg-[#111B21] text-white border-b border-[#00A884]/40 px-3.5 py-2.5 flex items-center justify-between gap-3 shadow-md">
@@ -947,14 +1184,25 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             </div>
           )}
 
-          {/* Lead Confirmed Subtle Bar */}
-          {leadSaved && (
-            <div className="shrink-0 bg-[#E7FCEB] border-b border-[#00A884]/20 px-4 py-1.5 flex items-center justify-between gap-2 text-[11px] text-[#075E54]">
+          {/* Lead Confirmed / WhatsApp Handoff Subtle Bar */}
+          {(leadSaved || handoffTrackedRef) && (
+            <div className="shrink-0 bg-[#E7FCEB] border-b border-[#00A884]/20 px-4 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#075E54]">
               <span className="inline-flex items-center gap-1.5 truncate">
                 <Check className="w-3.5 h-3.5 text-[#00A884] shrink-0" />
                 <span className="truncate">
-                  Atendimento vinculado ao WhatsApp{' '}
-                  <strong className="font-mono">{customerWhatsapp}</strong>
+                  {handoffTrackedRef ? (
+                    <>
+                      Encaminhado ao WhatsApp da loja ·{' '}
+                      <strong className="font-mono">
+                        Ref #{handoffTrackedRef}
+                      </strong>
+                    </>
+                  ) : (
+                    <>
+                      Atendimento vinculado ao WhatsApp{' '}
+                      <strong className="font-mono">{customerWhatsapp}</strong>
+                    </>
+                  )}
                 </span>
               </span>
             </div>
@@ -1294,7 +1542,12 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                               key={opt.id}
                               type="button"
                               disabled={isSending}
-                              onClick={() => sendQuickPrompt(opt.prompt)}
+                              onClick={() => {
+                                if (opt.id === 'visit') {
+                                  setManualHandoffCardOpen(true);
+                                }
+                                sendQuickPrompt(opt.prompt);
+                              }}
                               className="w-full text-left px-3.5 py-2.5 hover:bg-[#F5F6F6] active:bg-[#E7FCEB] transition-colors flex items-center justify-between gap-3 disabled:opacity-50"
                             >
                               <div className="min-w-0">
@@ -1346,6 +1599,59 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </div>
             )}
 
+            {/* Smart Inline WhatsApp Handoff Card (Triggers 1 & 2, Zero AI Tokens) */}
+            {showInlineHandoffCard && (
+              <div ref={handoffCardRef} className="flex justify-start pl-2 pt-1">
+                <div className="w-full max-w-[90%] sm:max-w-[78%] lg:max-w-[460px] bg-white rounded-xl shadow-[0_2px_6px_rgba(11,20,26,0.14)] border border-[#25D366]/45 overflow-hidden">
+                  <div className="px-3.5 py-2.5 bg-[#E7FCEB] border-b border-[#25D366]/25 flex items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold text-[#075E54]">
+                      <MessageCircle className="w-4 h-4 text-[#00A884] shrink-0" />
+                      <span>Continuar no WhatsApp com Consultor</span>
+                    </span>
+                    <span className="text-[10.5px] font-mono text-[#075E54]/80 shrink-0">
+                      Ref #{handoffData.shortRef}
+                    </span>
+                  </div>
+
+                  <div className="p-3.5 space-y-3">
+                    <p className="text-xs text-[#3B4A54] leading-relaxed">
+                      Sua mensagem já vai preenchida com seus dados e o assunto{' '}
+                      <strong className="text-[#111B21]">
+                        {handoffData.contextSummary}
+                      </strong>{' '}
+                      para agilizar sua simulação ou visita na{' '}
+                      <strong className="text-[#111B21]">
+                        {effectiveSettings.tradeName}
+                      </strong>
+                      .
+                    </p>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <a
+                        href={handoffData.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={handleTrackWhatsAppHandoff}
+                        className="flex-1 min-w-[210px] min-h-[42px] px-4 py-2.5 rounded-xl bg-[#25D366] hover:bg-[#1EBE5D] text-white text-xs font-semibold shadow-xs transition-colors inline-flex items-center justify-center gap-2"
+                      >
+                        <MessageCircle className="w-4 h-4 shrink-0" />
+                        <span>Falar com Consultor no WhatsApp</span>
+                        <ExternalLink className="w-3.5 h-3.5 shrink-0 opacity-90" />
+                      </a>
+
+                      <button
+                        type="button"
+                        onClick={() => setLeadPanelOpen(true)}
+                        className="min-h-[42px] px-3 py-2 rounded-xl border border-[#D1D7DB] hover:bg-[#F0F2F5] text-[11.5px] font-medium text-[#3B4A54] transition-colors"
+                      >
+                        Dados / LGPD
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {(errorMsg || mediaError) && (
               <div className="flex justify-center">
                 <div className="max-w-md p-3 rounded-lg bg-white border border-red-200 shadow-xs flex items-start gap-2.5 text-xs text-red-700">
@@ -1354,16 +1660,14 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     <p>{mediaError || errorMsg}</p>
                     {errorMsg && (
                       <a
-                        href={formatWhatsAppLink(
-                          effectiveSettings.whatsapp,
-                          `Olá! Gostaria de falar com um consultor da ${effectiveSettings.tradeName}.`
-                        )}
+                        href={handoffData.url}
                         target="_blank"
-                        rel="noreferrer"
+                        rel="noopener noreferrer"
+                        onClick={handleTrackWhatsAppHandoff}
                         className="inline-flex items-center gap-1.5 text-[#008069] hover:underline font-semibold"
                       >
                         <MessageCircle className="w-3.5 h-3.5" />
-                        <span>Continuar no WhatsApp da loja</span>
+                        <span>Falar com Consultor no WhatsApp</span>
                       </a>
                     )}
                   </div>

@@ -381,7 +381,18 @@ export function useVirtualConsultant({
   const customerNameRef = useRef<string>(customerName);
   const customerWhatsappRef = useRef<string>(customerWhatsapp);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const sessionIdRef = useRef<string>(createChatSessionId());
+  const initialSessionId = useRef<string>(
+    persistStorageKey && !targetVehicle
+      ? loadLocalChatStateSync(persistStorageKey)?.sessionId ||
+          createChatSessionId()
+      : createChatSessionId()
+  ).current;
+  const [sessionId, setSessionId] = useState<string>(initialSessionId);
+  const sessionIdRef = useRef<string>(initialSessionId);
+  const updateSessionId = useCallback((nextId: string) => {
+    sessionIdRef.current = nextId;
+    setSessionId(nextId);
+  }, []);
   const storageReadyRef = useRef<boolean>(false);
   const storageVersionRef = useRef<number>(0);
   const userMutatedRef = useRef<boolean>(false);
@@ -775,7 +786,7 @@ export function useVirtualConsultant({
     const hydrationVersion = storageVersionRef.current;
 
     if (targetVehicle) {
-      sessionIdRef.current = createChatSessionId();
+      updateSessionId(createChatSessionId());
       setLeadSaved(false);
       setLeadSaveError(null);
       setLgpdConsent(false);
@@ -815,7 +826,7 @@ export function useVirtualConsultant({
       }
 
       if (savedSync && savedSync.messages.length > 0) {
-        sessionIdRef.current = savedSync.sessionId;
+        updateSessionId(savedSync.sessionId);
         const initialKnownName = (savedSync.customerName || '').trim();
         const initialKnownPhone = (savedSync.customerWhatsapp || '').trim();
         const isFullyIdentified =
@@ -865,7 +876,7 @@ export function useVirtualConsultant({
         setErrorMsg(null);
         storageReadyRef.current = true;
       } else {
-        sessionIdRef.current = createChatSessionId();
+        updateSessionId(createChatSessionId());
         lastConsultantMsgIdRef.current = 0;
         setLeadSaved(false);
         setLeadSaveError(null);
@@ -926,7 +937,7 @@ export function useVirtualConsultant({
             );
           }
         } else if (isFullyIdentified) {
-          sessionIdRef.current = savedAsync.sessionId;
+          updateSessionId(savedAsync.sessionId);
           setMessages(
             personalizeRestoredHistory(
               savedAsync.messages,
@@ -1003,7 +1014,7 @@ export function useVirtualConsultant({
       return;
     }
 
-    sessionIdRef.current = createChatSessionId();
+    updateSessionId(createChatSessionId());
     setLeadSaved(false);
     setLeadSaveError(null);
     setLgpdConsent(false);
@@ -1019,6 +1030,7 @@ export function useVirtualConsultant({
     sendMessageToAi,
     settings.tradeName,
     targetVehicle,
+    updateSessionId,
   ]);
 
   // Persist conversation automatically to localStorage + IndexedDB when enabled
@@ -1212,7 +1224,7 @@ export function useVirtualConsultant({
       clearLocalChatState(persistStorageKey);
     }
 
-    sessionIdRef.current = createChatSessionId();
+    updateSessionId(createChatSessionId());
     lastConsultantMsgIdRef.current = 0;
     setIsSending(false);
     setIsProcessingAudio(false);
@@ -1237,7 +1249,7 @@ export function useVirtualConsultant({
         : createWelcomeMessage(settings.tradeName),
     ]);
     storageReadyRef.current = true;
-  }, [persistStorageKey, settings.tradeName]);
+  }, [persistStorageKey, settings.tradeName, updateSessionId]);
 
   const sendRichMessage = useCallback(
     (payload: SendRichMessagePayload) => {
@@ -1358,7 +1370,7 @@ export function useVirtualConsultant({
           clearLocalChatState(persistStorageKey);
         }
         storageVersionRef.current += 1;
-        sessionIdRef.current = createChatSessionId();
+        updateSessionId(createChatSessionId());
         lastConsultantMsgIdRef.current = 0;
         effectiveCustomerName = switchedUserName;
         effectiveLeadSaved = false;
@@ -1446,6 +1458,7 @@ export function useVirtualConsultant({
       syncVisitorIdentityToServer,
       targetVehicle,
       triageStage,
+      updateSessionId,
     ]
   );
 
@@ -1534,6 +1547,7 @@ export function useVirtualConsultant({
   );
 
   return {
+    sessionId,
     messages,
     input,
     setInput,

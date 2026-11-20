@@ -874,13 +874,21 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                       </span>
                     </div>
 
-                    {tagCfg && (
-                      <div className="mt-1.5">
-                        <span
-                          className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10.5px] font-medium ${tagCfg.badgeClass}`}
-                        >
-                          {tagCfg.label}
-                        </span>
+                    {(tagCfg || session.handoffStatus === 'whatsapp') && (
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                        {tagCfg && (
+                          <span
+                            className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10.5px] font-medium ${tagCfg.badgeClass}`}
+                          >
+                            {tagCfg.label}
+                          </span>
+                        )}
+                        {session.handoffStatus === 'whatsapp' && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10.5px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                            <MessageCircle className="w-3 h-3" />
+                            <span>WhatsApp</span>
+                          </span>
+                        )}
                       </div>
                     )}
 
@@ -932,6 +940,19 @@ export const ChatAuditModule: React.FC<ChatAuditModuleProps> = ({
                         </span>
                       ) : null;
                     })()}
+                    {activeSession.handoffStatus === 'whatsapp' && (
+                      <span
+                        title={
+                          activeSession.whatsappHandoffAt
+                            ? `Encaminhado em ${formatDateTimePt(activeSession.whatsappHandoffAt)}`
+                            : 'Encaminhado ao WhatsApp'
+                        }
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                      >
+                        <MessageCircle className="w-3 h-3" />
+                        <span>Encaminhado ao WhatsApp</span>
+                      </span>
+                    )}
                   </div>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 mt-1">
                     {activeSession.leadPhone ? (

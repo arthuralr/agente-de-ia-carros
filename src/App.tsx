@@ -40,6 +40,7 @@ import { PrivacyPolicyPage } from './components/public/PrivacyPolicyPage';
 import { PWAInstallBanner } from './components/public/PWAInstallBanner';
 import { AdminLoginPage } from './components/auth/AdminLoginPage';
 import { adminFetch, clearAdminSessionToken } from './utils/authSession';
+import { normalizeStoreWhatsAppNumber } from './utils/whatsappHandoff';
 
 function loadStored<T>(key: string, fallback: T): T {
   try {
@@ -121,7 +122,13 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [preselectedChatSessionId, setPreselectedChatSessionId] = useState<
     string | null
-  >(null);
+  >(() => {
+    if (typeof window === 'undefined') return null;
+    const sessionParam = new URLSearchParams(window.location.search)
+      .get('session')
+      ?.trim();
+    return sessionParam || null;
+  });
 
   // Auth Session State
   const [authUser, setAuthUser] = useState<AdminUser | null>(null);
@@ -139,6 +146,11 @@ export default function App() {
     loadStored('armazem_settings_v1', INITIAL_SETTINGS)
   );
   const [operationMode, setOperationMode] = useState<OperationMode>('full');
+  const [storeWhatsappNumber, setStoreWhatsappNumber] = useState<string>(() =>
+    normalizeStoreWhatsAppNumber(
+      loadStored('armazem_settings_v1', INITIAL_SETTINGS).whatsapp
+    ) || '5511994821040'
+  );
   const [activities, setActivities] = useState<ActivityLog[]>(INITIAL_ACTIVITY);
 
   // Public Chat Lead Token Store (allows public visitors to append chat turns without admin auth)
@@ -247,9 +259,20 @@ export default function App() {
       try {
         const cfgRes = await fetch('/api/public/config');
         if (active && cfgRes.ok) {
-          const cfg = (await cfgRes.json()) as { operationMode?: OperationMode };
+          const cfg = (await cfgRes.json()) as {
+            operationMode?: OperationMode;
+            storeWhatsappNumber?: string;
+          };
           if (cfg.operationMode === 'agent_only' || cfg.operationMode === 'full') {
             setOperationMode(cfg.operationMode);
+          }
+          if (cfg.storeWhatsappNumber) {
+            const normalized = normalizeStoreWhatsAppNumber(
+              cfg.storeWhatsappNumber
+            );
+            if (normalized.length >= 10) {
+              setStoreWhatsappNumber(normalized);
+            }
           }
         }
       } catch {
@@ -291,6 +314,12 @@ export default function App() {
       const parsed = parseRouteFromPathname(window.location.pathname);
       setActiveModule(parsed.module);
       setViewMode(parsed.viewMode);
+      const sessionParam = new URLSearchParams(window.location.search)
+        .get('session')
+        ?.trim();
+      if (sessionParam) {
+        setPreselectedChatSessionId(sessionParam);
+      }
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
@@ -782,6 +811,32 @@ export default function App() {
     );
   };
 
+  const handleUpdateStoreWhatsappNumber = async (nextNumber: string) => {
+    const res = await adminFetch('/api/admin/settings/store-whatsapp', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ storeWhatsappNumber: nextNumber }),
+    });
+    if (res.status === 401) {
+      handleUnauthorizedSession();
+      throw new Error('Sessão administrativa expirada.');
+    }
+    if (!res.ok) {
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(
+        errData.error ||
+          'Falha ao salvar WhatsApp comercial da loja no Neon PostgreSQL.'
+      );
+    }
+    const saved = (await res.json()) as { storeWhatsappNumber: string };
+    setStoreWhatsappNumber(saved.storeWhatsappNumber);
+    pushActivity(
+      'WhatsApp comercial da loja atualizado',
+      `Transbordo direto wa.me configurado para ${saved.storeWhatsappNumber}`,
+      'estoque'
+    );
+  };
+
   // 1A. Public LGPD Privacy Policy Page (/privacidade)
   if (viewMode === 'privacy') {
     return (
@@ -805,6 +860,7 @@ export default function App() {
       <StandaloneChatPage
         vehicles={vehicles}
         settings={settings}
+        storeWhatsappNumber={storeWhatsappNumber}
         showBackToCatalog={operationMode === 'full'}
         onCaptureLead={handleCapturePublicLead}
         onSyncLeadChat={handleSyncPublicLeadChat}
@@ -1056,7 +1112,9 @@ export default function App() {
             <SettingsModule
               settings={settings}
               operationMode={operationMode}
+              storeWhatsappNumber={storeWhatsappNumber}
               onChangeOperationMode={handleUpdateOperationMode}
+              onSaveStoreWhatsappNumber={handleUpdateStoreWhatsappNumber}
               onSaveSettings={(next) => {
                 setSettings(next);
                 pushActivity(

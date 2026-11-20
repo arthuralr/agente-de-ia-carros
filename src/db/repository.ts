@@ -53,6 +53,8 @@ export interface DbChatSessionRow {
   tag?: string | null;
   ai_summary?: string | null;
   ai_summary_updated_at?: Date | null;
+  whatsapp_handoff_at?: Date | null;
+  handoff_status?: string | null;
   created_at: Date;
   updated_at: Date;
   message_count?: number;
@@ -112,7 +114,9 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
       ALTER TABLE chat_sessions
       ADD COLUMN IF NOT EXISTS tag VARCHAR(64),
       ADD COLUMN IF NOT EXISTS ai_summary TEXT,
-      ADD COLUMN IF NOT EXISTS ai_summary_updated_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS ai_summary_updated_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS whatsapp_handoff_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS handoff_status VARCHAR(64)
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS chat_messages (
@@ -179,6 +183,25 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_feature
       ON ai_usage_logs(feature)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'visitor')),
+        session_id VARCHAR(128),
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_role
+      ON push_subscriptions(role)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_session_id
+      ON push_subscriptions(session_id)
     `);
     const vehCount = await client.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM vehicles'

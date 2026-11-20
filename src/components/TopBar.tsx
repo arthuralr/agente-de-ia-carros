@@ -1,16 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertCircle,
   Bell,
   BellRing,
+  Check,
   CheckCheck,
   ExternalLink,
   Kanban,
+  Loader2,
   Menu,
   MessageSquareText,
   Plus,
+  X,
 } from 'lucide-react';
 import { AdminNotificationItem, NavModule, OperationMode } from '../types';
 import { adminFetch } from '../utils/authSession';
+import { useWebPush } from '../hooks/useWebPush';
 
 interface TopBarProps {
   activeModule: NavModule;
@@ -126,6 +131,7 @@ export const TopBar: React.FC<TopBarProps> = ({
       return 'unsupported';
     }
   );
+  const adminPush = useWebPush({ role: 'admin' });
 
   const knownIdsRef = useRef<Set<string>>(new Set());
   const initializedRef = useRef<boolean>(false);
@@ -230,14 +236,12 @@ export const TopBar: React.FC<TopBarProps> = ({
     }
   };
 
-  const handleRequestBrowserPermission = async () => {
-    if (typeof window === 'undefined' || !('Notification' in window)) return;
-    try {
-      const perm = await Notification.requestPermission();
-      setBrowserNotifPermission(perm);
-    } catch {
-      // Ignore permission errors
+  const handleActivateAdminPush = async () => {
+    const ok = await adminPush.subscribe();
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      setBrowserNotifPermission(Notification.permission);
     }
+    return ok;
   };
 
   const handleSelectNotification = (item: AdminNotificationItem) => {
@@ -278,7 +282,45 @@ export const TopBar: React.FC<TopBarProps> = ({
         </div>
       </div>
 
-      <div className="flex items-center gap-2.5 sm:gap-3 shrink-0">
+      <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
+        {/* Admin Native Web Push Subscription Button (role = 'admin') */}
+        <button
+          type="button"
+          disabled={adminPush.isSubscribing}
+          onClick={() => void handleActivateAdminPush()}
+          title={
+            adminPush.isSubscribed
+              ? 'Alertas Push ativos neste aparelho (toque para revalidar)'
+              : 'Ativar notificações Push nativas neste aparelho para novos leads e mensagens'
+          }
+          className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 ${
+            adminPush.isSubscribed
+              ? 'bg-emerald-500/12 border-emerald-500/35 text-emerald-300 hover:bg-emerald-500/20'
+              : 'bg-amber-500/12 border-amber-500/35 text-amber-200 hover:bg-amber-500/20'
+          }`}
+        >
+          {adminPush.isSubscribing ? (
+            <>
+              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+              <span className="hidden md:inline">Ativando...</span>
+            </>
+          ) : adminPush.isSubscribed ? (
+            <>
+              <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span className="hidden md:inline">Alertas Ativos</span>
+              <span className="md:hidden">Push Ativo</span>
+            </>
+          ) : (
+            <>
+              <BellRing className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span className="hidden xl:inline">
+                Ativar Alertas Push neste Aparelho
+              </span>
+              <span className="xl:hidden">Ativar Alertas Push</span>
+            </>
+          )}
+        </button>
+
         {/* Admin Notification Bell + Unread Badge */}
         <div className="relative" ref={dropdownRef}>
           <button
@@ -325,17 +367,18 @@ export const TopBar: React.FC<TopBarProps> = ({
                 )}
               </div>
 
-              {browserNotifPermission === 'default' && (
+              {!adminPush.isSubscribed && browserNotifPermission !== 'denied' && (
                 <div className="px-4 py-2.5 bg-amber-500/10 border-b border-amber-500/20 flex items-center justify-between gap-2">
                   <span className="text-[11px] text-amber-200 leading-snug">
-                    Receba alertas no navegador quando chegar um novo lead.
+                    Receba alertas Push nativos no celular/PC quando chegar um novo lead.
                   </span>
                   <button
                     type="button"
-                    onClick={() => void handleRequestBrowserPermission()}
-                    className="px-2.5 py-1 rounded-md bg-amber-500 hover:bg-amber-400 text-[#09090B] text-[11px] font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                    disabled={adminPush.isSubscribing}
+                    onClick={() => void handleActivateAdminPush()}
+                    className="px-2.5 py-1 rounded-md bg-amber-500 hover:bg-amber-400 text-[#09090B] text-[11px] font-semibold whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
                   >
-                    Ativar
+                    {adminPush.isSubscribing ? 'Ativando...' : 'Ativar'}
                   </button>
                 </div>
               )}
@@ -423,6 +466,21 @@ export const TopBar: React.FC<TopBarProps> = ({
           <span>Novo Veículo</span>
         </button>
       </div>
+
+      {adminPush.statusMessage && (
+        <div className="absolute right-4 sm:right-6 top-[68px] z-50 max-w-sm bg-[#111114] border border-amber-500/40 rounded-xl shadow-2xl px-3.5 py-2.5 flex items-start gap-2.5 text-xs text-amber-100">
+          <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          <span className="leading-snug flex-1">{adminPush.statusMessage}</span>
+          <button
+            type="button"
+            onClick={adminPush.clearStatusMessage}
+            aria-label="Fechar aviso"
+            className="text-zinc-400 hover:text-white shrink-0"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
     </header>
   );
 };
