@@ -4452,12 +4452,22 @@ let dbInitPromise: Promise<void> | null = null;
 export function ensureDatabaseInitialized(): Promise<void> {
   if (!dbInitPromise) {
     dbInitPromise = (async () => {
+      let failed = false;
       try {
         await seedNeonDatabaseIfEmpty();
-        await ensureAdminUsersSchemaAndSeed();
-        console.log('[DB] Neon PostgreSQL conectado e tabelas verificadas.');
       } catch (err) {
+        failed = true;
         console.error('[DB] Falha ao inicializar/semear Neon PostgreSQL:', err);
+      }
+      try {
+        await ensureAdminUsersSchemaAndSeed();
+      } catch (err) {
+        failed = true;
+        console.error('[DB] Falha ao verificar/semear admin_users no Neon:', err);
+      }
+      if (!failed) {
+        console.log('[DB] Neon PostgreSQL conectado e tabelas verificadas.');
+      } else {
         dbInitPromise = null;
       }
     })();

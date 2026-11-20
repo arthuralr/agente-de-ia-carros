@@ -7,17 +7,22 @@ if (fs.existsSync('.env.local')) {
 }
 dotenv.config();
 
-const connectionString = process.env.DATABASE_URL;
+const connectionString = process.env.DATABASE_URL?.trim();
 
 if (!connectionString) {
   console.warn('[DB] DATABASE_URL não definida no ambiente (.env.local / .env).');
 }
 
+const requiresSsl = Boolean(
+  connectionString &&
+    (connectionString.includes('sslmode=require') ||
+      connectionString.includes('sslmode=verify-full') ||
+      connectionString.includes('neon.tech'))
+);
+
 export const pool = new Pool({
   connectionString,
-  ssl: connectionString?.includes('sslmode=require')
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl: requiresSsl ? { rejectUnauthorized: false } : undefined,
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,

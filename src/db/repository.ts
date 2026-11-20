@@ -144,65 +144,81 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id
       ON chat_messages(session_id, id)
     `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS chat_broadcasts (
-        id SERIAL PRIMARY KEY,
-        title VARCHAR(160),
-        message TEXT NOT NULL,
-        created_by VARCHAR(120),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_chat_broadcasts_created_at
-      ON chat_broadcasts(created_at DESC)
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS app_settings (
-        key VARCHAR(64) PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS ai_usage_logs (
-        id SERIAL PRIMARY KEY,
-        session_id VARCHAR(128),
-        feature VARCHAR(64) NOT NULL,
-        model VARCHAR(128) NOT NULL,
-        prompt_tokens INTEGER NOT NULL DEFAULT 0,
-        completion_tokens INTEGER NOT NULL DEFAULT 0,
-        total_tokens INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_created_at
-      ON ai_usage_logs(created_at DESC)
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_feature
-      ON ai_usage_logs(feature)
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS push_subscriptions (
-        id SERIAL PRIMARY KEY,
-        role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'visitor')),
-        session_id VARCHAR(128),
-        endpoint TEXT NOT NULL UNIQUE,
-        p256dh TEXT NOT NULL,
-        auth TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_role
-      ON push_subscriptions(role)
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_session_id
-      ON push_subscriptions(session_id)
-    `);
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_broadcasts (
+          id SERIAL PRIMARY KEY,
+          title VARCHAR(160),
+          message TEXT NOT NULL,
+          created_by VARCHAR(120),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_broadcasts_created_at
+        ON chat_broadcasts(created_at DESC)
+      `);
+    } catch (err) {
+      console.warn('[DB] Aviso ao verificar tabela secundária chat_broadcasts:', err);
+    }
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS app_settings (
+          key VARCHAR(64) PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+    } catch (err) {
+      console.warn('[DB] Aviso ao verificar tabela secundária app_settings:', err);
+    }
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS ai_usage_logs (
+          id SERIAL PRIMARY KEY,
+          session_id VARCHAR(128),
+          feature VARCHAR(64) NOT NULL,
+          model VARCHAR(128) NOT NULL,
+          prompt_tokens INTEGER NOT NULL DEFAULT 0,
+          completion_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_created_at
+        ON ai_usage_logs(created_at DESC)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_feature
+        ON ai_usage_logs(feature)
+      `);
+    } catch (err) {
+      console.warn('[DB] Aviso ao verificar tabela secundária ai_usage_logs:', err);
+    }
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+          id SERIAL PRIMARY KEY,
+          role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'visitor')),
+          session_id VARCHAR(128),
+          endpoint TEXT NOT NULL UNIQUE,
+          p256dh TEXT NOT NULL,
+          auth TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_push_subscriptions_role
+        ON push_subscriptions(role)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_push_subscriptions_session_id
+        ON push_subscriptions(session_id)
+      `);
+    } catch (err) {
+      console.warn('[DB] Aviso ao verificar tabela secundária push_subscriptions:', err);
+    }
     const vehCount = await client.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM vehicles'
     );

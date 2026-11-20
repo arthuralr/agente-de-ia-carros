@@ -1,4 +1,4 @@
-import webpush from 'web-push';
+import { createRequire } from 'node:module';
 import { pool } from '../db/pool';
 
 export type PushSubscriptionRole = 'admin' | 'visitor';
@@ -30,39 +30,124 @@ interface DbPushSubscriptionRow {
   created_at: Date;
 }
 
+interface WebPushClientLike {
+  setVapidDetails: (subject: string, publicKey: string, privateKey: string) => void;
+  sendNotification: (
+    subscription: {
+      endpoint: string;
+      keys: { p256dh: string; auth: string };
+    },
+    payload?: string,
+    options?: { TTL?: number }
+  ) => Promise<unknown>;
+}
+
+type WebPushModuleShape =
+  | (Partial<WebPushClientLike> & { default?: Partial<WebPushClientLike> })
+  | undefined;
+
+let cachedWebPushClient: WebPushClientLike | null = null;
 let lastConfiguredSignature = '';
+
+function isPlausibleVapidKey(value: string): boolean {
+  if (!value || value.length < 20) return false;
+  if (/^(MY_|YOUR_|CHANGE_ME|PLACEHOLDER)/i.test(value)) return false;
+  return /^[A-Za-z0-9_-]+=*$/.test(value);
+}
 
 function getVapidConfig(): {
   publicKey: string;
   privateKey: string;
   subject: string;
 } | null {
-  const publicKey = (process.env.VAPID_PUBLIC_KEY || '').trim();
-  const privateKey = (process.env.VAPID_PRIVATE_KEY || '').trim();
-  const subject =
-    (process.env.VAPID_SUBJECT || '').trim() ||
-    'mailto:contato@armazemdocarro.com.br';
+  try {
+    const publicKey = (process.env.VAPID_PUBLIC_KEY || '').trim();
+    const privateKey = (process.env.VAPID_PRIVATE_KEY || '').trim();
+    const rawSubject = (process.env.VAPID_SUBJECT || '').trim();
+    const subject =
+      rawSubject && (/^(mailto:|https?:\/\/)/i.test(rawSubject))
+        ? rawSubject
+        : 'mailto:contato@armazemdocarro.com.br';
 
-  if (!publicKey || !privateKey) {
+    if (!isPlausibleVapidKey(publicKey) || !isPlausibleVapidKey(privateKey)) {
+      return null;
+    }
+    return { publicKey, privateKey, subject };
+  } catch {
     return null;
   }
-  return { publicKey, privateKey, subject };
 }
 
-function ensureWebPushConfigured(): boolean {
-  const cfg = getVapidConfig();
-  if (!cfg) return false;
-  const sig = `${cfg.subject}|${cfg.publicKey}|${cfg.privateKey}`;
-  if (lastConfiguredSignature !== sig) {
-    try {
-      webpush.setVapidDetails(cfg.subject, cfg.publicKey, cfg.privateKey);
-      lastConfiguredSignature = sig;
-    } catch (err) {
-      console.error('[WebPush] Invalid VAPID configuration:', err);
-      return false;
-    }
+function normalizeWebPushExport(loaded: WebPushModuleShape): WebPushClientLike | null {
+  const candidate = loaded?.default ?? loaded;
+  if (
+    candidate &&
+    typeof candidate.setVapidDetails === 'function' &&
+    typeof candidate.sendNotification === 'function'
+  ) {
+    return candidate as WebPushClientLike;
   }
-  return true;
+  return null;
+}
+
+/**
+ * Lazily loads `web-push` exclusively when sending a push notification
+ * (never during module startup). Tries `createRequire(import.meta.url)` first
+ * and falls back to dynamic `await import('web-push')` (for runtimes like Node 20
+ * where `require()` on pure-ESM `web-push@4` throws ERR_REQUIRE_ESM), always
+ * normalizing `loaded?.default ?? loaded`.
+ */
+async function loadWebPushClient(): Promise<WebPushClientLike | null> {
+  try {
+    const require = createRequire(import.meta.url);
+    const loaded = require('web-push') as WebPushModuleShape;
+    const normalized = normalizeWebPushExport(loaded);
+    if (normalized) return normalized;
+  } catch {
+    // Fallback to native dynamic ESM import
+  }
+
+  try {
+    const loaded = (await import('web-push')) as unknown as WebPushModuleShape;
+    const normalized = normalizeWebPushExport(loaded);
+    if (normalized) return normalized;
+  } catch (err) {
+    console.warn('[WebPush] Falha silenciosa ao importar web-push:', err);
+  }
+
+  return null;
+}
+
+async function getConfiguredWebPushClient(): Promise<WebPushClientLike | null> {
+  const cfg = getVapidConfig();
+  if (!cfg) return null;
+
+  try {
+    if (!cachedWebPushClient) {
+      const client = await loadWebPushClient();
+      if (!client) {
+        console.warn('[WebPush] Módulo web-push indisponível neste runtime.');
+        return null;
+      }
+      cachedWebPushClient = client;
+    }
+
+    const sig = `${cfg.subject}|${cfg.publicKey}|${cfg.privateKey}`;
+    if (lastConfiguredSignature !== sig) {
+      cachedWebPushClient.setVapidDetails(
+        cfg.subject,
+        cfg.publicKey,
+        cfg.privateKey
+      );
+      lastConfiguredSignature = sig;
+    }
+
+    return cachedWebPushClient;
+  } catch (err) {
+    console.warn('[WebPush] Falha silenciosa ao configurar web-push:', err);
+    lastConfiguredSignature = '';
+    return null;
+  }
 }
 
 export function getPublicVapidKey(): string | null {
@@ -105,7 +190,8 @@ export async function sendPushToSubscribers(options: {
   payload: PushNotificationPayload;
 }): Promise<{ configured: boolean; sent: number; removed: number }> {
   try {
-    if (!ensureWebPushConfigured()) {
+    const webpush = await getConfiguredWebPushClient();
+    if (!webpush) {
       return { configured: false, sent: 0, removed: 0 };
     }
 
@@ -138,15 +224,18 @@ export async function sendPushToSubscribers(options: {
       return { configured: true, sent: 0, removed: 0 };
     }
 
+    const targetUrl =
+      options.payload.url || (options.role === 'admin' ? '/admin' : '/chat');
+
     const serializedPayload = JSON.stringify({
       title: options.payload.title.slice(0, 120),
       body: options.payload.body.slice(0, 220),
       icon: options.payload.icon || '/pwa-192x192.png',
       badge: options.payload.badge || '/pwa-192x192.png',
       tag: options.payload.tag || `armazem-${options.role}`,
-      url: options.payload.url || (options.role === 'admin' ? '/admin' : '/chat'),
+      url: targetUrl,
       data: {
-        url: options.payload.url || (options.role === 'admin' ? '/admin' : '/chat'),
+        url: targetUrl,
       },
     });
 
@@ -195,7 +284,7 @@ export async function sendPushToSubscribers(options: {
 
     return { configured: true, sent, removed };
   } catch (err) {
-    console.error('[WebPush Dispatch Error]', err);
+    console.warn('[WebPush Dispatch Error]', err);
     return { configured: isWebPushConfigured(), sent: 0, removed: 0 };
   }
 }
@@ -207,7 +296,7 @@ export function triggerAdminPushInBackground(
   void sendPushToSubscribers({
     role: 'admin',
     payload,
-  });
+  }).catch(() => {});
 }
 
 export function triggerVisitorSessionPushInBackground(
@@ -219,7 +308,7 @@ export function triggerVisitorSessionPushInBackground(
     role: 'visitor',
     sessionId: sessionId.trim(),
     payload,
-  });
+  }).catch(() => {});
 }
 
 export function triggerAllVisitorsPushInBackground(
@@ -229,5 +318,5 @@ export function triggerAllVisitorsPushInBackground(
   void sendPushToSubscribers({
     role: 'visitor',
     payload,
-  });
+  }).catch(() => {});
 }
