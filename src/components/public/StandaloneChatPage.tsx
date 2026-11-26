@@ -12,6 +12,7 @@ import {
   ChevronRight,
   Copy,
   Download,
+  ExternalLink,
   FileText,
   Filter,
   GitCompareArrows,
@@ -69,7 +70,9 @@ import {
   formatDealershipHours,
   formatKmBr,
   getVehicleDisplayTitle,
+  resolvePublicStorefrontLinks,
 } from '../../utils/vehicleDomain';
+import { ApiVehicleRow, mapDbVehicleToFrontend } from '../../db/mappers';
 import { useVirtualConsultant } from '../../hooks/useVirtualConsultant';
 import { useWebPush } from '../../hooks/useWebPush';
 import { ChatMarkdown } from './ChatMarkdown';
@@ -122,23 +125,54 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
   const urlSearchMeta = useMemo(() => {
     if (typeof window === 'undefined') {
-      return { vehicleId: null as string | null, origem: '/chat' };
+      return {
+        vehicleId: null as string | null,
+        origem: '/chat',
+        isEmbedded: false,
+      };
     }
     const params = new URLSearchParams(window.location.search);
     const vehicleId = params.get('veiculo')?.trim() || null;
     const rawOrigem = params.get('origem')?.trim() || '';
-    const origem = rawOrigem ? `/chat (${rawOrigem})` : '/chat';
-    return { vehicleId, origem };
+    const isEmbedded = params.get('embed') === '1';
+    const origem = rawOrigem ? `/chat (${rawOrigem})` : isEmbedded ? '/chat (widget)' : '/chat';
+    return { vehicleId, origem, isEmbedded };
   }, []);
+
+  const storefront = useMemo(
+    () => resolvePublicStorefrontLinks(effectiveSettings),
+    [effectiveSettings]
+  );
+
+  const [fetchedExternalVehicle, setFetchedExternalVehicle] = useState<Vehicle | null>(null);
+
+  useEffect(() => {
+    const id = urlSearchMeta.vehicleId;
+    if (!id || initialVehicle) return;
+    if (vehicles.some((v) => String(v.id) === String(id))) return;
+    let active = true;
+    void fetch(`/api/public/vehicles/${encodeURIComponent(id)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((row: ApiVehicleRow | null) => {
+        if (active && row && row.id) {
+          setFetchedExternalVehicle(mapDbVehicleToFrontend(row));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [initialVehicle, urlSearchMeta.vehicleId, vehicles]);
 
   const resolvedInitialVehicle = useMemo(() => {
     if (initialVehicle) return initialVehicle;
     if (!urlSearchMeta.vehicleId) return null;
     return (
       vehicles.find((v) => String(v.id) === String(urlSearchMeta.vehicleId)) ||
+      fetchedExternalVehicle ||
       null
     );
-  }, [initialVehicle, urlSearchMeta.vehicleId, vehicles]);
+  }, [initialVehicle, urlSearchMeta.vehicleId, vehicles, fetchedExternalVehicle]);
 
   const persistStorageKey = useMemo(() => {
     if (typeof window === 'undefined') return 'armazem_chat_v1_default';
@@ -326,6 +360,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       buildWhatsAppHandoffUrl({
         storeWhatsappNumber: effectiveStoreWhatsapp,
         storeName: effectiveSettings.tradeName,
+        dealership: effectiveSettings,
         leadName: customerName,
         leadPhone: customerWhatsapp,
         includeContactData: false,
@@ -339,7 +374,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       appOrigin,
       customerName,
       customerWhatsapp,
-      effectiveSettings.tradeName,
+      effectiveSettings,
       effectiveStoreWhatsapp,
       focusedVehicle,
       messages,
@@ -1084,12 +1119,18 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   );
 
   return (
-    <div className="h-dvh w-full bg-[#DADBD3] text-[#111B21] relative flex flex-col items-center justify-center overflow-hidden lg:py-5 lg:px-6">
+    <div
+      className={`h-dvh w-full bg-[#DADBD3] text-[#111B21] relative flex flex-col items-center justify-center overflow-hidden ${
+        urlSearchMeta.isEmbedded ? '' : 'lg:py-5 lg:px-6'
+      }`}
+    >
       {/* Classic WhatsApp Web Top Green Strip on Desktop */}
-      <div
-        aria-hidden="true"
-        className="hidden lg:block fixed top-0 inset-x-0 h-[128px] bg-[#00A884] z-0"
-      />
+      {!urlSearchMeta.isEmbedded && (
+        <div
+          aria-hidden="true"
+          className="hidden lg:block fixed top-0 inset-x-0 h-[128px] bg-[#00A884] z-0"
+        />
+      )}
 
       {/* Hidden File Inputs for Images & PDF */}
       <input
@@ -1108,21 +1149,41 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       />
 
       {/* Main WhatsApp App Container */}
-      <div className="relative z-10 w-full h-full lg:max-w-[1100px] lg:max-h-[920px] lg:rounded-lg lg:shadow-[0_12px_32px_rgba(11,20,26,0.18)] flex overflow-hidden bg-[#EFEAE2]">
+      <div
+        className={`relative z-10 w-full h-full flex overflow-hidden bg-[#EFEAE2] ${
+          urlSearchMeta.isEmbedded
+            ? ''
+            : 'lg:max-w-[1100px] lg:max-h-[920px] lg:rounded-lg lg:shadow-[0_12px_32px_rgba(11,20,26,0.18)]'
+        }`}
+      >
         {/* Primary WhatsApp Conversation Column */}
         <div className="flex-1 min-w-0 h-full flex flex-col">
           {/* Official WhatsApp Dark Green Fixed Header (#075E54) */}
           <header className="h-[60px] shrink-0 bg-[#075E54] text-white px-2.5 sm:px-4 flex items-center justify-between gap-2 shadow-xs z-20">
             <div className="flex items-center gap-2 min-w-0">
-              {showBackToCatalog && (
-                <button
-                  type="button"
-                  onClick={onOpenCatalog}
-                  aria-label="Voltar à vitrine"
-                  className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-full text-white/90 hover:text-white hover:bg-white/10 transition-colors shrink-0"
-                >
-                  <ArrowLeft className="w-5 h-5" />
-                </button>
+              {!urlSearchMeta.isEmbedded && showBackToCatalog && (
+                storefront.isExternal ? (
+                  <a
+                    href={storefront.catalogUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label="Ver vitrine oficial da revenda"
+                    title="Ver vitrine oficial da revenda"
+                    className="min-h-[40px] px-2.5 flex items-center justify-center gap-1.5 rounded-full text-xs font-medium text-white/95 hover:text-white bg-white/10 hover:bg-white/15 transition-colors shrink-0"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Vitrine oficial</span>
+                  </a>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={onOpenCatalog}
+                    aria-label="Voltar à vitrine"
+                    className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-full text-white/90 hover:text-white hover:bg-white/10 transition-colors shrink-0"
+                  >
+                    <ArrowLeft className="w-5 h-5" />
+                  </button>
+                )
               )}
 
               {/* Round Store Avatar + Green Online Dot */}
@@ -1167,6 +1228,18 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
             {/* Header Right Actions: Single Primary Consultant CTA + Compact Overflow Menu */}
             <div className="flex items-center gap-1.5 shrink-0">
+              {urlSearchMeta.isEmbedded && (
+                <a
+                  href="/chat"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Abrir atendimento em tela cheia"
+                  title="Abrir em tela cheia"
+                  className="w-9 h-9 rounded-full text-white/90 hover:text-white hover:bg-white/10 transition-colors inline-flex items-center justify-center"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                </a>
+              )}
               <button
                 type="button"
                 onClick={() => openHandoffPreview('sales')}
@@ -1284,11 +1357,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             </div>
           </header>
 
-          {/* Deferred Installable PWA Banner (never shown on initial empty open; mutually exclusive with Web Push prompt) */}
+          {/* Deferred Installable PWA Banner (never shown on initial empty open or inside external widget iframe) */}
           <PWAInstallBanner
             variant="whatsapp"
             appName={effectiveSettings.tradeName}
-            suppressed={userMessageCount === 0}
+            suppressed={urlSearchMeta.isEmbedded || userMessageCount === 0}
             onVisibilityChange={setIsPwaBannerVisible}
           />
 
@@ -1845,47 +1918,67 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     msg.suggestedActions &&
                     msg.suggestedActions.length > 0 && (
                       <div className="flex flex-wrap items-center gap-1.5 pl-2 pt-0.5">
-                        {msg.suggestedActions.slice(0, 3).map((action) => (
-                          <button
-                            key={action.id || action.label}
-                            type="button"
-                            onClick={() => {
-                              if (action.kind === 'attach_photos') {
-                                handleTriggerPhotoAttach();
-                              } else if (action.kind === 'handoff') {
-                                const actionVehicle = action.vehicleId
-                                  ? vehicles.find(
-                                      (v) => String(v.id) === String(action.vehicleId)
-                                    ) || null
-                                  : msg.financingSummary?.vehicleId
+                        {msg.suggestedActions.slice(0, 3).map((action) => {
+                          if (
+                            action.kind === 'open_sheet' &&
+                            action.sheetPath &&
+                            /^https?:\/\//i.test(action.sheetPath)
+                          ) {
+                            return (
+                              <a
+                                key={action.id || action.label}
+                                href={action.sheetPath}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 rounded-full text-xs font-medium text-[#075E54] bg-white hover:bg-[#E7FCEB] border border-[#00A884]/35 shadow-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[#00A884]"
+                              >
+                                <span>{action.label}</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            );
+                          }
+                          return (
+                            <button
+                              key={action.id || action.label}
+                              type="button"
+                              onClick={() => {
+                                if (action.kind === 'attach_photos') {
+                                  handleTriggerPhotoAttach();
+                                } else if (action.kind === 'handoff') {
+                                  const actionVehicle = action.vehicleId
                                     ? vehicles.find(
-                                        (v) =>
-                                          String(v.id) ===
-                                          String(msg.financingSummary?.vehicleId)
+                                        (v) => String(v.id) === String(action.vehicleId)
                                       ) || null
-                                    : undefined;
-                                openHandoffPreview(
-                                  msg.financingSummary ? 'financing' : 'sales',
-                                  null,
-                                  null,
-                                  actionVehicle
-                                );
-                              } else if (
-                                action.kind === 'open_sheet' &&
-                                action.vehicleId
-                              ) {
-                                handleInternalLinkNavigate(
-                                  action.sheetPath || `/veiculo/${action.vehicleId}`
-                                );
-                              } else if (action.promptText) {
-                                sendQuickPrompt(action.promptText);
-                              }
-                            }}
-                            className="min-h-[38px] px-3 py-1.5 rounded-full text-xs font-medium text-[#075E54] bg-white hover:bg-[#E7FCEB] border border-[#00A884]/35 shadow-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[#00A884]"
-                          >
-                            {action.label}
-                          </button>
-                        ))}
+                                    : msg.financingSummary?.vehicleId
+                                      ? vehicles.find(
+                                          (v) =>
+                                            String(v.id) ===
+                                            String(msg.financingSummary?.vehicleId)
+                                        ) || null
+                                      : undefined;
+                                  openHandoffPreview(
+                                    msg.financingSummary ? 'financing' : 'sales',
+                                    null,
+                                    null,
+                                    actionVehicle
+                                  );
+                                } else if (
+                                  action.kind === 'open_sheet' &&
+                                  action.vehicleId
+                                ) {
+                                  handleInternalLinkNavigate(
+                                    action.sheetPath || `/veiculo/${action.vehicleId}`
+                                  );
+                                } else if (action.promptText) {
+                                  sendQuickPrompt(action.promptText);
+                                }
+                              }}
+                              className="min-h-[38px] px-3 py-1.5 rounded-full text-xs font-medium text-[#075E54] bg-white hover:bg-[#E7FCEB] border border-[#00A884]/35 shadow-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[#00A884]"
+                            >
+                              {action.label}
+                            </button>
+                          );
+                        })}
                       </div>
                     )}
                 </div>

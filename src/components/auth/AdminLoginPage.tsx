@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeft,
@@ -31,9 +31,11 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
     return new URLSearchParams(window.location.search).get('convite')?.trim() || '';
   }, []);
 
-  const [mode, setMode] = useState<'login' | 'invite'>(
+  const [mode, setMode] = useState<'login' | 'invite' | 'bootstrap'>(
     initialInviteToken ? 'invite' : 'login'
   );
+  const [needsBootstrap, setNeedsBootstrap] = useState(false);
+  const [bootstrapName, setBootstrapName] = useState('');
   const [inviteToken, setInviteToken] = useState(initialInviteToken);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -42,9 +44,79 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  useEffect(() => {
+    let active = true;
+    void fetch('/api/auth/bootstrap-status')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { needsBootstrap?: boolean } | null) => {
+        if (active && data?.needsBootstrap === true) {
+          setNeedsBootstrap(true);
+          if (!initialInviteToken) {
+            setMode('bootstrap');
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [initialInviteToken]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+
+    if (mode === 'bootstrap') {
+      if (!bootstrapName.trim() || !email.trim()) {
+        setErrorMsg('Informe nome completo e e-mail corporativo do primeiro administrador.');
+        return;
+      }
+      if (password.length < 10) {
+        setErrorMsg('Defina uma senha forte com pelo menos 10 caracteres.');
+        return;
+      }
+      if (password !== confirmPassword) {
+        setErrorMsg('As senhas digitadas não coincidem.');
+        return;
+      }
+      setIsSubmitting(true);
+      try {
+        const res = await fetch('/api/auth/bootstrap-admin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            name: bootstrapName.trim(),
+            email: email.trim(),
+            password,
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          authenticated?: boolean;
+          user?: AdminUser;
+          token?: string;
+          error?: string;
+        };
+        if (!res.ok || !data.authenticated || !data.user) {
+          throw new Error(
+            data.error || 'Não foi possível criar o administrador inicial.'
+          );
+        }
+        if (data.token) {
+          setAdminSessionToken(data.token);
+        }
+        onLoginSuccess(data.user);
+      } catch (err: unknown) {
+        setErrorMsg(
+          err instanceof Error
+            ? err.message
+            : 'Erro ao configurar o primeiro administrador.'
+        );
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
 
     if (mode === 'invite') {
       if (!inviteToken.trim()) {
@@ -192,14 +264,18 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
                 <span>Acesso da Equipe · Central da Revenda</span>
               </div>
               <h1 className="font-display text-2xl font-semibold text-white tracking-tight">
-                {mode === 'invite'
-                  ? 'Ativar Conta por Convite'
-                  : 'Entrar na Central da Revenda'}
+                {mode === 'bootstrap'
+                  ? 'Configurar Administrador Inicial'
+                  : mode === 'invite'
+                    ? 'Ativar Conta por Convite'
+                    : 'Entrar na Central da Revenda'}
               </h1>
               <p className="text-sm text-zinc-400 mt-1.5 leading-relaxed">
-                {mode === 'invite'
-                  ? 'Defina sua senha individual para acessar atendimentos, estoque, divulgação e documentos conforme seu perfil.'
-                  : 'Use sua conta individual de vendedor, assistente, gestor ou administrador.'}
+                {mode === 'bootstrap'
+                  ? 'Nenhuma conta administrativa existe neste ambiente. Cadastre o primeiro administrador para bloquear o acesso inicial.'
+                  : mode === 'invite'
+                    ? 'Defina sua senha individual para acessar atendimentos, estoque, divulgação e documentos conforme seu perfil.'
+                    : 'Use sua conta individual de vendedor, assistente, gestor ou administrador.'}
               </p>
             </div>
 
@@ -225,6 +301,26 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
             )}
 
             <form onSubmit={handleSubmit} className="space-y-4">
+              {mode === 'bootstrap' && (
+                <div>
+                  <label
+                    htmlFor="bootstrap-name"
+                    className="block text-xs font-medium text-zinc-300 mb-1.5"
+                  >
+                    Nome do Administrador
+                  </label>
+                  <input
+                    id="bootstrap-name"
+                    type="text"
+                    required
+                    value={bootstrapName}
+                    onChange={(e) => setBootstrapName(e.target.value)}
+                    placeholder="Ex.: Diretor Comercial"
+                    className="w-full px-3.5 py-2.5 rounded-lg bg-[#09090B] border border-white/[0.1] text-sm text-white placeholder:text-zinc-600 focus:outline-none focus:border-red-600"
+                  />
+                </div>
+              )}
+
               {mode === 'invite' ? (
                 <div>
                   <label
@@ -275,14 +371,20 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
                   htmlFor="admin-password"
                   className="block text-xs font-medium text-zinc-300 mb-1.5"
                 >
-                  {mode === 'invite' ? 'Definir Senha (mín. 8 caracteres)' : 'Senha de Acesso'}
+                  {mode === 'bootstrap'
+                    ? 'Definir Senha Forte (mín. 10 caracteres)'
+                    : mode === 'invite'
+                      ? 'Definir Senha (mín. 8 caracteres)'
+                      : 'Senha de Acesso'}
                 </label>
                 <div className="relative">
                   <Lock className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     id="admin-password"
                     type={showPassword ? 'text' : 'password'}
-                    autoComplete={mode === 'invite' ? 'new-password' : 'current-password'}
+                    autoComplete={
+                      mode === 'login' ? 'current-password' : 'new-password'
+                    }
                     required
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
@@ -304,7 +406,7 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
                 </div>
               </div>
 
-              {mode === 'invite' && (
+              {(mode === 'invite' || mode === 'bootstrap') && (
                 <div>
                   <label
                     htmlFor="confirm-password"
@@ -337,31 +439,35 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
                   </>
                 ) : (
                   <span>
-                    {mode === 'invite'
-                      ? 'Ativar Conta e Entrar'
-                      : 'Entrar na Central'}
+                    {mode === 'bootstrap'
+                      ? 'Criar Administrador e Entrar'
+                      : mode === 'invite'
+                        ? 'Ativar Conta e Entrar'
+                        : 'Entrar na Central'}
                   </span>
                 )}
               </button>
             </form>
 
-            <div className="mt-6 pt-5 border-t border-white/[0.08] flex items-center justify-between gap-2 text-xs text-zinc-400">
-              <span>
-                {mode === 'invite'
-                  ? 'Já possui conta ativa?'
-                  : 'Recebeu um convite do administrador?'}
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  setErrorMsg(null);
-                  setMode((prev) => (prev === 'login' ? 'invite' : 'login'));
-                }}
-                className="text-red-400 hover:text-red-300 font-medium transition-colors whitespace-nowrap"
-              >
-                {mode === 'invite' ? 'Fazer login' : 'Aceitar convite'}
-              </button>
-            </div>
+            {!needsBootstrap && (
+              <div className="mt-6 pt-5 border-t border-white/[0.08] flex items-center justify-between gap-2 text-xs text-zinc-400">
+                <span>
+                  {mode === 'invite'
+                    ? 'Já possui conta ativa?'
+                    : 'Recebeu um convite do administrador?'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setErrorMsg(null);
+                    setMode((prev) => (prev === 'login' ? 'invite' : 'login'));
+                  }}
+                  className="text-red-400 hover:text-red-300 font-medium transition-colors whitespace-nowrap"
+                >
+                  {mode === 'invite' ? 'Fazer login' : 'Aceitar convite'}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </main>

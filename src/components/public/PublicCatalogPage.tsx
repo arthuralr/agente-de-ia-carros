@@ -4,9 +4,11 @@ import {
   ArrowLeft,
   ArrowUpDown,
   Eye,
+  Menu,
   MessageSquare,
   RotateCcw,
   Search,
+  X,
 } from 'lucide-react';
 import { DealershipSettings, Vehicle, VehicleCategory } from '../../types';
 import { inferVehicleCategory } from '../../data/mockData';
@@ -27,6 +29,7 @@ interface PublicCatalogPageProps {
   onOpenDetails: (vehicle: Vehicle) => void;
   onInterest: (vehicle: Vehicle) => void;
   onOpenGeneralChat: () => void;
+  onOpenDirectChat: () => void;
   onOpenPrivacy?: () => void;
 }
 
@@ -51,9 +54,10 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
   onOpenAdmin,
   onOpenDetails,
   onInterest,
-  onOpenGeneralChat,
+  onOpenDirectChat,
   onOpenPrivacy,
 }) => {
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState<'Todos' | VehicleCategory>('Todos');
   const [transmissionFilter, setTransmissionFilter] = useState<
@@ -172,11 +176,20 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
     setSortBy('recent');
   };
 
+  const handleDirectChatClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) {
+      return;
+    }
+    e.preventDefault();
+    setMobileMenuOpen(false);
+    onOpenDirectChat();
+  };
+
   return (
     <div className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col">
-      {/* Slim Top Navigation Bar (3-zone contract) */}
-      <header className="sticky top-0 z-30 h-16 border-b border-white/[0.08] bg-[#09090B]/95 backdrop-blur-md">
-        <div className="max-w-7xl mx-auto h-full px-5 sm:px-8 flex items-center justify-between gap-8">
+      {/* Slim Top Navigation Bar (3-zone contract + responsive mobile menu) */}
+      <header className="sticky top-0 z-30 border-b border-white/[0.08] bg-[#09090B]/95 backdrop-blur-md">
+        <div className="max-w-7xl mx-auto h-16 px-5 sm:px-8 flex items-center justify-between gap-4 sm:gap-8">
           {/* Zone 1: Brand Wordmark */}
           <button
             type="button"
@@ -205,7 +218,10 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
           </button>
 
           {/* Zone 2: Concise Single-Line Nav Links */}
-          <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-zinc-400">
+          <nav
+            aria-label="Navegação principal"
+            className="hidden md:flex items-center gap-6 text-xs font-medium text-zinc-400"
+          >
             <button
               type="button"
               onClick={onBackHome}
@@ -216,13 +232,13 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
             <span className="text-white border-b border-red-600 pb-0.5 whitespace-nowrap shrink-0">
               Estoque de Veículos
             </span>
-            <button
-              type="button"
-              onClick={onOpenGeneralChat}
+            <a
+              href="/chat"
+              onClick={handleDirectChatClick}
               className="hover:text-white transition-colors whitespace-nowrap shrink-0"
             >
               Atendimento IA
-            </button>
+            </a>
             <button
               type="button"
               onClick={onOpenAdmin}
@@ -232,16 +248,65 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
             </button>
           </nav>
 
-          {/* Zone 3: Discreet Back to Home Button */}
-          <button
-            type="button"
-            onClick={onBackHome}
-            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium text-zinc-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
-          >
-            <ArrowLeft className="w-3.5 h-3.5 text-zinc-400" />
-            <span>Voltar ao Início</span>
-          </button>
+          {/* Zone 3: Discreet Back to Home Button + Mobile Menu Toggle */}
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={onBackHome}
+              className="hidden sm:inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium text-zinc-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
+            >
+              <ArrowLeft className="w-3.5 h-3.5 text-zinc-400" />
+              <span>Voltar ao Início</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setMobileMenuOpen((prev) => !prev)}
+              aria-label={mobileMenuOpen ? 'Fechar menu' : 'Abrir menu de navegação'}
+              aria-expanded={mobileMenuOpen}
+              className="md:hidden inline-flex items-center justify-center w-10 h-10 rounded-lg border border-white/[0.1] bg-white/[0.04] text-zinc-200 hover:text-white hover:bg-white/[0.08] transition-colors"
+            >
+              {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+            </button>
+          </div>
         </div>
+
+        {mobileMenuOpen && (
+          <nav
+            aria-label="Menu mobile"
+            className="md:hidden border-t border-white/[0.08] bg-[#0D0D10] px-5 py-4 space-y-2"
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setMobileMenuOpen(false);
+                onBackHome();
+              }}
+              className="w-full flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-medium text-zinc-200 hover:bg-white/[0.06]"
+            >
+              <span>Início</span>
+              <ArrowLeft className="w-4 h-4 text-zinc-400" />
+            </button>
+            <a
+              href="/chat"
+              onClick={handleDirectChatClick}
+              className="flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-semibold text-white bg-red-600 hover:bg-red-500"
+            >
+              <span>Atendimento IA</span>
+              <MessageSquare className="w-4 h-4" />
+            </a>
+            <button
+              type="button"
+              onClick={() => {
+                setMobileMenuOpen(false);
+                onOpenAdmin();
+              }}
+              className="w-full flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-medium text-zinc-400 hover:text-white hover:bg-white/[0.06]"
+            >
+              <span>Painel Admin</span>
+            </button>
+          </nav>
+        )}
       </header>
 
       {/* Main Content */}
@@ -257,14 +322,14 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={onOpenGeneralChat}
+          <a
+            href="/chat"
+            onClick={handleDirectChatClick}
             className="self-start md:self-auto inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors whitespace-nowrap shrink-0"
           >
             <MessageSquare className="w-3.5 h-3.5" />
-            <span>Consultor Virtual IA</span>
-          </button>
+            <span>Atendimento IA</span>
+          </a>
         </section>
 
         {/* Search, Filters & Sorting Bar */}
@@ -442,13 +507,18 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
               >
                 Mostrar todo o estoque
               </button>
-              <button
-                type="button"
-                onClick={onOpenGeneralChat}
+              <a
+                href="/chat"
+                onClick={(e) => {
+                  if (!e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+                    e.preventDefault();
+                    onOpenDirectChat();
+                  }
+                }}
                 className="px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500"
               >
                 Buscar sob encomenda no Chat IA
-              </button>
+              </a>
             </div>
           </div>
         ) : (

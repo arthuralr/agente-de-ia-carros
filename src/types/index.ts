@@ -67,6 +67,13 @@ export interface Vehicle {
   gallery?: string[];
   optionals: string[];
   createdAt: string;
+  // Optional metadata when vehicle comes from an external official dealership catalog
+  officialUrl?: string | null;
+  dataSource?: 'internal' | 'external';
+  externalId?: string | null;
+  sourceUpdatedAt?: string | null;
+  priceConfirmed?: boolean;
+  availabilityConfirmed?: boolean;
 }
 
 export interface FipePriceEntry {
@@ -146,6 +153,11 @@ export interface VehicleCardData {
   isConfirmedBelowFipeOffer: boolean;
   sheetPath: string;
   sheetUrl: string;
+  officialUrl?: string | null;
+  isExternalUrl?: boolean;
+  dataSource?: 'internal' | 'external';
+  priceConfirmed?: boolean;
+  availabilityConfirmed?: boolean;
   alternativeNote?: string | null;
 }
 
@@ -356,6 +368,42 @@ export interface ActivityLog {
   category: 'estoque' | 'crm' | 'contrato';
 }
 
+export type StorefrontMode = 'internal' | 'external';
+
+export type ExternalInventorySourceType =
+  | 'json_feed'
+  | 'structured_site'
+  | 'site_connector';
+
+export type WidgetPosition = 'bottom-right' | 'bottom-left';
+
+export type ExternalSourceHealthStatus =
+  | 'not_configured'
+  | 'ok'
+  | 'empty'
+  | 'stale'
+  | 'unavailable'
+  | 'error'
+  | 'connector_required';
+
+export interface ExternalInventorySourceSummary {
+  storeSlug: string;
+  sourceType: ExternalInventorySourceType;
+  feedUrl: string;
+  hasAuthHeader: boolean;
+  authHeaderName: string;
+  syncIntervalMinutes: number;
+  publicLinkStatus: 'unverified' | 'valid' | 'invalid';
+  publicLinkCheckedAt: string | null;
+  publicLinkDetail: string | null;
+  connectionStatus: ExternalSourceHealthStatus;
+  lastSyncAttemptAt: string | null;
+  lastSyncSuccessAt: string | null;
+  lastSyncCount: number;
+  availableCount: number;
+  lastError: string | null;
+}
+
 export interface DealershipSettings {
   tradeName: string;
   legalName: string;
@@ -381,6 +429,16 @@ export interface DealershipSettings {
   warrantyKm: number;
   financingMonthlyRatePct?: number | null;
   logoUrl?: string;
+  // Storefront mode & external site configuration (public-safe fields ONLY)
+  publicStoreSlug?: string;
+  storefrontMode?: StorefrontMode;
+  externalCatalogUrl?: string;
+  externalHomeUrl?: string;
+  // Floating agent widget configuration
+  widgetEnabled?: boolean;
+  widgetPosition?: WidgetPosition;
+  widgetLabel?: string;
+  widgetAllowedOrigins?: string[];
 }
 
 // ============================================================================

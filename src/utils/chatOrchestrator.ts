@@ -1,6 +1,7 @@
 import {
   ChatSuggestedAction,
   DealershipSettings,
+  ExternalSourceHealthStatus,
   Vehicle,
   VehicleCardData,
   VehicleComparisonData,
@@ -12,8 +13,6 @@ import {
   analyzeVisitIntent,
   buildDealershipMapsUrl,
   buildVehicleComparison,
-  buildVehicleSheetPath,
-  buildVehicleSheetUrl,
   checkVehicleAgainstFilters,
   computeFinancingSummary,
   computeFipeMetrics,
@@ -30,10 +29,18 @@ import {
   normalizeTextForMatch,
   parseFiltersDeterministically,
   parseFinancingParams,
+  resolvePublicStorefrontLinks,
   resolveVehicleReference,
+  resolveVehicleSheetLink,
   searchAndRankInventory,
   toVehicleCardData,
 } from './vehicleDomain';
+
+export interface ExternalInventoryRuntimeState {
+  health: ExternalSourceHealthStatus;
+  lastSuccessAt?: string | null;
+  errorDetail?: string | null;
+}
 
 export interface ChatTurnContextInput {
   activeFilters?: VehicleSearchFilters | null;
@@ -167,10 +174,22 @@ function buildOutOfFilterNote(
   return `\n- **Relação com sua busca anterior:** ${getVehicleDisplayTitle(vehicle)} ${vehicle.year} · **${quality.displayTransmission}** — este veículo está fora da sua busca anterior (${check.shortReason}).`;
 }
 
-function formatVehicleFactLine(v: Vehicle, origin?: string | null): string {
+function formatVehicleFactLine(
+  v: Vehicle,
+  origin?: string | null,
+  dealership?: Partial<DealershipSettings> | null
+): string {
   const q = analyzeVehicleDataQuality(v);
   const f = computeFipeMetrics(v);
-  const sheetUrl = buildVehicleSheetUrl(v.id, origin);
+  const link = resolveVehicleSheetLink(v, origin, dealership);
+  const priceText =
+    v.priceConfirmed === false || v.price <= 0
+      ? 'Preço: a confirmar no site oficial'
+      : `Preço à vista: ${formatBrlCurrency(v.price)}`;
+  const availText =
+    v.availabilityConfirmed === false
+      ? `Status: ${v.status} (confirmar disponibilidade atual com a loja)`
+      : `Status: ${v.status}`;
   const fipeText = !f.hasFipeValue
     ? 'FIPE: não cadastrada'
     : f.hasReferenceMonth
@@ -187,7 +206,7 @@ function formatVehicleFactLine(v: Vehicle, origin?: string | null): string {
     ? `Câmbio: EM CONFERÊNCIA CADASTRAL (${q.conflictDetail} — NÃO confirmar nem automático nem manual)`
     : `Câmbio: ${q.displayTransmission}`;
 
-  return `- [ID ${v.id}] ${getVehicleDisplayTitle(v)} ${v.version || ''} | Ano: ${v.year} | Preço à vista: ${formatBrlCurrency(v.price)} | Km: ${formatKmBr(v.km)} | ${transText} | Combustível: ${v.fuel || 'N/I'} | Status: ${v.status} | ${fipeText} | Link ficha: ${sheetUrl}`;
+  return `- [ID ${v.id}] ${getVehicleDisplayTitle(v)} ${v.version || ''} | Ano: ${v.year || 'A confirmar'} | ${priceText} | Km: ${v.km > 0 ? formatKmBr(v.km) : 'A confirmar'} | ${transText} | Combustível: ${v.fuel || 'N/I'} | ${availText} | ${fipeText} | Link (${link.label}): ${link.fullUrl}`;
 }
 
 function buildContextualActions(
@@ -209,20 +228,31 @@ function buildContextualActions(
     });
   }
   if (cards.length === 1) {
+    const card = cards[0];
+    const sheetActionLabel = card.isExternalUrl
+      ? card.officialUrl
+        ? 'Ver ficha oficial'
+        : 'Ver vitrine da revenda'
+      : 'Ver ficha';
     actions.push({
-      id: `act-sheet-${cards[0].id}`,
-      label: 'Ver ficha',
+      id: `act-sheet-${card.id}`,
+      label: sheetActionLabel,
       kind: 'open_sheet',
-      vehicleId: cards[0].id,
-      sheetPath: cards[0].sheetPath,
+      vehicleId: card.id,
+      sheetPath: card.sheetPath,
     });
-    if (options?.includeSimulate !== false && isVehicleAvailable({ status: cards[0].status })) {
+    if (
+      options?.includeSimulate !== false &&
+      isVehicleAvailable({ status: card.status }) &&
+      card.priceConfirmed !== false &&
+      card.price > 0
+    ) {
       actions.push({
-        id: `act-sim-${cards[0].id}`,
+        id: `act-sim-${card.id}`,
         label: 'Simular financiamento',
         kind: 'prompt',
-        promptText: `Quero simular financiamento para o ${getVehicleDisplayTitle(cards[0])} ${cards[0].year} (#${cards[0].id})`,
-        vehicleId: cards[0].id,
+        promptText: `Quero simular financiamento para o ${getVehicleDisplayTitle(card)} ${card.year} (#${card.id})`,
+        vehicleId: card.id,
       });
     }
   } else if (cards.length >= 2 && options?.includeCompare !== false) {
@@ -257,6 +287,7 @@ export function planChatTurn(params: {
   dealership: DealershipSettings;
   dealershipConfigUnavailable?: boolean;
   selectedVehicle?: Vehicle | null;
+  externalSourceState?: ExternalInventoryRuntimeState | null;
 }): ChatTurnPlan {
   const {
     allVehicles,
@@ -266,7 +297,27 @@ export function planChatTurn(params: {
     dealership,
     dealershipConfigUnavailable = false,
     selectedVehicle,
+    externalSourceState = null,
   } = params;
+
+  const storefront = resolvePublicStorefrontLinks(dealership);
+  const externalStaleNotice =
+    storefront.isExternal && externalSourceState?.health === 'stale'
+      ? `\n\n_Nota: os dados acima vêm da última sincronização bem-sucedida com o site oficial${
+          externalSourceState.lastSuccessAt
+            ? ` (${new Date(externalSourceState.lastSuccessAt).toLocaleString('pt-BR')})`
+            : ''
+        }. Confirme preço e disponibilidade atualizados no site da revenda ou com o consultor._`
+      : '';
+  const externalUnavailable =
+    storefront.isExternal &&
+    allVehicles.filter(isVehicleAvailable).length === 0 &&
+    Boolean(
+      externalSourceState &&
+        ['unavailable', 'error', 'connector_required', 'not_configured'].includes(
+          externalSourceState.health
+        )
+    );
 
   const normMsg = normalizeTextForMatch(latestUserUtterance);
   const origin = chatContext?.baseUrl || '';
@@ -447,12 +498,15 @@ export function planChatTurn(params: {
       `${locationInfo.markdownLines.join('\n')}${statusNote}\n\n` +
       `Se quiser prosseguir, use o botão **Falar com consultor** para revisar a mensagem antes de abrir o WhatsApp.`;
 
-    const cards = targetVehicle ? [toVehicleCardData(targetVehicle, origin)] : [];
+    const cards = targetVehicle ? [toVehicleCardData(targetVehicle, origin, null, dealership)] : [];
+    const targetLink = targetVehicle
+      ? resolveVehicleSheetLink(targetVehicle, origin, dealership)
+      : null;
     return {
       intent: 'visit_request',
       useDeterministicDirectly: true,
       deterministicReply,
-      verifiedFactsPrompt: `SOLICITAÇÃO DE VISITA (NÃO É VISITA CONFIRMADA):\n${locationInfo.factsText}\n${targetVehicle ? formatVehicleFactLine(targetVehicle, origin) : '- Nenhum veículo específico selecionado ainda.'}\nREGRA: Trate explicitamente como "solicitação de visita" pendente de confirmação com o consultor; NUNCA diga "visita confirmada".`,
+      verifiedFactsPrompt: `SOLICITAÇÃO DE VISITA (NÃO É VISITA CONFIRMADA):\n${locationInfo.factsText}\n${targetVehicle ? formatVehicleFactLine(targetVehicle, origin, dealership) : '- Nenhum veículo específico selecionado ainda.'}\nREGRA: Trate explicitamente como "solicitação de visita" pendente de confirmação com o consultor; NUNCA diga "visita confirmada".`,
       activeFilters: prevFilters,
       recentVehicleIds: targetVehicle ? [targetVehicle.id] : recentIds,
       focusedVehicleId: targetVehicle ? targetVehicle.id : focusedId,
@@ -466,7 +520,7 @@ export function planChatTurn(params: {
       }),
       isVisitInquiryOnly: false,
       suppressHandoff: false,
-      fichaUrl: targetVehicle ? buildVehicleSheetUrl(targetVehicle.id, origin) : null,
+      fichaUrl: targetLink?.fullUrl || null,
     };
   }
 
@@ -594,17 +648,17 @@ export function planChatTurn(params: {
       if (f) targets.push(f);
     }
 
-    const comparison = buildVehicleComparison(targets, origin);
+    const comparison = buildVehicleComparison(targets, origin, dealership);
     if (comparison) {
       const bullets = comparison.highlights.map((h) => `- ${h}`).join('\n');
-      const deterministicReply = `Comparei os **${comparison.vehicles.length} veículos selecionados** com base nos dados cadastrados:\n${bullets || '- Confira os campos lado a lado no comparativo abaixo.'}\n\nQuer abrir a ficha de algum deles ou simular financiamento?`;
+      const deterministicReply = `Comparei os **${comparison.vehicles.length} veículos selecionados** com base nos dados cadastrados:\n${bullets || '- Confira os campos lado a lado no comparativo abaixo.'}${externalStaleNotice}\n\nQuer abrir a ficha de algum deles ou simular financiamento?`;
 
       return {
         intent: 'comparison',
         useDeterministicDirectly: false,
         deterministicReply,
         verifiedFactsPrompt: `COMPARATIVO OBJETIVO (USE APENAS ESTES VEÍCULOS SELECIONADOS NA CONVERSA):
-${targets.map((v) => formatVehicleFactLine(v, origin)).join('\n')}
+${targets.map((v) => formatVehicleFactLine(v, origin, dealership)).join('\n')}
 Diferenças objetivas calculadas:
 ${bullets}
 REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não adicione outros carros do estoque.`,
@@ -617,7 +671,7 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
         promptAttachPhotos: false,
         suggestedActions: comparison.vehicles.map((c) => ({
           id: `act-sheet-${c.id}`,
-          label: `Ficha ${c.model} ${c.year}`,
+          label: c.isExternalUrl && !c.officialUrl ? `Vitrine ${c.model}` : `Ficha ${c.model} ${c.year}`,
           kind: 'open_sheet',
           vehicleId: c.id,
           sheetPath: c.sheetPath,
@@ -692,7 +746,7 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
         activeFilters: prevFilters,
         recentVehicleIds: ref.candidates.map((c) => c.id),
         focusedVehicleId: null,
-        vehicleCards: ref.candidates.slice(0, 3).map((c) => toVehicleCardData(c, origin)),
+        vehicleCards: ref.candidates.slice(0, 3).map((c) => toVehicleCardData(c, origin, null, dealership)),
         comparison: null,
         financingSummary: null,
         promptAttachPhotos: false,
@@ -707,6 +761,7 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
     const months = finParams.months ?? prevFinParams.months;
 
     if (targetVehicle && downPayment !== null && downPayment > 0) {
+      const targetLink = resolveVehicleSheetLink(targetVehicle, origin, dealership);
       if (!isVehicleAvailable(targetVehicle)) {
         const deterministicReply = `O **${getVehicleDisplayTitle(targetVehicle)} ${targetVehicle.year}** está atualmente **${targetVehicle.status}** e não está disponível para simulação. Quer que eu busque opções disponíveis na mesma faixa de preço?`;
         return {
@@ -717,14 +772,39 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
           activeFilters: prevFilters,
           recentVehicleIds: recentIds,
           focusedVehicleId: targetVehicle.id,
-          vehicleCards: [toVehicleCardData(targetVehicle, origin)],
+          vehicleCards: [toVehicleCardData(targetVehicle, origin, null, dealership)],
           comparison: null,
           financingSummary: null,
           promptAttachPhotos: false,
           suggestedActions: [],
           isVisitInquiryOnly: false,
           suppressHandoff: true,
-          fichaUrl: buildVehicleSheetUrl(targetVehicle.id, origin),
+          fichaUrl: targetLink.fullUrl,
+        };
+      }
+
+      if (targetVehicle.priceConfirmed === false || targetVehicle.price <= 0) {
+        const deterministicReply = `O **${getVehicleDisplayTitle(targetVehicle)} ${targetVehicle.year}** está sem preço confirmado na vitrine oficial, por isso não consigo calcular o saldo de financiamento com precisão agora.\n- **${targetLink.label}:** [${targetLink.label}](${targetLink.href})\n\nSe quiser, fale com um consultor para confirmar o valor atualizado e simular.`;
+        const cards = [toVehicleCardData(targetVehicle, origin, null, dealership)];
+        return {
+          intent: 'financing',
+          useDeterministicDirectly: true,
+          deterministicReply,
+          verifiedFactsPrompt: `Preço não confirmado na vitrine oficial para ${getVehicleDisplayTitle(targetVehicle)}.`,
+          activeFilters: prevFilters,
+          recentVehicleIds: [targetVehicle.id],
+          focusedVehicleId: targetVehicle.id,
+          vehicleCards: cards,
+          comparison: null,
+          financingSummary: null,
+          promptAttachPhotos: false,
+          suggestedActions: buildContextualActions(cards, {
+            includeSimulate: false,
+            includeHandoff: true,
+          }),
+          isVisitInquiryOnly: false,
+          suppressHandoff: false,
+          fichaUrl: targetLink.fullUrl,
         };
       }
 
@@ -736,8 +816,6 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
       });
 
       const targetQuality = analyzeVehicleDataQuality(targetVehicle);
-      const sheetPath = buildVehicleSheetPath(targetVehicle.id);
-      const sheetUrl = buildVehicleSheetUrl(targetVehicle.id, origin);
       const outOfFilterNote = buildOutOfFilterNote(targetVehicle, prevFilters);
       const returnSearchAct = outOfFilterNote
         ? buildReturnToSearchAction(prevFilters)
@@ -749,15 +827,15 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
         : `- **Parcela mensal${termLine}:** não calculada porque a taxa efetiva depende da análise de crédito e do banco escolhido (sem chute de parcela).`;
 
       const deterministicReply =
-        `Para o **${summary.vehicleTitle}** (${formatBrlCurrency(summary.vehiclePrice)} · **${targetQuality.displayTransmission}** · ${formatKmBr(targetVehicle.km)}):` +
+        `Para o **${summary.vehicleTitle}** (${formatBrlCurrency(summary.vehiclePrice)} · **${targetQuality.displayTransmission}** · ${targetVehicle.km > 0 ? formatKmBr(targetVehicle.km) : 'km a confirmar'}):` +
         `${outOfFilterNote}\n` +
         `- **Entrada informada:** ${formatBrlCurrency(summary.downPayment)}\n` +
         `- **Saldo a financiar (antes de juros e encargos):** **${formatBrlCurrency(summary.principalBalance)}**\n` +
         `${installmentBlock}\n` +
-        `- **Ficha completa:** [Abrir ficha do veículo](${sheetPath})\n\n` +
+        `- **${targetLink.label}:** [${targetLink.label}](${targetLink.href})${externalStaleNotice}\n\n` +
         `Quando preferir, você pode solicitar uma simulação real com um consultor (opcional).`;
 
-      const cards = [toVehicleCardData(targetVehicle, origin)];
+      const cards = [toVehicleCardData(targetVehicle, origin, null, dealership)];
       const baseActions = buildContextualActions(cards, {
         includeSimulate: false,
         includeHandoff: true,
@@ -770,7 +848,7 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
         useDeterministicDirectly: true,
         deterministicReply,
         verifiedFactsPrompt: `SIMULAÇÃO DETERMINÍSTICA CALCULADA EM CÓDIGO:
-${formatVehicleFactLine(targetVehicle, origin)}
+${formatVehicleFactLine(targetVehicle, origin, dealership)}
 - Preço: ${formatBrlCurrency(summary.vehiclePrice)}
 - Entrada: ${formatBrlCurrency(summary.downPayment)}
 - Saldo a financiar (antes de juros/IOF/tarifas): ${formatBrlCurrency(summary.principalBalance)}
@@ -786,34 +864,38 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         suggestedActions: baseActions,
         isVisitInquiryOnly: false,
         suppressHandoff: false,
-        fichaUrl: sheetUrl,
+        fichaUrl: targetLink.fullUrl,
       };
     }
 
     if (targetVehicle) {
       const targetQuality = analyzeVehicleDataQuality(targetVehicle);
+      const targetLink = resolveVehicleSheetLink(targetVehicle, origin, dealership);
       const outOfFilterNote = buildOutOfFilterNote(targetVehicle, prevFilters);
       const returnSearchAct = outOfFilterNote
         ? buildReturnToSearchAction(prevFilters)
         : null;
-      const sheetPath = buildVehicleSheetPath(targetVehicle.id);
-      const deterministicReply = `Para simular o **${getVehicleDisplayTitle(targetVehicle)} ${targetVehicle.year}** (**${formatBrlCurrency(targetVehicle.price)}** · **${targetQuality.displayTransmission}**):${outOfFilterNote}\n- **Ficha:** [Abrir ficha do veículo](${sheetPath})\n\nQual valor de **entrada** e em quantos **meses** (ex.: 36x, 48x ou 60x) você pretende financiar?`;
+      const priceDisplay =
+        targetVehicle.priceConfirmed === false || targetVehicle.price <= 0
+          ? 'preço a confirmar'
+          : `**${formatBrlCurrency(targetVehicle.price)}**`;
+      const deterministicReply = `Para simular o **${getVehicleDisplayTitle(targetVehicle)} ${targetVehicle.year}** (${priceDisplay} · **${targetQuality.displayTransmission}**):${outOfFilterNote}\n- **${targetLink.label}:** [${targetLink.label}](${targetLink.href})\n\nQual valor de **entrada** e em quantos **meses** (ex.: 36x, 48x ou 60x) você pretende financiar?`;
       return {
         intent: 'financing',
         useDeterministicDirectly: true,
         deterministicReply,
-        verifiedFactsPrompt: `Peça entrada e prazo para o veículo ${formatVehicleFactLine(targetVehicle, origin)}`,
+        verifiedFactsPrompt: `Peça entrada e prazo para o veículo ${formatVehicleFactLine(targetVehicle, origin, dealership)}`,
         activeFilters: prevFilters,
         recentVehicleIds: [targetVehicle.id],
         focusedVehicleId: targetVehicle.id,
-        vehicleCards: [toVehicleCardData(targetVehicle, origin)],
+        vehicleCards: [toVehicleCardData(targetVehicle, origin, null, dealership)],
         comparison: null,
         financingSummary: null,
         promptAttachPhotos: false,
         suggestedActions: returnSearchAct ? [returnSearchAct] : [],
         isVisitInquiryOnly: false,
         suppressHandoff: true,
-        fichaUrl: buildVehicleSheetUrl(targetVehicle.id, origin),
+        fichaUrl: targetLink.fullUrl,
       };
     }
   }
@@ -864,11 +946,17 @@ ${formatVehicleFactLine(targetVehicle, origin)}
       const v = ref.vehicle;
       const q = analyzeVehicleDataQuality(v);
       const f = computeFipeMetrics(v);
-      const sheetPath = buildVehicleSheetPath(v.id);
-      const sheetUrl = buildVehicleSheetUrl(v.id, origin);
-      const availabilityLine = isVehicleAvailable(v)
-        ? 'Disponível em estoque'
-        : `Status atual: **${v.status}** (não disponível para venda imediata)`;
+      const link = resolveVehicleSheetLink(v, origin, dealership);
+      const availabilityLine =
+        v.availabilityConfirmed === false
+          ? 'Disponibilidade a confirmar com a revenda'
+          : isVehicleAvailable(v)
+            ? 'Disponível em estoque'
+            : `Status atual: **${v.status}** (não disponível para venda imediata)`;
+      const priceText =
+        v.priceConfirmed === false || v.price <= 0
+          ? 'A confirmar no site oficial'
+          : formatBrlCurrency(v.price);
       const fipeDiffText =
         f.hasFipeValue && f.hasReferenceMonth && f.diffBrl !== null && f.diffPct !== null
           ? f.diffBrl > 0
@@ -890,9 +978,9 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         ? buildReturnToSearchAction(prevFilters)
         : null;
 
-      const deterministicReply = `Aqui está a ficha do **${getVehicleDisplayTitle(v)}** (${v.year}):\n- **Preço à vista:** ${formatBrlCurrency(v.price)} · **${formatKmBr(v.km)}** · **${q.displayTransmission}**\n- **${availabilityLine}** · ${fipeLine}${conflictWarning}${outOfFilterNote}\n- **Link direto da ficha:** [Abrir ficha do veículo](${sheetPath})\n\nQuer simular financiamento ou comparar com outro veículo?`;
+      const deterministicReply = `Aqui estão os detalhes do **${getVehicleDisplayTitle(v)}** (${v.year}):\n- **Preço à vista:** ${priceText} · **${v.km > 0 ? formatKmBr(v.km) : 'km a confirmar'}** · **${q.displayTransmission}**\n- **${availabilityLine}** · ${fipeLine}${conflictWarning}${outOfFilterNote}\n- **${link.label}:** [${link.label}](${link.href})${externalStaleNotice}\n\nQuer simular financiamento ou comparar com outro veículo?`;
 
-      const cards = [toVehicleCardData(v, origin)];
+      const cards = [toVehicleCardData(v, origin, null, dealership)];
       const actions = buildContextualActions(cards, {
         includeSimulate: isVehicleAvailable(v),
         includeHandoff: true,
@@ -903,7 +991,7 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         intent: 'vehicle_sheet',
         useDeterministicDirectly: true,
         deterministicReply,
-        verifiedFactsPrompt: `FICHA DIRETA SOLICITADA:\n${formatVehicleFactLine(v, origin)}\nURL compartilhável: ${sheetUrl}`,
+        verifiedFactsPrompt: `FICHA DIRETA SOLICITADA:\n${formatVehicleFactLine(v, origin, dealership)}\nURL: ${link.fullUrl}`,
         activeFilters: prevFilters,
         recentVehicleIds: [v.id],
         focusedVehicleId: v.id,
@@ -914,15 +1002,13 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         suggestedActions: actions,
         isVisitInquiryOnly: false,
         suppressHandoff: false,
-        fichaUrl: sheetUrl,
+        fichaUrl: link.fullUrl,
       };
     }
   }
 
   // -------------------------------------------------------------------------
   // 5.5 DIRECT SPECIFIC-VEHICLE CONFIRMATION / INSPECTION (preserves prior search!)
-  // Handles queries like "E o Onix manual?", "Me confirma se o Onix 2021 é manual"
-  // without clobbering the previous search filters.
   // -------------------------------------------------------------------------
   const looksLikeFilterAdjustment =
     /\b(agora\s+pode|aument[ae]r?|subir|sobe|mud[ae]r?|alter[ae]r?|limpar|remover|voltar\s+a\s+busca|todos\s+os\s+carros|estoque|ate\s+r?\$?\s*\d|no\s+maximo|menos\s+de\s+\d)\b/i.test(
@@ -944,8 +1030,7 @@ ${formatVehicleFactLine(targetVehicle, origin)}
       const v = directRef.vehicle;
       const q = analyzeVehicleDataQuality(v);
       const f = computeFipeMetrics(v);
-      const sheetPath = buildVehicleSheetPath(v.id);
-      const sheetUrl = buildVehicleSheetUrl(v.id, origin);
+      const link = resolveVehicleSheetLink(v, origin, dealership);
       const outOfFilterNote = buildOutOfFilterNote(v, prevFilters);
       const returnSearchAct = outOfFilterNote
         ? buildReturnToSearchAction(prevFilters)
@@ -958,15 +1043,19 @@ ${formatVehicleFactLine(targetVehicle, origin)}
       const conflictWarning = q.hasTransmissionConflict
         ? `\n- **Atenção:** ${q.conflictDetail} (confirmar com a loja).`
         : '';
+      const priceText =
+        v.priceConfirmed === false || v.price <= 0
+          ? 'preço a confirmar'
+          : formatBrlCurrency(v.price);
 
       const deterministicReply =
         `Sobre o **${getVehicleDisplayTitle(v)}** (${v.year}):\n` +
-        `- **Câmbio cadastrado:** **${q.displayTransmission}** · **${formatBrlCurrency(v.price)}** · **${formatKmBr(v.km)}** · ${v.status}\n` +
+        `- **Câmbio cadastrado:** **${q.displayTransmission}** · **${priceText}** · **${v.km > 0 ? formatKmBr(v.km) : 'km a confirmar'}** · ${v.availabilityConfirmed === false ? 'Disponibilidade a confirmar' : v.status}\n` +
         `- **${fipeSummary}**${conflictWarning}${outOfFilterNote}\n` +
-        `- **Ficha completa:** [Abrir ficha do veículo](${sheetPath})\n\n` +
+        `- **${link.label}:** [${link.label}](${link.href})${externalStaleNotice}\n\n` +
         `Quer simular financiamento deste veículo ou voltar para a busca anterior?`;
 
-      const cards = [toVehicleCardData(v, origin)];
+      const cards = [toVehicleCardData(v, origin, null, dealership)];
       const actions = buildContextualActions(cards, {
         includeSimulate: isVehicleAvailable(v),
         includeHandoff: true,
@@ -977,7 +1066,7 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         intent: 'vehicle_sheet',
         useDeterministicDirectly: true,
         deterministicReply,
-        verifiedFactsPrompt: `CONSULTA DIRETA DE VEÍCULO ESPECÍFICO:\n${formatVehicleFactLine(v, origin)}`,
+        verifiedFactsPrompt: `CONSULTA DIRETA DE VEÍCULO ESPECÍFICO:\n${formatVehicleFactLine(v, origin, dealership)}`,
         activeFilters: prevFilters,
         recentVehicleIds: [v.id],
         focusedVehicleId: v.id,
@@ -988,7 +1077,7 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         suggestedActions: actions,
         isVisitInquiryOnly: false,
         suppressHandoff: false,
-        fichaUrl: sheetUrl,
+        fichaUrl: link.fullUrl,
       };
     }
   }
@@ -1028,12 +1117,13 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         fipeReply = `Referência FIPE cadastrada do **${getVehicleDisplayTitle(v)} ${v.year}**:\n- **Preço à vista:** ${formatBrlCurrency(v.price)}\n- **Tabela FIPE (${f.fipeReferenceMonth}):** ${formatBrlCurrency(f.fipePrice!)}\n- **Diferença:** ${diffDesc}\n\nQuer abrir a ficha completa ou simular financiamento?`;
       }
 
-      const cards = [toVehicleCardData(v, origin)];
+      const cards = [toVehicleCardData(v, origin, null, dealership)];
+      const link = resolveVehicleSheetLink(v, origin, dealership);
       return {
         intent: 'fipe',
         useDeterministicDirectly: true,
         deterministicReply: fipeReply,
-        verifiedFactsPrompt: `FIPE REAL DO VEÍCULO:\n${formatVehicleFactLine(v, origin)}`,
+        verifiedFactsPrompt: `FIPE REAL DO VEÍCULO:\n${formatVehicleFactLine(v, origin, dealership)}`,
         activeFilters: prevFilters,
         recentVehicleIds: [v.id],
         focusedVehicleId: v.id,
@@ -1044,7 +1134,7 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         suggestedActions: buildContextualActions(cards),
         isVisitInquiryOnly: false,
         suppressHandoff: true,
-        fichaUrl: buildVehicleSheetUrl(v.id, origin),
+        fichaUrl: link.fullUrl,
       };
     }
 
@@ -1130,6 +1220,46 @@ ${formatVehicleFactLine(targetVehicle, origin)}
     );
 
   if (isInventorySearchIntent) {
+    if (externalUnavailable) {
+      const reasonLine =
+        externalSourceState?.health === 'connector_required'
+          ? 'O site oficial da revenda ainda precisa de uma fonte estruturada de estoque para consulta automática aqui no chat.'
+          : 'No momento não foi possível consultar automaticamente o estoque atualizado do site oficial da revenda.';
+      const deterministicReply =
+        `${reasonLine}\n\n` +
+        `Para ver os carros disponíveis em tempo real, você pode acessar diretamente a **[vitrine oficial da revenda](${storefront.catalogUrl})** ou falar com um consultor para confirmar modelos, preços e disponibilidade.`;
+
+      return {
+        intent: 'inventory_search',
+        useDeterministicDirectly: true,
+        deterministicReply,
+        verifiedFactsPrompt: `FONTE EXTERNA DE ESTOQUE INDISPONÍVEL NO MOMENTO (${externalSourceState?.health}). Nunca invente veículos. Direcione para ${storefront.catalogUrl} ou consultor.`,
+        activeFilters: nextFilters,
+        recentVehicleIds: [],
+        focusedVehicleId: null,
+        vehicleCards: [],
+        comparison: null,
+        financingSummary: null,
+        promptAttachPhotos: false,
+        suggestedActions: [
+          {
+            id: 'act-external-catalog',
+            label: 'Ver vitrine da revenda',
+            kind: 'open_sheet',
+            sheetPath: storefront.catalogUrl,
+          },
+          {
+            id: 'act-handoff-ext-unavail',
+            label: 'Falar com consultor',
+            kind: 'handoff',
+          },
+        ],
+        isVisitInquiryOnly: false,
+        suppressHandoff: false,
+        fichaUrl: storefront.catalogUrl,
+      };
+    }
+
     const searchRes = searchAndRankInventory(allVehicles, nextFilters);
     const filterDesc = describeActiveFilters(nextFilters);
     const filterLabel =
@@ -1137,13 +1267,18 @@ ${formatVehicleFactLine(targetVehicle, origin)}
 
     if (searchRes.exactMatches.length > 0) {
       const topMatches = searchRes.exactMatches.slice(0, 3);
-      const cards = topMatches.map((v) => toVehicleCardData(v, origin));
+      const cards = topMatches.map((v) => toVehicleCardData(v, origin, null, dealership));
       const lines = topMatches.map((v) => {
         const q = analyzeVehicleDataQuality(v);
         const transNote = q.hasTransmissionConflict
           ? 'câmbio em conferência'
           : q.displayTransmission;
-        return `- **${getVehicleDisplayTitle(v)} ${v.year}** — **${formatBrlCurrency(v.price)}** · ${formatKmBr(v.km)} · ${transNote}`;
+        const priceNote =
+          v.priceConfirmed === false || v.price <= 0
+            ? 'preço a confirmar'
+            : `**${formatBrlCurrency(v.price)}**`;
+        const kmNote = v.km > 0 ? formatKmBr(v.km) : 'km a confirmar';
+        return `- **${getVehicleDisplayTitle(v)} ${v.year}** — ${priceNote} · ${kmNote} · ${transNote}`;
       });
 
       const extraCount =
@@ -1154,8 +1289,11 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         searchRes.excludedConflicts.length > 0
           ? `\n\n_Nota: ${searchRes.excludedConflicts.length} veículo(s) com divergência de câmbio no cadastro não foram confirmados neste filtro._`
           : '';
+      const catalogLinkLine = storefront.isExternal
+        ? `\n\nVocê também pode conferir todas as opções em **[Ver carros no site da revenda](${storefront.catalogUrl})**.`
+        : '';
 
-      const deterministicReply = `Encontrei **${searchRes.exactMatches.length}** opção(ões) para **${filterLabel}**${extraCount}:\n${lines.join('\n')}${conflictDisclaimer}\n\nQuer abrir a ficha de algum deles, comparar ou ajustar um critério?`;
+      const deterministicReply = `Encontrei **${searchRes.exactMatches.length}** opção(ões) para **${filterLabel}**${extraCount}:\n${lines.join('\n')}${conflictDisclaimer}${externalStaleNotice}${catalogLinkLine}\n\nQuer abrir a ficha de algum deles, comparar ou ajustar um critério?`;
 
       return {
         intent: 'inventory_search',
@@ -1163,12 +1301,13 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         deterministicReply,
         verifiedFactsPrompt: `RESULTADO EXATO DO ESTOQUE (FILTROS APLICADOS NO SERVIDOR: ${filterLabel}):
 Total de correspondências exatas: ${searchRes.exactMatches.length} (exibindo até 3 cards na tela):
-${topMatches.map((v) => formatVehicleFactLine(v, origin)).join('\n')}
+${topMatches.map((v) => formatVehicleFactLine(v, origin, dealership)).join('\n')}
 ${
   searchRes.excludedConflicts.length > 0
     ? `Veículos EXCLUÍDOS por divergência cadastral de câmbio (NUNCA confirme o câmbio deles): ${searchRes.excludedConflicts.map((e) => `${getVehicleDisplayTitle(e.vehicle)} ${e.vehicle.year} (${e.detail})`).join('; ')}`
     : ''
 }
+${storefront.isExternal ? `Vitrine oficial da revenda: ${storefront.catalogUrl}` : ''}
 REGRA: Liste SOMENTE os veículos exatos acima. Não invente características nem contradiga os filtros aplicados.`,
         activeFilters: nextFilters,
         recentVehicleIds: cards.map((c) => c.id),
@@ -1189,19 +1328,24 @@ REGRA: Liste SOMENTE os veículos exatos acima. Não invente características ne
       toVehicleCardData(
         nm.vehicle,
         origin,
-        `Alternativa próxima: ${nm.reasons.join(' · ')}`
+        `Alternativa próxima: ${nm.reasons.join(' · ')}`,
+        dealership
       )
     );
 
     const nearLines = searchRes.nearMatches.slice(0, 3).map(
       (nm) =>
-        `- **Alternativa:** **${getVehicleDisplayTitle(nm.vehicle)} ${nm.vehicle.year}** (${formatBrlCurrency(nm.vehicle.price)} · ${formatKmBr(nm.vehicle.km)}) — ${nm.reasons.join('; ')}.`
+        `- **Alternativa:** **${getVehicleDisplayTitle(nm.vehicle)} ${nm.vehicle.year}** (${nm.vehicle.priceConfirmed === false || nm.vehicle.price <= 0 ? 'preço a confirmar' : formatBrlCurrency(nm.vehicle.price)} · ${nm.vehicle.km > 0 ? formatKmBr(nm.vehicle.km) : 'km a confirmar'}) — ${nm.reasons.join('; ')}.`
     );
+
+    const externalFallback = storefront.isExternal
+      ? `\n\nSe preferir, você pode conferir o catálogo completo em **[Ver vitrine da revenda](${storefront.catalogUrl})**.`
+      : '';
 
     const deterministicReply =
       nearLines.length > 0
-        ? `Não temos nenhum veículo disponível que atenda **exatamente** a todos os critérios (${filterLabel}).\n\nSe quiser avaliar **alternativas próximas** (fora de um ou mais filtros):\n${nearLines.join('\n')}\n\nQuer flexibilizar algum critério (como preço, km ou câmbio) ou ver a ficha de uma dessas alternativas?`
-        : `No momento não temos nenhum veículo disponível no estoque para **${filterLabel}**.\n\nQuer ajustar algum critério (como preço, quilometragem ou câmbio) ou ver todo o estoque disponível?`;
+        ? `Não temos nenhum veículo disponível que atenda **exatamente** a todos os critérios (${filterLabel}).\n\nSe quiser avaliar **alternativas próximas** (fora de um ou mais filtros):\n${nearLines.join('\n')}${externalStaleNotice}${externalFallback}\n\nQuer flexibilizar algum critério (como preço, km ou câmbio) ou ver a ficha de uma dessas alternativas?`
+        : `No momento não temos nenhum veículo disponível no estoque para **${filterLabel}**.${externalStaleNotice}${externalFallback}\n\nQuer ajustar algum critério (como preço, quilometragem ou câmbio) ou ver todo o estoque disponível?`;
 
     return {
       intent: 'inventory_search',
@@ -1219,12 +1363,19 @@ ${nearLines.join('\n') || 'Nenhuma alternativa próxima.'}`,
       promptAttachPhotos: false,
       suggestedActions: [
         ...buildContextualActions(nearCards, { includeSimulate: false }),
-        {
-          id: 'act-clear-filters',
-          label: 'Ver todo o estoque',
-          kind: 'prompt',
-          promptText: 'Limpar filtros e ver todo o estoque disponível',
-        },
+        storefront.isExternal
+          ? {
+              id: 'act-external-catalog',
+              label: 'Ver vitrine da revenda',
+              kind: 'open_sheet',
+              sheetPath: storefront.catalogUrl,
+            }
+          : {
+              id: 'act-clear-filters',
+              label: 'Ver todo o estoque',
+              kind: 'prompt',
+              promptText: 'Limpar filtros e ver todo o estoque disponível',
+            },
       ],
       isVisitInquiryOnly: false,
       suppressHandoff: true,
@@ -1248,39 +1399,63 @@ ${nearLines.join('\n') || 'Nenhuma alternativa próxima.'}`,
         (focusedId ? allVehicles.find((v) => v.id === focusedId) || null : null);
 
   const available = allVehicles.filter(isVehicleAvailable);
-  const stockLines = available.map((v) => formatVehicleFactLine(v, origin)).join('\n');
+  const stockLines = available.map((v) => formatVehicleFactLine(v, origin, dealership)).join('\n');
   const focusFact = resolvedFocus
-    ? `Veículo em foco na conversa:\n${formatVehicleFactLine(resolvedFocus, origin)}\n\n`
+    ? `Veículo em foco na conversa:\n${formatVehicleFactLine(resolvedFocus, origin, dealership)}\n\n`
     : '';
   const activeFilterNote = hasAnyActiveFilter(prevFilters)
     ? `Filtros ativos da conversa: ${describeActiveFilters(prevFilters).join(' · ')}\n`
     : '';
+  const externalContextNote = storefront.isExternal
+    ? `Modo vitrine oficial externa ativo: ${storefront.catalogUrl} (Status da fonte de estoque: ${externalSourceState?.health || 'ok'})\n`
+    : '';
 
-  const fallbackReply =
-    available.length > 0
-      ? `Temos **${available.length} veículo(s) disponível(is)** no estoque. Me diga a faixa de preço, câmbio ou modelo que você procura que eu filtro na hora.`
-      : 'No momento nosso estoque está em atualização. Posso te ajudar com simulação ou falar com um consultor.';
+  const fallbackReply = externalUnavailable
+    ? `Não consegui consultar automaticamente o estoque do site oficial agora, mas você pode acessar **[Ver vitrine da revenda](${storefront.catalogUrl})** ou falar com nossa equipe pelo WhatsApp.`
+    : available.length > 0
+      ? `Temos **${available.length} veículo(s) disponível(is)** no estoque${storefront.isExternal ? ' sincronizado com o site oficial' : ''}. Me diga a faixa de preço, câmbio ou modelo que você procura que eu filtro na hora.`
+      : storefront.isExternal
+        ? `Você pode consultar os carros diretamente em **[Ver vitrine da revenda](${storefront.catalogUrl})** ou me dizer o que procura para eu encaminhar ao consultor.`
+        : 'No momento nosso estoque está em atualização. Posso te ajudar com simulação ou falar com um consultor.';
+
+  const focusLink = resolvedFocus
+    ? resolveVehicleSheetLink(resolvedFocus, origin, dealership)
+    : null;
 
   return {
     intent: 'general',
-    useDeterministicDirectly: false,
+    useDeterministicDirectly: externalUnavailable,
     deterministicReply: fallbackReply,
-    verifiedFactsPrompt: `${focusFact}${activeFilterNote}ESTOQUE REAL DISPONÍVEL NO BANCO DE DADOS (${available.length} veículos):
+    verifiedFactsPrompt: `${externalContextNote}${focusFact}${activeFilterNote}ESTOQUE REAL DISPONÍVEL (${available.length} veículos):
 ${stockLines || 'Nenhum veículo disponível no momento.'}
 ${locationInfo.factsText}`,
     activeFilters: prevFilters,
     recentVehicleIds: resolvedFocus ? [resolvedFocus.id] : recentIds,
     focusedVehicleId: resolvedFocus ? resolvedFocus.id : focusedId,
-    vehicleCards: resolvedFocus ? [toVehicleCardData(resolvedFocus, origin)] : [],
+    vehicleCards: resolvedFocus ? [toVehicleCardData(resolvedFocus, origin, null, dealership)] : [],
     comparison: null,
     financingSummary: null,
     promptAttachPhotos: false,
     suggestedActions: resolvedFocus
-      ? buildContextualActions([toVehicleCardData(resolvedFocus, origin)])
-      : [],
+      ? buildContextualActions([toVehicleCardData(resolvedFocus, origin, null, dealership)])
+      : externalUnavailable
+        ? [
+            {
+              id: 'act-external-catalog',
+              label: 'Ver vitrine da revenda',
+              kind: 'open_sheet',
+              sheetPath: storefront.catalogUrl,
+            },
+            {
+              id: 'act-handoff-ext',
+              label: 'Falar com consultor',
+              kind: 'handoff',
+            },
+          ]
+        : [],
     isVisitInquiryOnly: false,
     suppressHandoff: false,
-    fichaUrl: resolvedFocus ? buildVehicleSheetUrl(resolvedFocus.id, origin) : null,
+    fichaUrl: focusLink?.fullUrl || null,
   };
 }
 

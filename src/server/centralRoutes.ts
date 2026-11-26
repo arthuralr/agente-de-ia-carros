@@ -28,6 +28,13 @@ import {
   renderDocumentPreviewText,
 } from '../utils/documentEngine';
 import { formatBRL, formatKm } from '../utils/formatters';
+import {
+  getExternalSourceSummary,
+  saveExternalSourceConfig,
+  syncExternalInventory,
+  testExternalSourceConnection,
+  validatePublicStorefrontLink,
+} from './externalInventoryService';
 import type {
   CopilotQueryResult,
   DealershipSettings,
@@ -474,12 +481,38 @@ export function registerCentralRevendaRoutes(
           return;
         }
 
+        // Prevent removing or disabling the last active administrator
+        const wasActiveAdmin =
+          Boolean(cur.active) && normalizeStaffRole(cur.role_code, cur.role) === 'administrador';
+        const willBeActiveAdmin = nextActive && nextRoleCode === 'administrador';
+        if (wasActiveAdmin && !willBeActiveAdmin) {
+          const otherAdmins = await pool.query<{ count: number }>(
+            `SELECT COUNT(*)::int AS count
+             FROM admin_users
+             WHERE id <> $1 AND active = true AND (role_code = 'administrador' OR LOWER(role) LIKE '%admin%')`,
+            [userId]
+          );
+          if ((otherAdmins.rows[0]?.count ?? 0) === 0) {
+            res.status(400).json({
+              error: 'É necessário manter pelo menos um administrador ativo antes de alterar ou desativar esta conta.',
+            });
+            return;
+          }
+        }
+
+        const shouldBumpTokenVersion =
+          !nextActive || nextRoleCode !== normalizeStaffRole(cur.role_code, cur.role);
+
         const updated = await pool.query(
           `UPDATE admin_users
-           SET name = $1, role = $2, role_code = $3, active = $4
+           SET name = $1,
+               role = $2,
+               role_code = $3,
+               active = $4,
+               token_version = CASE WHEN $6::boolean THEN COALESCE(token_version, 1) + 1 ELSE COALESCE(token_version, 1) END
            WHERE id = $5
            RETURNING id, name, email, role, role_code, avatar_url, active`,
-          [nextName, nextRoleLabel, nextRoleCode, nextActive, userId]
+          [nextName, nextRoleLabel, nextRoleCode, nextActive, userId, shouldBumpTokenVersion]
         );
 
         await recordStaffAudit({
@@ -487,7 +520,7 @@ export function registerCentralRevendaRoutes(
           action: 'team_user_updated',
           entityType: 'admin_user',
           entityId: userId,
-          details: { roleCode: nextRoleCode, active: nextActive },
+          details: { roleCode: nextRoleCode, active: nextActive, sessionsRevoked: shouldBumpTokenVersion },
         });
 
         const row = updated.rows[0];
@@ -503,6 +536,121 @@ export function registerCentralRevendaRoutes(
       } catch (err: unknown) {
         res.status(500).json({
           error: err instanceof Error ? err.message : 'Erro ao atualizar usuário.',
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/team/users/:id/rotate-password',
+    requirePerm('team:manage'),
+    async (req: StaffAuthenticatedRequest, res) => {
+      try {
+        const userId = Number(req.params.id);
+        if (!Number.isInteger(userId) || userId <= 0) {
+          res.status(400).json({ error: 'ID de usuário inválido.' });
+          return;
+        }
+        const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+        if (newPassword.length < 10) {
+          res.status(400).json({
+            error: 'A nova senha deve ter pelo menos 10 caracteres.',
+          });
+          return;
+        }
+        const existing = await pool.query(
+          'SELECT id, name, email, role, role_code, avatar_url, active FROM admin_users WHERE id = $1 LIMIT 1',
+          [userId]
+        );
+        if (existing.rowCount === 0) {
+          res.status(404).json({ error: 'Usuário não encontrado.' });
+          return;
+        }
+
+        const passwordHash = hashPassword(newPassword);
+        const updated = await pool.query(
+          `UPDATE admin_users
+           SET password_hash = $1,
+               token_version = COALESCE(token_version, 1) + 1
+           WHERE id = $2
+           RETURNING id, name, email, role, role_code, avatar_url, active, token_version`,
+          [passwordHash, userId]
+        );
+        const row = updated.rows[0];
+
+        await recordStaffAudit({
+          user: req.adminUser,
+          action: 'team_user_password_rotated',
+          entityType: 'admin_user',
+          entityId: userId,
+          details: { sessionsRevoked: true },
+        });
+
+        // If the admin rotated their own password, issue a fresh session token so they stay logged in
+        if (req.adminUser && req.adminUser.id === userId) {
+          const freshUser: PublicAdminUser = {
+            id: Number(row.id),
+            name: String(row.name),
+            email: String(row.email),
+            role: String(row.role),
+            roleCode: normalizeStaffRole(row.role_code, row.role),
+            avatarUrl: row.avatar_url ? String(row.avatar_url) : null,
+            active: Boolean(row.active),
+            tokenVersion: Number(row.token_version) || 1,
+          };
+          const freshToken = signSessionToken(freshUser);
+          res.setHeader('Set-Cookie', buildSessionCookieHeader(req, freshToken));
+        }
+
+        res.json({
+          rotated: true,
+          sessionsRevoked: true,
+          message: 'Senha redefinida e sessões anteriores revogadas com sucesso.',
+        });
+      } catch (err: unknown) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao redefinir senha da conta.',
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/team/users/:id/revoke-sessions',
+    requirePerm('team:manage'),
+    async (req: StaffAuthenticatedRequest, res) => {
+      try {
+        const userId = Number(req.params.id);
+        if (!Number.isInteger(userId) || userId <= 0) {
+          res.status(400).json({ error: 'ID de usuário inválido.' });
+          return;
+        }
+        const updated = await pool.query(
+          `UPDATE admin_users
+           SET token_version = COALESCE(token_version, 1) + 1
+           WHERE id = $1
+           RETURNING id`,
+          [userId]
+        );
+        if (updated.rowCount === 0) {
+          res.status(404).json({ error: 'Usuário não encontrado.' });
+          return;
+        }
+
+        await recordStaffAudit({
+          user: req.adminUser,
+          action: 'team_user_sessions_revoked',
+          entityType: 'admin_user',
+          entityId: userId,
+        });
+
+        res.json({
+          revoked: true,
+          message: 'Todas as sessões ativas desta conta foram encerradas.',
+        });
+      } catch (err: unknown) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao revogar sessões.',
         });
       }
     }
@@ -2644,6 +2792,153 @@ export function registerCentralRevendaRoutes(
       } catch (err: unknown) {
         res.status(500).json({
           error: err instanceof Error ? err.message : 'Erro ao executar consulta do copiloto.',
+        });
+      }
+    }
+  );
+
+  // ==========================================================================
+  // SITE E VITRINE — CONFIGURAÇÃO E SINCRONIZAÇÃO DE ESTOQUE EXTERNO
+  // ==========================================================================
+
+  app.get(
+    '/api/admin/external-storefront/status',
+    requirePerm('settings:edit_dealership'),
+    async (_req, res) => {
+      try {
+        const { config } = await deps.getPersistedDealershipConfig();
+        const slug = (config.publicStoreSlug || 'armazem-do-carro').trim();
+        const summary = await getExternalSourceSummary(slug);
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          storeSlug: slug,
+          storefrontMode: config.storefrontMode || 'internal',
+          externalCatalogUrl: config.externalCatalogUrl || '',
+          externalHomeUrl: config.externalHomeUrl || '',
+          source: summary,
+        });
+      } catch (err: unknown) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao consultar status da vitrine externa.',
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/external-storefront/validate-link',
+    requirePerm('settings:edit_dealership'),
+    async (req: StaffAuthenticatedRequest, res) => {
+      try {
+        const { config } = await deps.getPersistedDealershipConfig();
+        const slug = (config.publicStoreSlug || 'armazem-do-carro').trim();
+        const rawUrl =
+          typeof req.body?.url === 'string'
+            ? req.body.url.trim()
+            : (config.externalCatalogUrl || '').trim();
+        const result = await validatePublicStorefrontLink(slug, rawUrl);
+        await recordStaffAudit({
+          user: req.adminUser,
+          action: 'external_storefront_link_validated',
+          entityType: 'external_storefront',
+          entityId: slug,
+          details: { ok: result.ok, detail: result.detail },
+        });
+        res.json(result);
+      } catch (err: unknown) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao validar link público da vitrine.',
+        });
+      }
+    }
+  );
+
+  app.patch(
+    '/api/admin/external-storefront/config',
+    requirePerm('settings:edit_dealership'),
+    async (req: StaffAuthenticatedRequest, res) => {
+      try {
+        const { config } = await deps.getPersistedDealershipConfig();
+        const slug = (config.publicStoreSlug || 'armazem-do-carro').trim();
+        const result = await saveExternalSourceConfig(slug, {
+          sourceType: req.body?.sourceType,
+          feedUrl: req.body?.feedUrl,
+          authHeaderName: req.body?.authHeaderName,
+          authHeaderValue: req.body?.authHeaderValue,
+          clearAuthHeader: Boolean(req.body?.clearAuthHeader),
+          syncIntervalMinutes: req.body?.syncIntervalMinutes,
+        });
+        if (!result.ok) {
+          res.status(400).json({ error: result.error || 'Configuração de fonte externa inválida.' });
+          return;
+        }
+        await recordStaffAudit({
+          user: req.adminUser,
+          action: 'external_storefront_source_updated',
+          entityType: 'external_storefront',
+          entityId: slug,
+          details: {
+            sourceType: result.summary?.sourceType,
+            syncIntervalMinutes: result.summary?.syncIntervalMinutes,
+          },
+        });
+        res.json({ ok: true, source: result.summary });
+      } catch (err: unknown) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao salvar fonte de estoque externo.',
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/external-storefront/test',
+    requirePerm('settings:edit_dealership'),
+    async (req: StaffAuthenticatedRequest, res) => {
+      try {
+        const { config } = await deps.getPersistedDealershipConfig();
+        const slug = (config.publicStoreSlug || 'armazem-do-carro').trim();
+        const result = await testExternalSourceConnection(slug, {
+          sourceType: req.body?.sourceType,
+          feedUrl: typeof req.body?.feedUrl === 'string' ? req.body.feedUrl : undefined,
+          authHeaderName:
+            typeof req.body?.authHeaderName === 'string' ? req.body.authHeaderName : undefined,
+          authHeaderValue:
+            typeof req.body?.authHeaderValue === 'string' ? req.body.authHeaderValue : undefined,
+        });
+        res.json(result);
+      } catch (err: unknown) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao testar conexão com o estoque externo.',
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/external-storefront/sync',
+    requirePerm('settings:edit_dealership'),
+    async (req: StaffAuthenticatedRequest, res) => {
+      try {
+        const { config } = await deps.getPersistedDealershipConfig();
+        const slug = (config.publicStoreSlug || 'armazem-do-carro').trim();
+        const result = await syncExternalInventory(slug);
+        await recordStaffAudit({
+          user: req.adminUser,
+          action: 'external_storefront_synced',
+          entityType: 'external_storefront',
+          entityId: slug,
+          details: {
+            ok: result.ok,
+            status: result.status,
+            syncedCount: result.syncedCount,
+            removedCount: result.removedCount,
+          },
+        });
+        res.json(result);
+      } catch (err: unknown) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao sincronizar estoque externo.',
         });
       }
     }

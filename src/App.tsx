@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2 } from 'lucide-react';
+import { CarFront, ExternalLink, Loader2, MessageSquare } from 'lucide-react';
 import {
   ActivityLog,
   AdminUser,
@@ -42,6 +42,7 @@ import { StandaloneChatPage } from './components/public/StandaloneChatPage';
 import { VehicleSheetPage } from './components/public/VehicleSheetPage';
 import { PrivacyPolicyPage } from './components/public/PrivacyPolicyPage';
 import { PWAInstallBanner } from './components/public/PWAInstallBanner';
+import { FloatingAgentWidget } from './components/public/FloatingAgentWidget';
 import { AdminLoginPage } from './components/auth/AdminLoginPage';
 import { adminFetch, clearAdminSessionToken } from './utils/authSession';
 import { normalizeStoreWhatsAppNumber } from './utils/whatsappHandoff';
@@ -54,6 +55,7 @@ import {
   buildVehicleSheetPath,
   DEFAULT_DEALERSHIP_CONFIG,
   mergeDealershipConfig,
+  resolvePublicStorefrontLinks,
 } from './utils/vehicleDomain';
 
 const MODULE_PATH_MAP: Record<NavModule, string> = {
@@ -913,6 +915,20 @@ export default function App() {
     setChatOpen(true);
   };
 
+  const handleOpenDirectChat = (vehicle?: Vehicle | null, origem?: string) => {
+    setChatOpen(false);
+    setChatVehicle(vehicle || null);
+    if (typeof window !== 'undefined') {
+      const qs = new URLSearchParams();
+      if (vehicle?.id) qs.set('veiculo', String(vehicle.id));
+      if (origem) qs.set('origem', origem);
+      const nextUrl = qs.toString() ? `/chat?${qs.toString()}` : '/chat';
+      window.history.pushState(null, '', nextUrl);
+    }
+    setActiveVehicleId(null);
+    setViewMode('chat');
+  };
+
   const handleUpdateOperationMode = async (nextMode: OperationMode) => {
     const res = await adminFetch('/api/admin/settings/operation-mode', {
       method: 'PATCH',
@@ -1009,16 +1025,24 @@ export default function App() {
     );
   };
 
+  const publicStorefront = resolvePublicStorefrontLinks(settings);
+
   // 1A. Public LGPD Privacy Policy Page (/privacidade)
   if (viewMode === 'privacy') {
     return (
-      <PrivacyPolicyPage
-        settings={settings}
-        onBack={() =>
-          navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog')
-        }
-        onOpenChat={() => navigateTo('chat')}
-      />
+      <>
+        <PrivacyPolicyPage
+          settings={settings}
+          onBack={() =>
+            navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog')
+          }
+          onOpenChat={() => handleOpenDirectChat()}
+        />
+        <FloatingAgentWidget
+          settings={settings}
+          onOpenChat={() => handleOpenDirectChat(null, 'widget_flutuante')}
+        />
+      </>
     );
   }
 
@@ -1027,31 +1051,31 @@ export default function App() {
     const preloadedVehicle =
       vehicles.find((v) => String(v.id) === String(activeVehicleId)) || null;
     return (
-      <VehicleSheetPage
-        vehicleId={activeVehicleId}
-        initialVehicle={preloadedVehicle}
-        settings={settings}
-        storeWhatsappNumber={storeWhatsappNumber}
-        onBackToCatalog={() => {
-          void hydratePublicVehicles();
-          navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog');
-        }}
-        onOpenChatWithVehicle={(veh, trackingSource) => {
-          setChatVehicle(veh);
-          if (typeof window !== 'undefined') {
-            const qs = new URLSearchParams();
-            qs.set('veiculo', String(veh.id));
-            if (trackingSource) qs.set('origem', trackingSource);
-            window.history.pushState(null, '', `/chat?${qs.toString()}`);
-          }
-          setActiveVehicleId(null);
-          setViewMode('chat');
-        }}
-      />
+      <>
+        <VehicleSheetPage
+          vehicleId={activeVehicleId}
+          initialVehicle={preloadedVehicle}
+          settings={settings}
+          storeWhatsappNumber={storeWhatsappNumber}
+          onBackToCatalog={() => {
+            void hydratePublicVehicles();
+            navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog');
+          }}
+          onOpenChatWithVehicle={(veh, trackingSource) => {
+            handleOpenDirectChat(veh, trackingSource || undefined);
+          }}
+        />
+        <FloatingAgentWidget
+          settings={settings}
+          activeVehicle={preloadedVehicle}
+          onOpenChat={(veh) => handleOpenDirectChat(veh, 'widget_flutuante')}
+        />
+      </>
     );
   }
 
   // 1B. Public Standalone WhatsApp-Style Agent Page (/chat or /atendimento, OR root / when operationMode === 'agent_only')
+  // IMPORTANT: FloatingAgentWidget is NEVER mounted on /chat.
   if (
     viewMode === 'chat' ||
     (operationMode === 'agent_only' &&
@@ -1080,19 +1104,87 @@ export default function App() {
 
   // 1C. Public Storefront Views (Always accessible without authentication in 'full' mode)
   if (viewMode === 'catalog' || viewMode === 'home') {
+    const renderExternalCatalogHandoff = () => (
+      <div className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col items-center justify-center px-5 py-12">
+        <div className="w-full max-w-xl rounded-2xl border border-white/[0.1] bg-[#111114] p-7 sm:p-9 space-y-6">
+          <div className="space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wider text-red-400">
+              Vitrine oficial da revenda
+            </p>
+            <h1 className="font-display text-2xl sm:text-3xl font-semibold text-white tracking-tight">
+              {settings.tradeName}
+            </h1>
+            <p className="text-sm text-zinc-400 leading-relaxed">
+              A vitrine pública de veículos desta loja funciona diretamente no site oficial da
+              revenda. Acesse o catálogo oficial ou fale agora com nosso agente de atendimento.
+            </p>
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-3">
+            <a
+              href={publicStorefront.catalogUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-sm font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors"
+            >
+              <CarFront className="w-4 h-4" />
+              <span>Ver carros no site da revenda</span>
+              <ExternalLink className="w-4 h-4" />
+            </a>
+            <a
+              href="/chat"
+              onClick={(e) => {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) {
+                  return;
+                }
+                e.preventDefault();
+                handleOpenDirectChat();
+              }}
+              className="inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-sm font-medium text-zinc-100 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.1] transition-colors"
+            >
+              <MessageSquare className="w-4 h-4 text-red-400" />
+              <span>Atendimento IA</span>
+            </a>
+          </div>
+
+          <div className="pt-4 border-t border-white/[0.08] flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
+            <button
+              type="button"
+              onClick={() => navigateTo('home')}
+              className="hover:text-white transition-colors"
+            >
+              Ir para página inicial
+            </button>
+            <button
+              type="button"
+              onClick={handleOpenAdminEntry}
+              className="hover:text-white underline underline-offset-4 transition-colors"
+            >
+              Acesso da equipe
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+
     return (
       <>
         {viewMode === 'catalog' ? (
-          <PublicCatalogPage
-            vehicles={vehicles}
-            settings={settings}
-            onBackHome={() => navigateTo('home')}
-            onOpenAdmin={handleOpenAdminEntry}
-            onOpenDetails={(v) => openVehicleSheet(v.id)}
-            onInterest={openVehicleInterestChat}
-            onOpenGeneralChat={openGeneralChat}
-            onOpenPrivacy={() => navigateTo('privacy')}
-          />
+          publicStorefront.isExternal ? (
+            renderExternalCatalogHandoff()
+          ) : (
+            <PublicCatalogPage
+              vehicles={vehicles}
+              settings={settings}
+              onBackHome={() => navigateTo('home')}
+              onOpenAdmin={handleOpenAdminEntry}
+              onOpenDetails={(v) => openVehicleSheet(v.id)}
+              onInterest={openVehicleInterestChat}
+              onOpenGeneralChat={openGeneralChat}
+              onOpenDirectChat={() => handleOpenDirectChat()}
+              onOpenPrivacy={() => navigateTo('privacy')}
+            />
+          )
         ) : (
           <PublicHomePage
             vehicles={vehicles}
@@ -1102,6 +1194,7 @@ export default function App() {
             onOpenDetails={(v) => openVehicleSheet(v.id)}
             onInterest={openVehicleInterestChat}
             onOpenGeneralChat={openGeneralChat}
+            onOpenDirectChat={() => handleOpenDirectChat()}
             onOpenPrivacy={() => navigateTo('privacy')}
           />
         )}
@@ -1122,8 +1215,7 @@ export default function App() {
           onCaptureLead={handleCapturePublicLead}
           onSyncLeadChat={handleSyncPublicLeadChat}
           onOpenStandaloneChat={() => {
-            setChatOpen(false);
-            navigateTo('chat');
+            handleOpenDirectChat(chatVehicle);
           }}
           onOpenPrivacy={() => navigateTo('privacy')}
         />
@@ -1131,6 +1223,11 @@ export default function App() {
         <PWAInstallBanner
           variant="storefront"
           appName={settings.tradeName}
+        />
+
+        <FloatingAgentWidget
+          settings={settings}
+          onOpenChat={() => handleOpenDirectChat(null, 'widget_flutuante')}
         />
       </>
     );

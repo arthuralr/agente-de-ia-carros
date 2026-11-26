@@ -19,6 +19,7 @@ import {
   buildSessionCookieHeader,
   DbAdminUserRow,
   ensureAdminUsersSchemaAndSeed,
+  hashPassword,
   parseCookies,
   PublicAdminUser,
   SESSION_COOKIE_NAME,
@@ -46,10 +47,13 @@ import {
   DEFAULT_DEALERSHIP_CONFIG,
   formatDealershipAddress,
   formatDealershipHours,
+  getVehicleDisplayTitle,
+  isSafeHttpUrl,
   mergeDealershipConfig,
 } from './src/utils/vehicleDomain';
 import {
   ChatTurnContextInput,
+  ExternalInventoryRuntimeState,
   guardChatReply,
   planChatTurn,
 } from './src/utils/chatOrchestrator';
@@ -63,7 +67,16 @@ import {
   recordStaffAudit,
 } from './src/db/centralSchema';
 import { registerCentralRevendaRoutes } from './src/server/centralRoutes';
-import { DealershipSettings } from './src/types';
+import {
+  findExternalVehicleForContext,
+  loadExternalVehiclesForChat,
+  validateExternalUrl,
+} from './src/server/externalInventoryService';
+import {
+  buildDemoExternalSiteHtml,
+  buildExternalWidgetScript,
+} from './src/server/widgetScript';
+import { DealershipSettings, Vehicle } from './src/types';
 
 if (fs.existsSync('.env.local')) {
   dotenv.config({ path: '.env.local', override: true });
@@ -1013,7 +1026,7 @@ async function resolveAuthenticatedAdmin(
   if (!payload) return null;
 
   const userRes = await pool.query<DbAdminUserRow>(
-    `SELECT id, name, email, role, role_code, avatar_url, active
+    `SELECT id, name, email, role, role_code, avatar_url, active, COALESCE(token_version, 1) AS token_version
      FROM admin_users
      WHERE id = $1 AND active = true
      LIMIT 1`,
@@ -1023,6 +1036,12 @@ async function resolveAuthenticatedAdmin(
   const row = userRes.rows[0];
   if (!row) return null;
 
+  const dbTokenVersion = Number(row.token_version ?? 1);
+  const tokenVersionClaim = payload.tv === undefined ? 1 : Number(payload.tv);
+  if (tokenVersionClaim !== dbTokenVersion) {
+    return null;
+  }
+
   return {
     id: row.id,
     name: row.name,
@@ -1031,6 +1050,7 @@ async function resolveAuthenticatedAdmin(
     roleCode: normalizeStaffRole(row.role_code, row.role),
     avatarUrl: row.avatar_url,
     active: Boolean(row.active),
+    tokenVersion: dbTokenVersion,
   };
 }
 
@@ -1093,7 +1113,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const userRes = await pool.query<DbAdminUserRow>(
-      `SELECT id, name, email, password_hash, role, role_code, avatar_url, active
+      `SELECT id, name, email, password_hash, role, role_code, avatar_url, active, COALESCE(token_version, 1) AS token_version
        FROM admin_users
        WHERE LOWER(email) = $1
        LIMIT 1`,
@@ -1120,6 +1140,7 @@ app.post('/api/auth/login', async (req, res) => {
       roleCode: normalizeStaffRole(row.role_code, row.role),
       avatarUrl: row.avatar_url,
       active: Boolean(row.active),
+      tokenVersion: Number(row.token_version ?? 1),
     };
 
     const token = signSessionToken(user);
@@ -1129,6 +1150,74 @@ app.post('/api/auth/login', async (req, res) => {
     const message =
       err instanceof Error ? err.message : 'Erro ao autenticar no banco de dados.';
     res.status(500).json({ error: message });
+  }
+});
+
+app.get('/api/auth/bootstrap-status', async (_req, res) => {
+  try {
+    const countRes = await pool.query<{ count: number }>(
+      'SELECT COUNT(*)::int AS count FROM admin_users'
+    );
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ needsBootstrap: (countRes.rows[0]?.count ?? 0) === 0 });
+  } catch {
+    res.json({ needsBootstrap: false });
+  }
+});
+
+app.post('/api/auth/bootstrap-admin', async (req, res) => {
+  try {
+    const countRes = await pool.query<{ count: number }>(
+      'SELECT COUNT(*)::int AS count FROM admin_users'
+    );
+    if ((countRes.rows[0]?.count ?? 0) > 0) {
+      res.status(409).json({
+        error: 'A configuração inicial já foi concluída. Solicite um convite a um administrador.',
+      });
+      return;
+    }
+
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 150) : '';
+    const email =
+      typeof req.body?.email === 'string'
+        ? req.body.email.trim().toLowerCase().slice(0, 200)
+        : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    if (name.length < 2 || !email.includes('@')) {
+      res.status(400).json({ error: 'Informe nome e e-mail corporativo válidos.' });
+      return;
+    }
+    if (password.length < 10) {
+      res.status(400).json({ error: 'A senha inicial deve ter pelo menos 10 caracteres.' });
+      return;
+    }
+
+    const passwordHash = hashPassword(password);
+    const inserted = await pool.query<DbAdminUserRow>(
+      `INSERT INTO admin_users (name, email, password_hash, role, role_code, active, token_version)
+       VALUES ($1, $2, $3, 'Administrador', 'administrador', true, 1)
+       RETURNING id, name, email, role, role_code, avatar_url, active, token_version`,
+      [name, email, passwordHash]
+    );
+    const row = inserted.rows[0];
+    const user: PublicAdminUser = {
+      id: row.id,
+      name: row.name,
+      email: row.email,
+      role: row.role,
+      roleCode: 'administrador',
+      avatarUrl: row.avatar_url,
+      active: true,
+      tokenVersion: Number(row.token_version ?? 1),
+    };
+    const token = signSessionToken(user);
+    res.setHeader('Set-Cookie', buildSessionCookieHeader(req, token));
+    res.status(201).json({ authenticated: true, user, token });
+  } catch (err: unknown) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Erro ao criar conta inicial de administrador.',
+    });
   }
 });
 
@@ -1180,7 +1269,55 @@ app.get('/api/public/vehicles', async (_req, res) => {
 });
 
 app.get('/api/public/vehicles/:id', async (req, res) => {
-  const id = Number(req.params.id);
+  const rawId = String(req.params.id || '').trim();
+  if (rawId.startsWith('ext-')) {
+    try {
+      const { config } = await getPersistedDealershipConfig();
+      const extVeh = await findExternalVehicleForContext(
+        config.publicStoreSlug || 'armazem-do-carro',
+        { vehicleRef: rawId }
+      );
+      if (!extVeh) {
+        res.status(404).json({ error: 'Veículo não encontrado na vitrine oficial.' });
+        return;
+      }
+      res.json({
+        id: extVeh.id,
+        brand: extVeh.brand,
+        model: extVeh.model,
+        version: extVeh.version,
+        year: extVeh.year,
+        km: extVeh.km,
+        price: extVeh.price,
+        fipe_price: 0,
+        fipe_code: '',
+        fipe_reference_month: null,
+        color: extVeh.color,
+        transmission: extVeh.transmission,
+        fuel: extVeh.fuel,
+        plate: '',
+        renavam: '',
+        chassis: '',
+        status: extVeh.status,
+        image_url: extVeh.imageUrl,
+        gallery: extVeh.gallery || [],
+        optionals: extVeh.optionals || [],
+        created_at: extVeh.createdAt,
+        official_url: extVeh.officialUrl,
+        data_source: 'external',
+        price_confirmed: extVeh.priceConfirmed,
+        availability_confirmed: extVeh.availabilityConfirmed,
+      });
+      return;
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'Erro ao consultar veículo sincronizado.';
+      res.status(500).json({ error: message });
+      return;
+    }
+  }
+
+  const id = Number(rawId);
   if (!Number.isInteger(id) || id <= 0) {
     res.status(400).json({ error: 'Identificador de veículo inválido.' });
     return;
@@ -1233,6 +1370,145 @@ app.get('/api/public/config', async (_req, res) => {
       dealershipConfig: mergeDealershipConfig(DEFAULT_DEALERSHIP_CONFIG, fallbackPhone),
       configUnavailable: true,
     });
+  }
+});
+
+function resolveRequestBaseOrigin(req: Request): string {
+  const forwardedProto =
+    typeof req.headers['x-forwarded-proto'] === 'string'
+      ? req.headers['x-forwarded-proto'].split(',')[0].trim()
+      : '';
+  const proto = forwardedProto || (req.secure ? 'https' : 'http');
+  const host = req.get('host') || `localhost:${PORT}`;
+  return `${proto}://${host}`;
+}
+
+app.get('/api/public/widget-config', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store');
+
+  try {
+    const { config } = await getPersistedDealershipConfig();
+    const configuredSlug = (config.publicStoreSlug || 'armazem-do-carro').trim().toLowerCase();
+    const requestedSlug =
+      typeof req.query.loja === 'string' && req.query.loja.trim()
+        ? req.query.loja.trim().toLowerCase()
+        : configuredSlug;
+
+    const appOrigin = resolveRequestBaseOrigin(req);
+    const callerOrigin =
+      typeof req.query.origin === 'string' ? req.query.origin.trim().replace(/\/+$/, '').toLowerCase() : '';
+    const allowedOrigins = (config.widgetAllowedOrigins || [])
+      .map((o) => o.trim().replace(/\/+$/, '').toLowerCase())
+      .filter(Boolean);
+
+    let embedAllowed = true;
+    if (allowedOrigins.length > 0 && callerOrigin) {
+      const sameAsApp = callerOrigin === appOrigin.toLowerCase();
+      embedAllowed =
+        sameAsApp ||
+        allowedOrigins.some((allowed) => {
+          if (allowed === callerOrigin) return true;
+          try {
+            const allowedHost = new URL(allowed).hostname.toLowerCase();
+            const callerHost = new URL(callerOrigin).hostname.toLowerCase();
+            return allowedHost === callerHost;
+          } catch {
+            return false;
+          }
+        });
+    }
+
+    const vehicleRef = typeof req.query.veiculo === 'string' ? req.query.veiculo.trim() : '';
+    const pageUrl = typeof req.query.pageUrl === 'string' ? req.query.pageUrl.trim() : '';
+
+    let matchedVehicle: { id: string; label: string; officialUrl: string | null } | null = null;
+    if (vehicleRef || pageUrl) {
+      if (config.storefrontMode === 'external') {
+        const extVeh = await findExternalVehicleForContext(configuredSlug, {
+          vehicleRef,
+          pageUrl,
+        });
+        if (extVeh) {
+          matchedVehicle = {
+            id: extVeh.id,
+            label: `${getVehicleDisplayTitle(extVeh)} ${extVeh.year}`.trim(),
+            officialUrl: extVeh.officialUrl || null,
+          };
+        }
+      } else if (vehicleRef && /^\d+$/.test(vehicleRef)) {
+        const dbRes = await pool.query<DbVehicleRow>(
+          'SELECT * FROM vehicles WHERE id = $1 LIMIT 1',
+          [Number(vehicleRef)]
+        );
+        if (dbRes.rows[0]) {
+          const v = mapDbVehicleToFrontend({
+            ...dbRes.rows[0],
+            created_at:
+              dbRes.rows[0].created_at instanceof Date
+                ? dbRes.rows[0].created_at.toISOString()
+                : String(dbRes.rows[0].created_at || ''),
+          });
+          matchedVehicle = {
+            id: v.id,
+            label: `${getVehicleDisplayTitle(v)} ${v.year}`.trim(),
+            officialUrl: null,
+          };
+        }
+      }
+    }
+
+    res.json({
+      storeSlug: requestedSlug,
+      enabled: config.widgetEnabled !== false,
+      embedAllowed,
+      position: config.widgetPosition === 'bottom-left' ? 'bottom-left' : 'bottom-right',
+      label: config.widgetLabel || 'Fale com o agente',
+      tradeName: config.tradeName || 'Armazém do Carro',
+      storefrontMode: config.storefrontMode || 'internal',
+      chatBaseUrl: `${appOrigin}/chat`,
+      matchedVehicle,
+    });
+  } catch {
+    const appOrigin = resolveRequestBaseOrigin(req);
+    res.json({
+      storeSlug: 'armazem-do-carro',
+      enabled: true,
+      embedAllowed: false,
+      position: 'bottom-right',
+      label: 'Fale com o agente',
+      tradeName: 'Armazém do Carro',
+      storefrontMode: 'internal',
+      chatBaseUrl: `${appOrigin}/chat`,
+      matchedVehicle: null,
+    });
+  }
+});
+
+app.get('/widget.js', (req, res) => {
+  const appOrigin = resolveRequestBaseOrigin(req);
+  const script = buildExternalWidgetScript(appOrigin);
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.send(script);
+});
+
+app.get('/demo-site-externo', async (req, res) => {
+  try {
+    const { config } = await getPersistedDealershipConfig();
+    const storeSlug =
+      typeof req.query.loja === 'string' && req.query.loja.trim()
+        ? req.query.loja.trim()
+        : config.publicStoreSlug || 'armazem-do-carro';
+    const vehicleAttr = typeof req.query.veiculo === 'string' ? req.query.veiculo.trim() : '';
+    const duplicateScript = req.query.dup === '1' || req.query.dup === 'true';
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(buildDemoExternalSiteHtml({ storeSlug, vehicleAttr, duplicateScript }));
+  } catch {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(buildDemoExternalSiteHtml({ storeSlug: 'armazem-do-carro' }));
   }
 });
 
@@ -1645,6 +1921,75 @@ app.patch(
       const cleanStr = (val: unknown, fallback: string, maxLen = 220): string =>
         typeof val === 'string' ? val.trim().slice(0, maxLen) : fallback;
 
+      const requestedStorefrontMode =
+        payload.storefrontMode === 'external'
+          ? 'external'
+          : payload.storefrontMode === 'internal'
+            ? 'internal'
+            : current.storefrontMode || 'internal';
+
+      const nextExternalCatalogUrl =
+        typeof payload.externalCatalogUrl === 'string'
+          ? payload.externalCatalogUrl.trim().slice(0, 600)
+          : current.externalCatalogUrl || '';
+      const nextExternalHomeUrl =
+        typeof payload.externalHomeUrl === 'string'
+          ? payload.externalHomeUrl.trim().slice(0, 600)
+          : current.externalHomeUrl || '';
+
+      if (requestedStorefrontMode === 'external') {
+        const catalogCheck = await validateExternalUrl(nextExternalCatalogUrl, {
+          skipDnsLookup: true,
+        });
+        if (!catalogCheck.ok) {
+          res.status(400).json({
+            error:
+              catalogCheck.error ||
+              'Informe uma URL pública válida (https://...) da vitrine oficial antes de ativar o modo externo.',
+          });
+          return;
+        }
+      }
+
+      if (nextExternalHomeUrl && !isSafeHttpUrl(nextExternalHomeUrl)) {
+        res.status(400).json({
+          error: 'A URL opcional do site institucional deve começar com https:// ou http://.',
+        });
+        return;
+      }
+
+      const rawAllowedOrigins = Array.isArray(payload.widgetAllowedOrigins)
+        ? payload.widgetAllowedOrigins
+        : current.widgetAllowedOrigins || [];
+      const sanitizedAllowedOrigins: string[] = [];
+      for (const item of rawAllowedOrigins) {
+        const raw = String(item || '').trim();
+        if (!raw) continue;
+        const candidate = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+        try {
+          const parsed = new URL(candidate);
+          if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+            const norm = `${parsed.protocol}//${parsed.host}`.toLowerCase();
+            if (!sanitizedAllowedOrigins.includes(norm)) {
+              sanitizedAllowedOrigins.push(norm);
+            }
+          }
+        } catch {
+          // Ignore malformed domain entries
+        }
+      }
+
+      const nextPublicStoreSlug =
+        typeof payload.publicStoreSlug === 'string' && payload.publicStoreSlug.trim()
+          ? payload.publicStoreSlug
+              .trim()
+              .toLowerCase()
+              .replace(/[^a-z0-9-]/g, '-')
+              .replace(/-+/g, '-')
+              .replace(/^-|-$/g, '')
+              .slice(0, 80) || current.publicStoreSlug || 'armazem-do-carro'
+          : current.publicStoreSlug || 'armazem-do-carro';
+
       const updated: DealershipSettings = {
         ...current,
         tradeName: cleanStr(payload.tradeName, current.tradeName, 120) || current.tradeName,
@@ -1688,6 +2033,24 @@ app.patch(
             ? Math.max(0, Math.round(Number(payload.warrantyKm)))
             : current.warrantyKm,
         financingMonthlyRatePct: safeRate,
+        publicStoreSlug: nextPublicStoreSlug,
+        storefrontMode: requestedStorefrontMode,
+        externalCatalogUrl: nextExternalCatalogUrl,
+        externalHomeUrl: nextExternalHomeUrl,
+        widgetEnabled:
+          typeof payload.widgetEnabled === 'boolean'
+            ? payload.widgetEnabled
+            : current.widgetEnabled !== false,
+        widgetPosition:
+          payload.widgetPosition === 'bottom-left'
+            ? 'bottom-left'
+            : payload.widgetPosition === 'bottom-right'
+              ? 'bottom-right'
+              : current.widgetPosition || 'bottom-right',
+        widgetLabel:
+          cleanStr(payload.widgetLabel, current.widgetLabel || 'Fale com o agente', 48) ||
+          'Fale com o agente',
+        widgetAllowedOrigins: sanitizedAllowedOrigins.slice(0, 20),
       };
 
       await pool.query(
@@ -4292,13 +4655,41 @@ app.post('/api/ai/chat', async (req, res) => {
       aiAssistantName: authoritativeDealership.aiAssistantName || assistantName,
     };
 
+    const isExternalStorefrontMode =
+      effectiveDealership.storefrontMode === 'external' &&
+      isSafeHttpUrl(effectiveDealership.externalCatalogUrl);
+
+    let activeInventoryVehicles: Vehicle[] = freshDbVehicles;
+    let externalSourceState: ExternalInventoryRuntimeState | null = null;
+    if (isExternalStorefrontMode) {
+      try {
+        const extData = await loadExternalVehiclesForChat(
+          effectiveDealership.publicStoreSlug || 'armazem-do-carro'
+        );
+        activeInventoryVehicles = extData.vehicles;
+        externalSourceState = {
+          health: extData.health,
+          lastSuccessAt: extData.lastSuccessAt,
+          errorDetail: extData.errorDetail,
+        };
+      } catch (extErr) {
+        console.error('[AI Chat External Inventory Load Failed]', extErr);
+        activeInventoryVehicles = [];
+        externalSourceState = {
+          health: 'unavailable',
+          lastSuccessAt: null,
+          errorDetail: 'Falha ao ler a base sincronizada do site oficial.',
+        };
+      }
+    }
+
     const wantsStream =
       (req.body as { stream?: boolean }).stream !== false &&
       (req.headers.accept?.includes('text/event-stream') ||
         (req.body as { stream?: boolean }).stream === true);
 
-    // Differentiate DB/query failure from a valid empty search result
-    if (stockQueryFailed) {
+    // Differentiate DB/query failure from a valid empty search result (internal mode)
+    if (!isExternalStorefrontMode && stockQueryFailed) {
       const recoverableMsg =
         'Não consegui consultar o estoque atualizado no banco de dados agora. Isso é uma instabilidade temporária — clique em **Tentar novamente** em alguns instantes ou fale com um consultor.';
       if (!wantsStream) {
@@ -4356,9 +4747,9 @@ app.post('/api/ai/chat', async (req, res) => {
       }
     }
 
-    // Resolve fresh selectedVehicle from DB if passed by client
+    // Resolve fresh selectedVehicle from active inventory (internal or external)
     const resolvedSelectedVehicle = body.vehicle
-      ? freshDbVehicles.find(
+      ? activeInventoryVehicles.find(
           (v) =>
             v.brand.toLowerCase() === body.vehicle!.brand.toLowerCase() &&
             v.model.toLowerCase() === body.vehicle!.model.toLowerCase() &&
@@ -4371,7 +4762,7 @@ app.post('/api/ai/chat', async (req, res) => {
       (req.headers.origin && typeof req.headers.origin === 'string' ? req.headers.origin : '');
 
     const turnPlan = planChatTurn({
-      allVehicles: freshDbVehicles,
+      allVehicles: activeInventoryVehicles,
       messages: body.messages,
       latestUserUtterance: latestClientUtterance,
       chatContext: {
@@ -4381,6 +4772,7 @@ app.post('/api/ai/chat', async (req, res) => {
       dealership: effectiveDealership,
       dealershipConfigUnavailable,
       selectedVehicle: resolvedSelectedVehicle,
+      externalSourceState,
     });
 
     const safeReplyToId =

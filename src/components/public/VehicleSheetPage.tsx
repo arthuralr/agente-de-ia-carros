@@ -7,6 +7,7 @@ import {
   Check,
   CheckCircle2,
   Copy,
+  ExternalLink,
   Fuel,
   Gauge,
   MessageCircle,
@@ -29,6 +30,7 @@ import {
   formatKmBr,
   getVehicleDisplayTitle,
   isVehicleAvailable,
+  resolvePublicStorefrontLinks,
 } from '../../utils/vehicleDomain';
 import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 import { HandoffPurpose } from '../../utils/whatsappHandoff';
@@ -152,6 +154,8 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
     );
   }
 
+  const storefront = resolvePublicStorefrontLinks(settings);
+
   if (notFound) {
     return (
       <div className="min-h-screen bg-[#0A0A0B] text-zinc-100 flex items-center justify-center p-6">
@@ -161,14 +165,26 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
           <p className="text-sm text-zinc-400">
             Este anúncio pode ter sido removido ou o endereço informado não corresponde a um veículo do estoque.
           </p>
-          <button
-            type="button"
-            onClick={onBackToCatalog}
-            className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[44px] rounded-xl bg-white text-zinc-950 text-sm font-semibold hover:bg-zinc-200 transition-colors"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            <span>Voltar ao estoque disponível</span>
-          </button>
+          {storefront.isExternal ? (
+            <a
+              href={storefront.catalogUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[44px] rounded-xl bg-white text-zinc-950 text-sm font-semibold hover:bg-zinc-200 transition-colors"
+            >
+              <span>Ver carros no site da revenda</span>
+              <ExternalLink className="w-4 h-4" />
+            </a>
+          ) : (
+            <button
+              type="button"
+              onClick={onBackToCatalog}
+              className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[44px] rounded-xl bg-white text-zinc-950 text-sm font-semibold hover:bg-zinc-200 transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span>Voltar ao estoque disponível</span>
+            </button>
+          )}
         </div>
       </div>
     );
@@ -233,14 +249,26 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
       {/* Sticky top bar */}
       <header className="sticky top-0 z-30 border-b border-zinc-800/80 bg-[#0A0A0B]/95 backdrop-blur-md">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-3">
-          <button
-            type="button"
-            onClick={onBackToCatalog}
-            className="inline-flex items-center gap-2 px-3 py-2 min-h-[44px] rounded-lg text-sm font-medium text-zinc-300 hover:text-white hover:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-red-500"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            <span>Voltar ao estoque</span>
-          </button>
+          {storefront.isExternal ? (
+            <a
+              href={storefront.catalogUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 px-3 py-2 min-h-[44px] rounded-lg text-sm font-medium text-zinc-300 hover:text-white hover:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-red-500"
+            >
+              <ExternalLink className="w-4 h-4" />
+              <span>Ver carros no site da revenda</span>
+            </a>
+          ) : (
+            <button
+              type="button"
+              onClick={onBackToCatalog}
+              className="inline-flex items-center gap-2 px-3 py-2 min-h-[44px] rounded-lg text-sm font-medium text-zinc-300 hover:text-white hover:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-red-500"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span>Voltar ao estoque</span>
+            </button>
+          )}
 
           <div className="flex items-center gap-2">
             <button
@@ -265,6 +293,25 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
       </header>
 
       <main className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 sm:pt-8 space-y-6">
+        {storefront.isExternal && (
+          <div className="rounded-xl border border-zinc-700/80 bg-zinc-900/75 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <p className="text-xs sm:text-sm text-zinc-200">
+              A vitrine pública da {settings.tradeName} opera no site oficial da revenda.
+            </p>
+            <a
+              href={vehicle.officialUrl || storefront.catalogUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-semibold shrink-0"
+            >
+              <span>
+                {vehicle.officialUrl ? 'Abrir ficha no site oficial' : 'Abrir vitrine oficial'}
+              </span>
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </div>
+        )}
+
         {/* Unavailable banner */}
         {!available && (
           <div className="rounded-xl border border-amber-500/40 bg-amber-950/40 px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -279,13 +326,25 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
                 </p>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={onBackToCatalog}
-              className="px-4 py-2.5 min-h-[44px] rounded-lg bg-amber-400 text-zinc-950 text-xs font-semibold hover:bg-amber-300 shrink-0"
-            >
-              Ver veículos disponíveis
-            </button>
+            {storefront.isExternal ? (
+              <a
+                href={storefront.catalogUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 min-h-[44px] rounded-lg bg-amber-400 text-zinc-950 text-xs font-semibold hover:bg-amber-300 shrink-0"
+              >
+                <span>Ver vitrine oficial</span>
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+            ) : (
+              <button
+                type="button"
+                onClick={onBackToCatalog}
+                className="px-4 py-2.5 min-h-[44px] rounded-lg bg-amber-400 text-zinc-950 text-xs font-semibold hover:bg-amber-300 shrink-0"
+              >
+                Ver veículos disponíveis
+              </button>
+            )}
           </div>
         )}
 

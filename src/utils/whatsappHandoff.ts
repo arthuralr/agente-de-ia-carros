@@ -1,10 +1,10 @@
 import { ChatMessage, DealershipSettings, Vehicle } from '../types';
 import {
-  buildVehicleSheetUrl,
   extractTradeInInfo,
   extractVehicleMatchTokens,
   getVehicleDisplayTitle,
   normalizeTextForMatch,
+  resolveVehicleSheetLink,
 } from './vehicleDomain';
 
 export type HandoffPurpose = 'sales' | 'financing' | 'visit' | 'tradein';
@@ -33,6 +33,7 @@ export interface WhatsAppHandoffParams {
   messages?: ChatMessage[];
   vehicles?: Vehicle[];
   existingSummary?: string | null;
+  dealership?: Partial<DealershipSettings> | null;
 }
 
 export interface WhatsAppHandoffResult {
@@ -389,12 +390,10 @@ export function buildWhatsAppHandoffUrl(
 
   let contextSummary = '';
   let actionLine = '';
-  const sheetUrl =
-    resolvedVehicle && params.baseUrl
-      ? buildVehicleSheetUrl(resolvedVehicle.id, params.baseUrl)
-      : resolvedVehicle
-        ? buildVehicleSheetUrl(resolvedVehicle.id, '')
-        : null;
+  const resolvedLink = resolvedVehicle
+    ? resolveVehicleSheetLink(resolvedVehicle, params.baseUrl, params.dealership)
+    : null;
+  const sheetUrl = resolvedLink?.fullUrl || null;
 
   if (resolvedVehicle) {
     const vehicleName = `${getVehicleDisplayTitle(resolvedVehicle)} ${resolvedVehicle.year}`;
@@ -423,7 +422,11 @@ export function buildWhatsAppHandoffUrl(
         : `Gostaria de conversar sobre o ${vehicleName}${subjectSuffix}.${tradeInClause}`;
 
     if (sheetUrl && /^https?:\/\//i.test(sheetUrl)) {
-      actionLine += ` Ficha: ${sheetUrl}`;
+      const linkPrefix =
+        resolvedLink?.isExternal && !resolvedLink.hasOfficialVehicleUrl
+          ? 'Vitrine'
+          : 'Ficha';
+      actionLine += ` ${linkPrefix}: ${sheetUrl}`;
     }
   } else {
     const rawContext =

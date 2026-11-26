@@ -1,5 +1,6 @@
 import { pool } from './pool';
 import { DEFAULT_DOCUMENT_TEMPLATES } from '../utils/documentEngine';
+import { ensureExternalStorefrontSchema } from '../server/externalInventoryService';
 import type { PublicAdminUser } from './auth';
 
 /**
@@ -241,6 +242,7 @@ export async function ensureCentralRevendaSchemaAndSeeds(): Promise<void> {
         ]
       );
     }
+    await ensureExternalStorefrontSchema();
   } finally {
     client.release();
   }

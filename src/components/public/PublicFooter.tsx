@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import {
   Award,
+  ExternalLink,
   Instagram,
   MapPin,
   MessageCircle,
@@ -14,6 +15,7 @@ import {
   formatDealershipAddress,
   formatDealershipHours,
   formatPhoneDisplay,
+  resolvePublicStorefrontLinks,
 } from '../../utils/vehicleDomain';
 import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 
@@ -35,6 +37,7 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
   const formattedAddress = formatDealershipAddress(settings);
   const mapsUrl = buildDealershipMapsUrl(settings);
   const formattedHours = formatDealershipHours(settings);
+  const storefront = resolvePublicStorefrontLinks(settings);
 
   return (
     <footer className="border-t border-white/[0.08] bg-[#0B0B0E] mt-16">
@@ -122,6 +125,18 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
               <Instagram className="w-3.5 h-3.5 text-red-500" />
               <span>Redes Sociais</span>
             </button>
+
+            {storefront.isExternal && (
+              <a
+                href={storefront.catalogUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium text-zinc-200 bg-[#111114] hover:bg-white/[0.06] border border-white/[0.08] transition-colors whitespace-nowrap"
+              >
+                <ExternalLink className="w-3.5 h-3.5 text-red-500" />
+                <span>Ver carros no site da revenda</span>
+              </a>
+            )}
 
             <button
               type="button"

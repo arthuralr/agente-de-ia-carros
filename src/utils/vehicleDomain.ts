@@ -417,6 +417,113 @@ export function computeFipeMetrics(vehicle: Vehicle): VehicleFipeMetrics {
 }
 
 /**
+ * Validates that a URL uses strictly http: or https: and has no embedded credentials.
+ */
+export function isSafeHttpUrl(raw?: string | null): boolean {
+  const clean = (raw || '').trim();
+  if (!clean) return false;
+  try {
+    const parsed = new URL(clean);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    if (parsed.username || parsed.password) return false;
+    return Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export interface PublicStorefrontLinks {
+  isExternal: boolean;
+  catalogUrl: string;
+  homeUrl: string;
+  catalogLabel: string;
+  catalogCtaLabel: string;
+  backToCatalogLabel: string;
+}
+
+/**
+ * Resolves public storefront navigation URLs and labels from DealershipSettings.
+ * Defaults safely to internal storefront unless external mode is active with a valid http(s) catalog URL.
+ */
+export function resolvePublicStorefrontLinks(
+  settings?: Partial<DealershipSettings> | null
+): PublicStorefrontLinks {
+  const externalCatalog = (settings?.externalCatalogUrl || '').trim();
+  const externalHome = (settings?.externalHomeUrl || '').trim();
+  const isExternal =
+    settings?.storefrontMode === 'external' && isSafeHttpUrl(externalCatalog);
+
+  if (isExternal) {
+    return {
+      isExternal: true,
+      catalogUrl: externalCatalog,
+      homeUrl: isSafeHttpUrl(externalHome) ? externalHome : externalCatalog,
+      catalogLabel: 'Ver carros no site da revenda',
+      catalogCtaLabel: 'Ver vitrine da revenda',
+      backToCatalogLabel: 'Ver vitrine da revenda',
+    };
+  }
+
+  return {
+    isExternal: false,
+    catalogUrl: '/',
+    homeUrl: '/inicio',
+    catalogLabel: 'Estoque de Veículos',
+    catalogCtaLabel: 'Explorar Estoque',
+    backToCatalogLabel: 'Voltar à vitrine',
+  };
+}
+
+export interface ResolvedVehicleSheetLink {
+  href: string;
+  fullUrl: string;
+  isExternal: boolean;
+  hasOfficialVehicleUrl: boolean;
+  label: string;
+}
+
+export function resolveVehicleSheetLink(
+  vehicle: Pick<Vehicle, 'id' | 'officialUrl' | 'dataSource'>,
+  origin?: string | null,
+  dealership?: Partial<DealershipSettings> | null
+): ResolvedVehicleSheetLink {
+  const storefront = resolvePublicStorefrontLinks(dealership);
+  const official = (vehicle.officialUrl || '').trim();
+  const hasOfficial = isSafeHttpUrl(official);
+
+  if (storefront.isExternal || vehicle.dataSource === 'external') {
+    if (hasOfficial) {
+      return {
+        href: official,
+        fullUrl: official,
+        isExternal: true,
+        hasOfficialVehicleUrl: true,
+        label: 'Ver ficha oficial',
+      };
+    }
+    if (storefront.isExternal) {
+      return {
+        href: storefront.catalogUrl,
+        fullUrl: storefront.catalogUrl,
+        isExternal: true,
+        hasOfficialVehicleUrl: false,
+        label: 'Ver vitrine da revenda',
+      };
+    }
+  }
+
+  const path = buildVehicleSheetPath(vehicle.id);
+  const full = buildVehicleSheetUrl(vehicle.id, origin);
+  return {
+    href: path,
+    fullUrl: full,
+    isExternal: false,
+    hasOfficialVehicleUrl: false,
+    label: 'Ver ficha',
+  };
+}
+
+/**
  * Builds canonical shareable vehicle sheet path and full URL.
  */
 export function buildVehicleSheetPath(vehicleId: string | number): string {
@@ -437,10 +544,12 @@ export function buildVehicleSheetUrl(
 export function toVehicleCardData(
   vehicle: Vehicle,
   origin?: string | null,
-  alternativeNote?: string | null
+  alternativeNote?: string | null,
+  dealership?: Partial<DealershipSettings> | null
 ): VehicleCardData {
   const quality = analyzeVehicleDataQuality(vehicle);
   const fipe = computeFipeMetrics(vehicle);
+  const link = resolveVehicleSheetLink(vehicle, origin, dealership);
   return {
     id: vehicle.id,
     brand: vehicle.brand,
@@ -460,8 +569,13 @@ export function toVehicleCardData(
     fipeDiffBrl: fipe.diffBrl,
     fipeDiffPct: fipe.diffPct,
     isConfirmedBelowFipeOffer: fipe.isConfirmedBelowFipeOffer,
-    sheetPath: buildVehicleSheetPath(vehicle.id),
-    sheetUrl: buildVehicleSheetUrl(vehicle.id, origin),
+    sheetPath: link.href,
+    sheetUrl: link.fullUrl,
+    officialUrl: link.hasOfficialVehicleUrl ? link.fullUrl : null,
+    isExternalUrl: link.isExternal,
+    dataSource: vehicle.dataSource || 'internal',
+    priceConfirmed: vehicle.priceConfirmed !== false && vehicle.price > 0,
+    availabilityConfirmed: vehicle.availabilityConfirmed !== false,
     alternativeNote: alternativeNote || null,
   };
 }
@@ -1243,7 +1357,8 @@ export function analyzeVisitIntent(message: string): VisitIntentClassification {
  */
 export function buildVehicleComparison(
   vehicles: Vehicle[],
-  origin?: string | null
+  origin?: string | null,
+  dealership?: Partial<DealershipSettings> | null
 ): VehicleComparisonData | null {
   const unique: Vehicle[] = [];
   for (const v of vehicles) {
@@ -1252,12 +1367,16 @@ export function buildVehicleComparison(
   if (unique.length < 2) return null;
 
   const selected = unique.slice(0, 3);
-  const cards = selected.map((v) => toVehicleCardData(v, origin));
+  const cards = selected.map((v) => toVehicleCardData(v, origin, null, dealership));
 
   const rows: VehicleComparisonData['rows'] = [
     {
       label: 'Preço à vista',
-      values: selected.map((v) => formatBrlCurrency(v.price)),
+      values: selected.map((v) =>
+        v.priceConfirmed === false || v.price <= 0
+          ? 'A confirmar'
+          : formatBrlCurrency(v.price)
+      ),
     },
     {
       label: 'Ano',
@@ -1353,6 +1472,14 @@ export const DEFAULT_DEALERSHIP_CONFIG: DealershipSettings = {
   warrantyKm: 5000,
   financingMonthlyRatePct: null,
   logoUrl: '',
+  publicStoreSlug: 'armazem-do-carro',
+  storefrontMode: 'internal',
+  externalCatalogUrl: '',
+  externalHomeUrl: '',
+  widgetEnabled: true,
+  widgetPosition: 'bottom-right',
+  widgetLabel: 'Fale com o agente',
+  widgetAllowedOrigins: [],
 };
 
 /**
@@ -1483,6 +1610,22 @@ export function mergeDealershipConfig(
   if (!merged.financingWhatsappLabel?.trim()) {
     merged.financingWhatsappLabel = 'Financeiro / Simulação';
   }
+  if (!merged.publicStoreSlug?.trim()) {
+    merged.publicStoreSlug = 'armazem-do-carro';
+  }
+  merged.storefrontMode =
+    merged.storefrontMode === 'external' ? 'external' : 'internal';
+  merged.externalCatalogUrl = (merged.externalCatalogUrl || '').trim();
+  merged.externalHomeUrl = (merged.externalHomeUrl || '').trim();
+  merged.widgetEnabled = merged.widgetEnabled !== false;
+  merged.widgetPosition =
+    merged.widgetPosition === 'bottom-left' ? 'bottom-left' : 'bottom-right';
+  merged.widgetLabel = (merged.widgetLabel || '').trim() || 'Fale com o agente';
+  merged.widgetAllowedOrigins = Array.isArray(merged.widgetAllowedOrigins)
+    ? merged.widgetAllowedOrigins
+        .map((o) => String(o || '').trim().replace(/\/+$/, ''))
+        .filter(Boolean)
+    : [];
   return merged;
 }
 

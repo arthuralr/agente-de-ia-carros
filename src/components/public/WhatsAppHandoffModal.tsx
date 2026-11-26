@@ -120,6 +120,7 @@ export const WhatsAppHandoffModal: React.FC<WhatsAppHandoffModalProps> = ({
       buildWhatsAppHandoffUrl({
         storeWhatsappNumber: destination.normalizedNumber,
         storeName: settings.tradeName,
+        dealership: settings,
         leadName,
         leadPhone,
         includeContactData,
@@ -138,7 +139,7 @@ export const WhatsAppHandoffModal: React.FC<WhatsAppHandoffModalProps> = ({
     [
       destination.normalizedNumber,
       destination.label,
-      settings.tradeName,
+      settings,
       leadName,
       leadPhone,
       includeContactData,

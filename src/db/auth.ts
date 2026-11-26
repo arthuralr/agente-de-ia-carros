@@ -14,6 +14,7 @@ export interface DbAdminUserRow {
   role_code?: string | null;
   avatar_url: string | null;
   active: boolean;
+  token_version?: number;
   last_login_at: Date | null;
   created_at: Date;
 }
@@ -26,6 +27,7 @@ export interface PublicAdminUser {
   roleCode: StaffRole;
   avatarUrl: string | null;
   active?: boolean;
+  tokenVersion?: number;
   lastLoginAt?: string | null;
 }
 
@@ -35,6 +37,7 @@ export interface SessionJwtPayload {
   name: string;
   role: string;
   roleCode?: StaffRole;
+  tv?: number;
   iat?: number;
   exp?: number;
 }
@@ -80,6 +83,7 @@ export function signSessionToken(user: PublicAdminUser): string {
       name: user.name,
       role: user.role,
       roleCode: resolvedRoleCode,
+      tv: Number.isFinite(user.tokenVersion) ? user.tokenVersion : 1,
     },
     getJwtSecret(),
     {
@@ -200,32 +204,40 @@ export async function ensureAdminUsersSchemaAndSeed(): Promise<void> {
         name VARCHAR(150) NOT NULL,
         email VARCHAR(200) UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
-        role VARCHAR(80) NOT NULL DEFAULT 'Gerente Comercial',
+        role VARCHAR(80) NOT NULL DEFAULT 'Administrador',
+        role_code VARCHAR(40) NOT NULL DEFAULT 'administrador',
         avatar_url TEXT,
         active BOOLEAN NOT NULL DEFAULT true,
+        token_version INTEGER NOT NULL DEFAULT 1,
         last_login_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
 
+    await client.query(`
+      ALTER TABLE admin_users
+        ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 1
+    `);
+
+    // Secure first-run bootstrap ONLY via explicit server environment variables when no user exists.
+    // Never creates hardcoded demo credentials.
     const countRes = await client.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM admin_users'
     );
 
     if ((countRes.rows[0]?.count ?? 0) === 0) {
-      const defaultPasswordHash = hashPassword('Armazem@2026');
-      await client.query(
-        `INSERT INTO admin_users (name, email, password_hash, role, avatar_url, active)
-         VALUES ($1, $2, $3, $4, $5, true)
-         ON CONFLICT (email) DO NOTHING`,
-        [
-          'Ricardo Almeida',
-          'ricardo@armazemdocarro.com.br',
-          defaultPasswordHash,
-          'Gerente Comercial',
-          '/src/assets/images/avatar_ricardo_1794945349576.jpg',
-        ]
-      );
+      const bootstrapEmail = (process.env.ADMIN_BOOTSTRAP_EMAIL || '').trim().toLowerCase();
+      const bootstrapPassword = (process.env.ADMIN_BOOTSTRAP_PASSWORD || '').trim();
+      const bootstrapName = (process.env.ADMIN_BOOTSTRAP_NAME || 'Administrador').trim();
+      if (bootstrapEmail && bootstrapPassword.length >= 10) {
+        const passwordHash = hashPassword(bootstrapPassword);
+        await client.query(
+          `INSERT INTO admin_users (name, email, password_hash, role, role_code, active, token_version)
+           VALUES ($1, $2, $3, 'Administrador', 'administrador', true, 1)
+           ON CONFLICT (email) DO NOTHING`,
+          [bootstrapName, bootstrapEmail, passwordHash]
+        );
+      }
     }
   } finally {
     client.release();

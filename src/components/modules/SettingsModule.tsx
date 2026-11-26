@@ -4,8 +4,11 @@ import {
   AlertTriangle,
   Check,
   Copy,
+  Globe,
+  KeyRound,
   LayoutGrid,
   Loader2,
+  LogOut,
   MessageCircle,
   RotateCcw,
   Save,
@@ -27,6 +30,7 @@ import {
   DEFAULT_DEALERSHIP_CONFIG,
   formatPhoneDisplay,
 } from '../../utils/vehicleDomain';
+import { ExternalStorefrontSettingsTab } from './ExternalStorefrontSettingsTab';
 
 interface SettingsModuleProps {
   currentUser?: AdminUser | null;
@@ -48,7 +52,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   onSaveSettings,
   onUnauthorized,
 }) => {
-  const [settingsTab, setSettingsTab] = useState<'revenda' | 'equipe'>('revenda');
+  const [settingsTab, setSettingsTab] = useState<'revenda' | 'vitrine_widget' | 'equipe'>('revenda');
   const [form, setForm] = useState<DealershipSettings>(settings);
   const [selectedMode, setSelectedMode] = useState<OperationMode>(operationMode);
   const [savingMode, setSavingMode] = useState(false);
@@ -73,6 +77,9 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
     null
   );
   const [copiedInvite, setCopiedInvite] = useState(false);
+  const [rotatingUserId, setRotatingUserId] = useState<number | null>(null);
+  const [rotatePasswordValue, setRotatePasswordValue] = useState('');
+  const [submittingSecurityAction, setSubmittingSecurityAction] = useState(false);
 
   const loadTeam = useCallback(async () => {
     setLoadingTeam(true);
@@ -191,6 +198,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
     patch: { roleCode?: StaffRole; active?: boolean }
   ) => {
     setTeamError(null);
+    setTeamNotice(null);
     try {
       const res = await adminFetch(`/api/admin/team/users/${userId}`, {
         method: 'PATCH',
@@ -206,6 +214,84 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
       await loadTeam();
     } catch (err) {
       setTeamError(err instanceof Error ? err.message : 'Erro ao atualizar usuário.');
+    }
+  };
+
+  const handleRotateUserPassword = async (userId: number) => {
+    if (rotatePasswordValue.length < 10) {
+      setTeamError('Defina uma nova senha forte com pelo menos 10 caracteres.');
+      return;
+    }
+    setSubmittingSecurityAction(true);
+    setTeamError(null);
+    setTeamNotice(null);
+    try {
+      const res = await adminFetch(`/api/admin/team/users/${userId}/rotate-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newPassword: rotatePasswordValue }),
+      });
+      if (res.status === 401) {
+        onUnauthorized?.();
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as {
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        throw new Error(data.error || 'Não foi possível redefinir a senha.');
+      }
+      setRotatingUserId(null);
+      setRotatePasswordValue('');
+      setTeamNotice(
+        data.message || 'Senha redefinida e sessões anteriores revogadas com sucesso.'
+      );
+      if (currentUser?.id === userId) {
+        onUnauthorized?.();
+        return;
+      }
+      await loadTeam();
+    } catch (err) {
+      setTeamError(
+        err instanceof Error ? err.message : 'Erro ao redefinir senha.'
+      );
+    } finally {
+      setSubmittingSecurityAction(false);
+    }
+  };
+
+  const handleRevokeUserSessions = async (userId: number) => {
+    setSubmittingSecurityAction(true);
+    setTeamError(null);
+    setTeamNotice(null);
+    try {
+      const res = await adminFetch(`/api/admin/team/users/${userId}/revoke-sessions`, {
+        method: 'POST',
+      });
+      if (res.status === 401) {
+        onUnauthorized?.();
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as {
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        throw new Error(data.error || 'Não foi possível revogar sessões.');
+      }
+      setTeamNotice(data.message || 'Sessões ativas revogadas imediatamente.');
+      if (currentUser?.id === userId) {
+        onUnauthorized?.();
+        return;
+      }
+      await loadTeam();
+    } catch (err) {
+      setTeamError(
+        err instanceof Error ? err.message : 'Erro ao revogar sessões.'
+      );
+    } finally {
+      setSubmittingSecurityAction(false);
     }
   };
 
@@ -335,8 +421,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
 
   return (
     <div className="max-w-4xl space-y-6">
-      {/* Sub-navigation between Dealership Settings & Team RBAC */}
-      <div className="inline-flex items-center gap-1 p-1 bg-[#111114] border border-white/[0.08] rounded-lg">
+      {/* Sub-navigation between Dealership Settings, Storefront & Widget, and Team RBAC */}
+      <div className="inline-flex flex-wrap items-center gap-1 p-1 bg-[#111114] border border-white/[0.08] rounded-lg">
         <button
           type="button"
           onClick={() => setSettingsTab('revenda')}
@@ -348,6 +434,18 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         >
           <Shield className="w-3.5 h-3.5" />
           <span>Dados da Revenda & Canais</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setSettingsTab('vitrine_widget')}
+          className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md text-xs font-medium transition-colors ${
+            settingsTab === 'vitrine_widget'
+              ? 'bg-zinc-800 text-white'
+              : 'text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          <Globe className="w-3.5 h-3.5" />
+          <span>Site e vitrine</span>
         </button>
         <button
           type="button"
@@ -363,7 +461,13 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         </button>
       </div>
 
-      {settingsTab === 'equipe' ? (
+      {settingsTab === 'vitrine_widget' ? (
+        <ExternalStorefrontSettingsTab
+          settings={settings}
+          onSaveSettings={onSaveSettings}
+          onUnauthorized={onUnauthorized}
+        />
+      ) : settingsTab === 'equipe' ? (
         <div className="space-y-6">
           {teamError && (
             <div className="p-3.5 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center gap-2 text-xs text-red-200">
@@ -518,61 +622,115 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
               <div className="divide-y divide-white/[0.06]">
                 {teamUsers.map((u) => {
                   const isSelf = currentUser?.id === u.id;
+                  const isRotatingThis = rotatingUserId === u.id;
                   return (
-                    <div
-                      key={u.id}
-                      className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                    >
-                      <div className="min-w-0">
-                        <p className="font-semibold text-white">
-                          {u.name}{' '}
-                          {isSelf && (
-                            <span className="text-[10px] font-normal text-zinc-400">
-                              (você)
-                            </span>
-                          )}
-                        </p>
-                        <p className="text-zinc-400 font-mono text-[11px] truncate">
-                          {u.email}
-                        </p>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <select
-                          disabled={isSelf}
-                          value={u.roleCode}
-                          onChange={(e) =>
-                            void handleUpdateUserRoleOrActive(u.id, {
-                              roleCode: e.target.value as StaffRole,
-                            })
-                          }
-                          className="px-2.5 py-1.5 bg-[#09090B] border border-white/[0.1] rounded-lg text-xs text-zinc-200 disabled:opacity-50"
-                        >
-                          {(Object.keys(STAFF_ROLE_META) as StaffRole[]).map(
-                            (code) => (
-                              <option key={code} value={code} className="bg-zinc-950">
-                                {STAFF_ROLE_META[code].label}
-                              </option>
-                            )
-                          )}
-                        </select>
-                        {!isSelf && (
-                          <button
-                            type="button"
-                            onClick={() =>
+                    <div key={u.id} className="py-3 space-y-2.5 text-xs">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="font-semibold text-white">
+                            {u.name}{' '}
+                            {isSelf && (
+                              <span className="text-[10px] font-normal text-zinc-400">
+                                (você)
+                              </span>
+                            )}
+                          </p>
+                          <p className="text-zinc-400 font-mono text-[11px] truncate">
+                            {u.email}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <select
+                            disabled={isSelf}
+                            value={u.roleCode}
+                            onChange={(e) =>
                               void handleUpdateUserRoleOrActive(u.id, {
-                                active: u.active === false,
+                                roleCode: e.target.value as StaffRole,
                               })
                             }
-                            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border ${
-                              u.active === false
-                                ? 'text-emerald-300 border-emerald-500/30 bg-emerald-600/10'
-                                : 'text-zinc-400 border-white/[0.1] bg-white/[0.04] hover:text-red-300'
-                            }`}
+                            className="px-2.5 py-1.5 bg-[#09090B] border border-white/[0.1] rounded-lg text-xs text-zinc-200 disabled:opacity-50"
                           >
-                            {u.active === false ? 'Reativar' : 'Desativar'}
+                            {(Object.keys(STAFF_ROLE_META) as StaffRole[]).map(
+                              (code) => (
+                                <option key={code} value={code} className="bg-zinc-950">
+                                  {STAFF_ROLE_META[code].label}
+                                </option>
+                              )
+                            )}
+                          </select>
+                          <button
+                            type="button"
+                            disabled={submittingSecurityAction}
+                            onClick={() => {
+                              setRotatingUserId(isRotatingThis ? null : u.id);
+                              setRotatePasswordValue('');
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-zinc-300 border border-white/[0.1] bg-white/[0.04] hover:text-white hover:bg-white/[0.08]"
+                          >
+                            <KeyRound className="w-3.5 h-3.5" />
+                            <span>Redefinir senha</span>
                           </button>
-                        )}
+                          <button
+                            type="button"
+                            disabled={submittingSecurityAction}
+                            onClick={() => void handleRevokeUserSessions(u.id)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-amber-300 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20"
+                          >
+                            <LogOut className="w-3.5 h-3.5" />
+                            <span>Revogar sessões</span>
+                          </button>
+                          {!isSelf && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void handleUpdateUserRoleOrActive(u.id, {
+                                  active: u.active === false,
+                                })
+                              }
+                              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border ${
+                                u.active === false
+                                  ? 'text-emerald-300 border-emerald-500/30 bg-emerald-600/10'
+                                  : 'text-zinc-400 border-white/[0.1] bg-white/[0.04] hover:text-red-300'
+                              }`}
+                            >
+                              {u.active === false ? 'Reativar' : 'Desativar'}
+                            </button>
+                          )}
+                        </div>
                       </div>
+
+                      {isRotatingThis && (
+                        <div className="p-3 rounded-lg bg-[#09090B] border border-white/[0.1] flex flex-col sm:flex-row sm:items-center gap-2">
+                          <input
+                            type="password"
+                            autoComplete="new-password"
+                            value={rotatePasswordValue}
+                            onChange={(e) => setRotatePasswordValue(e.target.value)}
+                            placeholder="Nova senha forte (mín. 10 caracteres)"
+                            className="flex-1 px-3 py-1.5 bg-[#111114] border border-white/[0.1] rounded-lg text-xs text-white focus:outline-none focus:border-red-600"
+                          />
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              disabled={submittingSecurityAction}
+                              onClick={() => void handleRotateUserPassword(u.id)}
+                              className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 disabled:opacity-50"
+                            >
+                              Confirmar nova senha
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRotatingUserId(null);
+                                setRotatePasswordValue('');
+                              }}
+                              className="px-2.5 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-white"
+                            >
+                              Cancelar
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
