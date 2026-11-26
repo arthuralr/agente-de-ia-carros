@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { DealershipSettings, Vehicle } from '../../types';
 import { formatBRL, formatKm } from '../../utils/formatters';
+import { analyzeVehicleDataQuality } from '../../utils/vehicleDomain';
 import { VehicleImage } from '../VehicleImage';
 import { PublicFooter } from './PublicFooter';
 
@@ -225,7 +226,9 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {activeStock.slice(0, 3).map((v) => (
+            {activeStock.slice(0, 3).map((v) => {
+              const quality = analyzeVehicleDataQuality(v);
+              return (
               <div
                 key={v.id}
                 className="bg-[#111114] border border-white/[0.08] rounded-xl overflow-hidden flex flex-col"
@@ -241,8 +244,8 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
                     <h3 className="font-display text-base font-semibold text-white">
                       {v.brand} {v.model}
                     </h3>
-                    <p className="text-xs text-zinc-400 mt-0.5 truncate">
-                      {v.year} · {formatKm(v.km)} · {v.transmission}
+                    <p className="text-xs text-zinc-400 mt-0.5 truncate tabular-nums">
+                      {v.year} · {formatKm(v.km)} · {quality.displayTransmission}
                     </p>
                   </div>
 
@@ -260,7 +263,8 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
                   </div>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       </main>

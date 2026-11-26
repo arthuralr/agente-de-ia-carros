@@ -12,6 +12,10 @@ import { DealershipSettings, Vehicle, VehicleCategory } from '../../types';
 import { inferVehicleCategory } from '../../data/mockData';
 import { ApiVehicleRow, mapDbVehicleToFrontend } from '../../db/mappers';
 import { formatBRL, formatKm } from '../../utils/formatters';
+import {
+  analyzeVehicleDataQuality,
+  computeFipeMetrics,
+} from '../../utils/vehicleDomain';
 import { VehicleImage } from '../VehicleImage';
 import { PublicFooter } from './PublicFooter';
 
@@ -63,6 +67,8 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
   const [isLoadingStock, setIsLoadingStock] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  const [retryCounter, setRetryCounter] = useState(0);
+
   useEffect(() => {
     let active = true;
 
@@ -97,7 +103,7 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
     return () => {
       active = false;
     };
-  }, [vehicles]);
+  }, [vehicles, retryCounter]);
 
   // Dynamic available stock loaded from Neon (status = 'Disponivel', ordered by created_at DESC)
   const activeStock = useMemo(() => {
@@ -112,15 +118,13 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
       const cat = inferVehicleCategory(v);
       const matchesCat = category === 'Todos' || cat === category;
 
-      const transLower = v.transmission.toLowerCase();
+      const quality = analyzeVehicleDataQuality(v);
       const matchesTrans =
         transmissionFilter === 'Todos' ||
         (transmissionFilter === 'Automático' &&
-          (transLower.includes('automático') ||
-            transLower.includes('pdk') ||
-            transLower.includes('dsg') ||
-            transLower.includes('cvt'))) ||
-        (transmissionFilter === 'Manual' && transLower.includes('manual'));
+          quality.transmissionStatus === 'confirmed_auto') ||
+        (transmissionFilter === 'Manual' &&
+          quality.transmissionStatus === 'confirmed_manual');
 
       const fuelLower = v.fuel.toLowerCase();
       const matchesFuel =
@@ -386,9 +390,18 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
         </section>
 
         {loadError && (
-          <div className="px-4 py-3 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center gap-2.5 text-xs text-red-200">
-            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-            <span>{loadError}</span>
+          <div className="px-4 py-3 rounded-lg bg-red-950/50 border border-red-600/40 flex flex-wrap items-center justify-between gap-3 text-xs text-red-200">
+            <span className="inline-flex items-center gap-2.5">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              <span>{loadError}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setRetryCounter((c) => c + 1)}
+              className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white font-semibold"
+            >
+              Tentar novamente
+            </button>
           </div>
         )}
 
@@ -442,6 +455,8 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
           <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {filteredAndSorted.map((vehicle) => {
               const cat = inferVehicleCategory(vehicle);
+              const quality = analyzeVehicleDataQuality(vehicle);
+              const fipe = computeFipeMetrics(vehicle);
 
               return (
                 <article
@@ -484,8 +499,22 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
                       {/* Clean unboxed technical metadata */}
                       <p className="text-xs text-zinc-300 mt-3 tabular-nums">
                         {vehicle.year} · {formatKm(vehicle.km)} ·{' '}
-                        {vehicle.transmission} · {vehicle.fuel}
+                        <span
+                          className={
+                            quality.canonicalTransmission
+                              ? 'text-zinc-300'
+                              : 'text-amber-400'
+                          }
+                        >
+                          {quality.displayTransmission}
+                        </span>{' '}
+                        · {vehicle.fuel}
                       </p>
+                      {fipe.isConfirmedBelowFipeOffer && fipe.diffBrl && (
+                        <p className="text-[11px] text-emerald-400 mt-1.5 tabular-nums">
+                          {formatBRL(fipe.diffBrl)} abaixo da FIPE ({fipe.fipeReferenceMonth})
+                        </p>
+                      )}
                     </div>
 
                     <div className="pt-4 border-t border-white/[0.06] space-y-4">

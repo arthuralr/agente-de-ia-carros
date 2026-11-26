@@ -36,11 +36,13 @@ import { PublicHomePage } from './components/public/PublicHomePage';
 import { VehicleDetailModal } from './components/public/VehicleDetailModal';
 import { AiChatDrawer } from './components/public/AiChatDrawer';
 import { StandaloneChatPage } from './components/public/StandaloneChatPage';
+import { VehicleSheetPage } from './components/public/VehicleSheetPage';
 import { PrivacyPolicyPage } from './components/public/PrivacyPolicyPage';
 import { PWAInstallBanner } from './components/public/PWAInstallBanner';
 import { AdminLoginPage } from './components/auth/AdminLoginPage';
 import { adminFetch, clearAdminSessionToken } from './utils/authSession';
 import { normalizeStoreWhatsAppNumber } from './utils/whatsappHandoff';
+import { buildVehicleSheetPath, mergeDealershipConfig } from './utils/vehicleDomain';
 
 function loadStored<T>(key: string, fallback: T): T {
   try {
@@ -65,42 +67,58 @@ const MODULE_PATH_MAP: Record<NavModule, string> = {
 function parseRouteFromPathname(pathname: string): {
   viewMode: AppViewMode;
   module: NavModule;
+  vehicleId: string | null;
 } {
   const clean = pathname.replace(/\/+$/, '') || '/';
 
+  const vehicleMatch = clean.match(/^\/veiculo\/([^/]+)$/);
+  if (vehicleMatch?.[1]) {
+    return {
+      viewMode: 'vehicle_detail',
+      module: 'inventory',
+      vehicleId: decodeURIComponent(vehicleMatch[1]),
+    };
+  }
   if (clean === '/inicio' || clean === '/home') {
-    return { viewMode: 'home', module: 'inventory' };
+    return { viewMode: 'home', module: 'inventory', vehicleId: null };
   }
   if (clean === '/chat' || clean === '/atendimento') {
-    return { viewMode: 'chat', module: 'inventory' };
+    return { viewMode: 'chat', module: 'inventory', vehicleId: null };
   }
   if (clean === '/privacidade' || clean === '/politica-de-privacidade') {
-    return { viewMode: 'privacy', module: 'inventory' };
+    return { viewMode: 'privacy', module: 'inventory', vehicleId: null };
   }
   if (clean === '/login') {
-    return { viewMode: 'login', module: 'inventory' };
+    return { viewMode: 'login', module: 'inventory', vehicleId: null };
   }
   if (clean === '/admin' || clean.startsWith('/admin/')) {
     const sub = clean.slice('/admin'.length);
     if (sub === '/visao-geral' || sub === '/dashboard') {
-      return { viewMode: 'admin', module: 'dashboard' };
+      return { viewMode: 'admin', module: 'dashboard', vehicleId: null };
     }
-    if (sub === '/crm') return { viewMode: 'admin', module: 'crm' };
+    if (sub === '/crm') return { viewMode: 'admin', module: 'crm', vehicleId: null };
     if (sub === '/conversas' || sub === '/chat-audit') {
-      return { viewMode: 'admin', module: 'chat_audit' };
+      return { viewMode: 'admin', module: 'chat_audit', vehicleId: null };
     }
-    if (sub === '/contratos') return { viewMode: 'admin', module: 'contracts' };
+    if (sub === '/contratos') return { viewMode: 'admin', module: 'contracts', vehicleId: null };
     if (sub === '/ia' || sub === '/posts-ia') {
-      return { viewMode: 'admin', module: 'social_ai' };
+      return { viewMode: 'admin', module: 'social_ai', vehicleId: null };
     }
-    if (sub === '/configuracoes') return { viewMode: 'admin', module: 'settings' };
-    return { viewMode: 'admin', module: 'inventory' };
+    if (sub === '/configuracoes') return { viewMode: 'admin', module: 'settings', vehicleId: null };
+    return { viewMode: 'admin', module: 'inventory', vehicleId: null };
   }
 
-  return { viewMode: 'catalog', module: 'inventory' };
+  return { viewMode: 'catalog', module: 'inventory', vehicleId: null };
 }
 
-function getPathForView(viewMode: AppViewMode, module: NavModule): string {
+function getPathForView(
+  viewMode: AppViewMode,
+  module: NavModule,
+  vehicleId?: string | null
+): string {
+  if (viewMode === 'vehicle_detail' && vehicleId) {
+    return buildVehicleSheetPath(vehicleId);
+  }
   if (viewMode === 'home') return '/inicio';
   if (viewMode === 'chat') return '/chat';
   if (viewMode === 'privacy') return '/privacidade';
@@ -116,6 +134,9 @@ export default function App() {
 
   const [viewMode, setViewMode] = useState<AppViewMode>(initialRoute.viewMode);
   const [activeModule, setActiveModule] = useState<NavModule>(initialRoute.module);
+  const [activeVehicleId, setActiveVehicleId] = useState<string | null>(
+    initialRoute.vehicleId
+  );
   const [pendingAdminModule, setPendingAdminModule] = useState<NavModule>(
     initialRoute.module
   );
@@ -173,15 +194,27 @@ export default function App() {
   >(null);
 
   const navigateTo = useCallback(
-    (nextView: AppViewMode, nextModule?: NavModule, replace = false) => {
+    (
+      nextView: AppViewMode,
+      nextModule?: NavModule,
+      replace = false,
+      vehicleId?: string | null
+    ) => {
       const resolvedModule = nextModule ?? activeModule;
+      const resolvedVehicleId =
+        nextView === 'vehicle_detail' ? (vehicleId ?? activeVehicleId) : null;
       if (nextModule) {
         setActiveModule(nextModule);
       }
+      setActiveVehicleId(resolvedVehicleId);
       setViewMode(nextView);
 
       if (typeof window !== 'undefined') {
-        const targetPath = getPathForView(nextView, resolvedModule);
+        const targetPath = getPathForView(
+          nextView,
+          resolvedModule,
+          resolvedVehicleId
+        );
         if (window.location.pathname !== targetPath) {
           if (replace) {
             window.history.replaceState(null, '', targetPath);
@@ -191,7 +224,15 @@ export default function App() {
         }
       }
     },
-    [activeModule]
+    [activeModule, activeVehicleId]
+  );
+
+  const openVehicleSheet = useCallback(
+    (vehicleId: string) => {
+      setDetailVehicle(null);
+      navigateTo('vehicle_detail', undefined, false, vehicleId);
+    },
+    [navigateTo]
   );
 
   const handleUnauthorizedSession = useCallback(
@@ -262,6 +303,7 @@ export default function App() {
           const cfg = (await cfgRes.json()) as {
             operationMode?: OperationMode;
             storeWhatsappNumber?: string;
+            dealershipConfig?: Partial<DealershipSettings>;
           };
           if (cfg.operationMode === 'agent_only' || cfg.operationMode === 'full') {
             setOperationMode(cfg.operationMode);
@@ -273,6 +315,15 @@ export default function App() {
             if (normalized.length >= 10) {
               setStoreWhatsappNumber(normalized);
             }
+          }
+          if (cfg.dealershipConfig) {
+            setSettings(
+              mergeDealershipConfig(cfg.dealershipConfig, cfg.storeWhatsappNumber)
+            );
+          } else if (cfg.storeWhatsappNumber) {
+            setSettings((prev) =>
+              mergeDealershipConfig(prev, cfg.storeWhatsappNumber)
+            );
           }
         }
       } catch {
@@ -313,6 +364,7 @@ export default function App() {
     const onPopState = () => {
       const parsed = parseRouteFromPathname(window.location.pathname);
       setActiveModule(parsed.module);
+      setActiveVehicleId(parsed.vehicleId);
       setViewMode(parsed.viewMode);
       const sessionParam = new URLSearchParams(window.location.search)
         .get('session')
@@ -437,6 +489,7 @@ export default function App() {
         price: vehicle.price,
         fipe_code: vehicle.fipeCode?.trim() || null,
         fipe_price: vehicle.fipePrice > 0 ? vehicle.fipePrice : null,
+        fipe_reference_month: vehicle.fipeReferenceMonth?.trim() || null,
         status: 'Disponivel',
         fuel: vehicle.fuel,
         transmission: vehicle.transmission,
@@ -498,6 +551,7 @@ export default function App() {
           price: updated.price,
           fipe_code: updated.fipeCode?.trim() || null,
           fipe_price: updated.fipePrice > 0 ? updated.fipePrice : null,
+          fipe_reference_month: updated.fipeReferenceMonth?.trim() || null,
           status: updated.status,
           fuel: updated.fuel,
           transmission: updated.transmission,
@@ -828,11 +882,54 @@ export default function App() {
           'Falha ao salvar WhatsApp comercial da loja no Neon PostgreSQL.'
       );
     }
-    const saved = (await res.json()) as { storeWhatsappNumber: string };
+    const saved = (await res.json()) as {
+      storeWhatsappNumber: string;
+      dealershipConfig?: DealershipSettings;
+    };
     setStoreWhatsappNumber(saved.storeWhatsappNumber);
+    if (saved.dealershipConfig) {
+      setSettings(saved.dealershipConfig);
+    } else {
+      setSettings((prev) =>
+        mergeDealershipConfig(prev, saved.storeWhatsappNumber)
+      );
+    }
     pushActivity(
       'WhatsApp comercial da loja atualizado',
       `Transbordo direto wa.me configurado para ${saved.storeWhatsappNumber}`,
+      'estoque'
+    );
+  };
+
+  const handleSaveCentralizedDealershipSettings = async (
+    next: DealershipSettings
+  ) => {
+    const res = await adminFetch('/api/admin/settings/dealership', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dealershipConfig: next }),
+    });
+    if (res.status === 401) {
+      handleUnauthorizedSession();
+      throw new Error('Sessão administrativa expirada.');
+    }
+    if (!res.ok) {
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(
+        errData.error || 'Falha ao salvar configurações da loja no banco Neon.'
+      );
+    }
+    const saved = (await res.json()) as {
+      dealershipConfig: DealershipSettings;
+      storeWhatsappNumber?: string;
+    };
+    setSettings(saved.dealershipConfig);
+    if (saved.storeWhatsappNumber) {
+      setStoreWhatsappNumber(saved.storeWhatsappNumber);
+    }
+    pushActivity(
+      'Configurações centralizadas atualizadas',
+      'Dados da loja, horários e canais de WhatsApp salvos no banco Neon',
       'estoque'
     );
   };
@@ -846,6 +943,28 @@ export default function App() {
           navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog')
         }
         onOpenChat={() => navigateTo('chat')}
+      />
+    );
+  }
+
+  // 1A-bis. Public Shareable Vehicle Sheet Page (/veiculo/:id)
+  if (viewMode === 'vehicle_detail' && activeVehicleId) {
+    const preloadedVehicle =
+      vehicles.find((v) => String(v.id) === String(activeVehicleId)) || null;
+    return (
+      <VehicleSheetPage
+        vehicleId={activeVehicleId}
+        initialVehicle={preloadedVehicle}
+        settings={settings}
+        storeWhatsappNumber={storeWhatsappNumber}
+        onBackToCatalog={() => {
+          void hydratePublicVehicles();
+          navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog');
+        }}
+        onOpenChatWithVehicle={(veh) => {
+          setChatVehicle(veh);
+          navigateTo('chat');
+        }}
       />
     );
   }
@@ -868,6 +987,7 @@ export default function App() {
           void hydratePublicVehicles();
           navigateTo('catalog');
         }}
+        onOpenVehicleSheet={openVehicleSheet}
         onOpenPrivacy={() => navigateTo('privacy')}
       />
     );
@@ -883,7 +1003,7 @@ export default function App() {
             settings={settings}
             onBackHome={() => navigateTo('home')}
             onOpenAdmin={handleOpenAdminEntry}
-            onOpenDetails={(v) => setDetailVehicle(v)}
+            onOpenDetails={(v) => openVehicleSheet(v.id)}
             onInterest={openVehicleInterestChat}
             onOpenGeneralChat={openGeneralChat}
             onOpenPrivacy={() => navigateTo('privacy')}
@@ -894,7 +1014,7 @@ export default function App() {
             settings={settings}
             onGoToCatalog={() => navigateTo('catalog')}
             onOpenAdmin={handleOpenAdminEntry}
-            onOpenDetails={(v) => setDetailVehicle(v)}
+            onOpenDetails={(v) => openVehicleSheet(v.id)}
             onInterest={openVehicleInterestChat}
             onOpenGeneralChat={openGeneralChat}
             onOpenPrivacy={() => navigateTo('privacy')}
@@ -1115,14 +1235,7 @@ export default function App() {
               storeWhatsappNumber={storeWhatsappNumber}
               onChangeOperationMode={handleUpdateOperationMode}
               onSaveStoreWhatsappNumber={handleUpdateStoreWhatsappNumber}
-              onSaveSettings={(next) => {
-                setSettings(next);
-                pushActivity(
-                  'Configurações atualizadas',
-                  'Parâmetros institucionais e regras da revenda salvos',
-                  'estoque'
-                );
-              }}
+              onSaveSettings={handleSaveCentralizedDealershipSettings}
             />
           )}
         </main>

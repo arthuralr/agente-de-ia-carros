@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   Check,
   LayoutGrid,
   Loader2,
@@ -11,6 +12,7 @@ import {
 import { DealershipSettings, OperationMode } from '../../types';
 import { INITIAL_SETTINGS } from '../../data/mockData';
 import { normalizeStoreWhatsAppNumber } from '../../utils/whatsappHandoff';
+import { formatPhoneDisplay } from '../../utils/vehicleDomain';
 
 interface SettingsModuleProps {
   settings: DealershipSettings;
@@ -18,7 +20,7 @@ interface SettingsModuleProps {
   storeWhatsappNumber: string;
   onChangeOperationMode: (mode: OperationMode) => Promise<void>;
   onSaveStoreWhatsappNumber: (nextNumber: string) => Promise<void>;
-  onSaveSettings: (next: DealershipSettings) => void;
+  onSaveSettings: (next: DealershipSettings) => Promise<void> | void;
 }
 
 export const SettingsModule: React.FC<SettingsModuleProps> = ({
@@ -26,7 +28,6 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   operationMode,
   storeWhatsappNumber,
   onChangeOperationMode,
-  onSaveStoreWhatsappNumber,
   onSaveSettings,
 }) => {
   const [form, setForm] = useState<DealershipSettings>(settings);
@@ -34,10 +35,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   const [savingMode, setSavingMode] = useState(false);
   const [modeSavedNotice, setModeSavedNotice] = useState(false);
   const [modeError, setModeError] = useState<string | null>(null);
-  const [whatsappInput, setWhatsappInput] = useState<string>(storeWhatsappNumber);
-  const [savingWhatsapp, setSavingWhatsapp] = useState(false);
-  const [whatsappSavedNotice, setWhatsappSavedNotice] = useState(false);
-  const [whatsappError, setWhatsappError] = useState<string | null>(null);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState(false);
 
   useEffect(() => {
@@ -45,37 +44,22 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   }, [operationMode]);
 
   useEffect(() => {
-    setWhatsappInput(storeWhatsappNumber);
-  }, [storeWhatsappNumber]);
+    setForm((prev) => ({
+      ...prev,
+      ...settings,
+      salesWhatsapp:
+        settings.salesWhatsapp || storeWhatsappNumber || settings.whatsapp,
+      whatsapp:
+        settings.salesWhatsapp || storeWhatsappNumber || settings.whatsapp,
+    }));
+  }, [settings, storeWhatsappNumber]);
 
-  const normalizedPreviewNumber = normalizeStoreWhatsAppNumber(whatsappInput);
-
-  const handleSaveStoreWhatsapp = async () => {
-    const normalized = normalizeStoreWhatsAppNumber(whatsappInput);
-    if (normalized.length < 10) {
-      setWhatsappError(
-        'Informe um número válido com DDI + DDD + número (ex: 5551999999999).'
-      );
-      return;
-    }
-    setSavingWhatsapp(true);
-    setWhatsappError(null);
-    setWhatsappSavedNotice(false);
-    try {
-      await onSaveStoreWhatsappNumber(normalized);
-      setWhatsappInput(normalized);
-      setWhatsappSavedNotice(true);
-      setTimeout(() => setWhatsappSavedNotice(false), 3000);
-    } catch (err: unknown) {
-      setWhatsappError(
-        err instanceof Error
-          ? err.message
-          : 'Erro ao salvar WhatsApp comercial da loja no banco Neon.'
-      );
-    } finally {
-      setSavingWhatsapp(false);
-    }
-  };
+  const activeSalesNormalized = normalizeStoreWhatsAppNumber(
+    form.salesWhatsapp || form.whatsapp
+  );
+  const activeFinancingNormalized = normalizeStoreWhatsAppNumber(
+    form.financingWhatsapp || ''
+  );
 
   const handleModeSelect = async (nextMode: OperationMode) => {
     if (nextMode === operationMode && !modeError) {
@@ -102,22 +86,85 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    onSaveSettings(form);
-    setSavedNotice(true);
-    setTimeout(() => setSavedNotice(false), 2500);
+    setSettingsError(null);
+    setSavedNotice(false);
+
+    const normalizedSales = normalizeStoreWhatsAppNumber(
+      form.salesWhatsapp || form.whatsapp
+    );
+    if (normalizedSales.length < 10) {
+      setSettingsError(
+        'Informe um WhatsApp principal de vendas válido com DDI + DDD + número (ex: 5511994821040).'
+      );
+      return;
+    }
+
+    const normalizedFinancing = (form.financingWhatsapp || '').trim()
+      ? normalizeStoreWhatsAppNumber(form.financingWhatsapp || '')
+      : '';
+    if ((form.financingWhatsapp || '').trim() && normalizedFinancing.length < 10) {
+      setSettingsError(
+        'O WhatsApp opcional de financiamento precisa ter DDI + DDD + número ou ficar em branco.'
+      );
+      return;
+    }
+
+    const payload: DealershipSettings = {
+      ...form,
+      whatsapp: normalizedSales,
+      salesWhatsapp: normalizedSales,
+      salesWhatsappLabel:
+        (form.salesWhatsappLabel || '').trim() || 'Consultor de Vendas',
+      financingWhatsapp: normalizedFinancing,
+      financingWhatsappLabel:
+        (form.financingWhatsappLabel || '').trim() || 'Financeiro / Simulação',
+    };
+
+    setSavingSettings(true);
+    try {
+      await onSaveSettings(payload);
+      setForm(payload);
+      setSavedNotice(true);
+      setTimeout(() => setSavedNotice(false), 3000);
+    } catch (err: unknown) {
+      setSettingsError(
+        err instanceof Error
+          ? err.message
+          : 'Erro ao salvar configurações centralizadas no banco Neon.'
+      );
+    } finally {
+      setSavingSettings(false);
+    }
   };
 
-  const handleReset = () => {
-    setForm(INITIAL_SETTINGS);
-    onSaveSettings(INITIAL_SETTINGS);
-    setSavedNotice(true);
-    setTimeout(() => setSavedNotice(false), 2500);
+  const handleReset = async () => {
+    setSettingsError(null);
+    setSavingSettings(true);
+    try {
+      const next: DealershipSettings = {
+        ...INITIAL_SETTINGS,
+        whatsapp: activeSalesNormalized || INITIAL_SETTINGS.whatsapp,
+        salesWhatsapp: activeSalesNormalized || INITIAL_SETTINGS.whatsapp,
+      };
+      await onSaveSettings(next);
+      setForm(next);
+      setSavedNotice(true);
+      setTimeout(() => setSavedNotice(false), 3000);
+    } catch (err: unknown) {
+      setSettingsError(
+        err instanceof Error
+          ? err.message
+          : 'Erro ao restaurar padrões no banco Neon.'
+      );
+    } finally {
+      setSavingSettings(false);
+    }
   };
 
   return (
-    <form onSubmit={handleSubmit} className="max-w-4xl space-y-6">
+    <form onSubmit={(e) => void handleSubmit(e)} className="max-w-4xl space-y-6">
       {/* Dual Operation Mode (Persisted in Neon PostgreSQL) */}
       <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -196,87 +243,148 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
             </div>
             <p className="text-xs text-zinc-400 mt-2 leading-relaxed">
               A rota raiz <span className="font-mono text-zinc-300">/</span> abre diretamente o
-              Consultor Virtual estilo WhatsApp em tela cheia, ocultando links para a vitrine —
-              ideal para Link na Bio do Instagram e anúncios.
+              Consultor Virtual estilo WhatsApp em tela cheia — ideal para Link na Bio do Instagram e anúncios.
             </p>
           </button>
         </div>
       </div>
 
-      {/* Store Commercial WhatsApp Number for Direct wa.me Handoff (Persisted in Neon) */}
-      <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-4">
-        <div className="flex flex-wrap items-start justify-between gap-3">
+      {/* Unified Centralized WhatsApp Channels & Financing Parameter (Single Source of Truth in Neon) */}
+      <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-5">
+        <div>
+          <h2 className="font-display text-base font-semibold text-white">
+            Canais de WhatsApp da Loja (Fonte Única Centralizada)
+          </h2>
+          <p className="text-xs text-zinc-400 mt-0.5">
+            Todos os pontos da aplicação (<span className="font-mono text-zinc-300">/chat</span>,
+            vitrine, rodapé e ficha <span className="font-mono text-zinc-300">/veiculo/:id</span>)
+            consomem exatamente estes canais salvos no banco Neon.
+          </p>
+        </div>
+
+        {/* Operational confirmation note */}
+        <div className="p-3.5 rounded-lg bg-amber-950/35 border border-amber-500/30 flex items-start gap-2.5 text-xs text-amber-200">
+          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <p className="font-medium text-amber-100">
+              Confirme com a loja o número oficial de atendimento ativo
+            </p>
+            <p className="text-amber-200/85 leading-relaxed">
+              Número principal atual:{' '}
+              <strong className="font-mono text-white">
+                {formatPhoneDisplay(activeSalesNormalized) || 'Não configurado'}
+              </strong>
+              . Se houver canal separado para Financiamento, informe abaixo com o rótulo do setor para que o cliente veja claramente qual destino está abrindo.
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
-            <h2 className="font-display text-base font-semibold text-white">
-              WhatsApp Comercial da Loja (DDI + DDD + Número)
-            </h2>
-            <p className="text-xs text-zinc-400 mt-0.5">
-              Número de destino usado no transbordo direto do <span className="font-mono text-zinc-300">/chat</span> para o WhatsApp da equipe (<span className="font-mono text-zinc-300">wa.me</span>), sem custo de API e sem gasto de tokens.
+            <label className="block text-xs font-medium text-zinc-300 mb-1">
+              WhatsApp Principal de Vendas (DDI + DDD + Número) *
+            </label>
+            <input
+              required
+              type="tel"
+              value={form.salesWhatsapp || form.whatsapp}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  salesWhatsapp: e.target.value,
+                  whatsapp: e.target.value,
+                })
+              }
+              placeholder="5511994821040"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-emerald-500 rounded-lg text-sm text-white font-mono focus:outline-none"
+            />
+            <p className="text-[11px] text-zinc-500 font-mono mt-1 truncate">
+              {activeSalesNormalized
+                ? `https://wa.me/${activeSalesNormalized}`
+                : 'Informe DDI 55 + DDD + número'}
             </p>
           </div>
 
-          {savingWhatsapp && (
-            <span className="inline-flex items-center gap-1.5 text-xs text-zinc-300">
-              <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
-              <span>Salvando número...</span>
-            </span>
-          )}
-          {!savingWhatsapp && whatsappSavedNotice && (
-            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400">
-              <Check className="w-4 h-4" />
-              <span>WhatsApp salvo no Neon</span>
-            </span>
-          )}
-        </div>
-
-        {whatsappError && (
-          <div className="p-3 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center gap-2 text-xs text-red-200">
-            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-            <span>{whatsappError}</span>
-          </div>
-        )}
-
-        <div className="flex flex-col sm:flex-row sm:items-end gap-3">
-          <div className="flex-1 min-w-0">
+          <div>
             <label className="block text-xs font-medium text-zinc-300 mb-1">
-              Número oficial para transbordo (somente dígitos com DDI 55)
+              Rótulo do Canal Principal
             </label>
             <input
-              type="tel"
-              value={whatsappInput}
-              onChange={(e) => {
-                setWhatsappInput(e.target.value);
-                if (whatsappError) setWhatsappError(null);
-              }}
-              placeholder="5551999999999"
-              disabled={savingWhatsapp}
-              className="w-full px-3.5 py-2.5 bg-[#09090B] border border-white/[0.1] focus:border-emerald-500 rounded-lg text-sm text-white font-mono focus:outline-none"
+              type="text"
+              value={form.salesWhatsappLabel || ''}
+              onChange={(e) =>
+                setForm({ ...form, salesWhatsappLabel: e.target.value })
+              }
+              placeholder="Consultor de Vendas"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-emerald-500 rounded-lg text-sm text-white focus:outline-none"
             />
           </div>
 
-          <button
-            type="button"
-            disabled={savingWhatsapp}
-            onClick={() => void handleSaveStoreWhatsapp()}
-            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 transition-colors shrink-0 cursor-pointer"
-          >
-            {savingWhatsapp ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <MessageCircle className="w-4 h-4" />
+          <div>
+            <label className="block text-xs font-medium text-zinc-300 mb-1">
+              WhatsApp de Financiamento (Opcional)
+            </label>
+            <input
+              type="tel"
+              value={form.financingWhatsapp || ''}
+              onChange={(e) =>
+                setForm({ ...form, financingWhatsapp: e.target.value })
+              }
+              placeholder="Deixe vazio para usar o mesmo de Vendas"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-emerald-500 rounded-lg text-sm text-white font-mono focus:outline-none"
+            />
+            {activeFinancingNormalized && (
+              <p className="text-[11px] text-zinc-500 font-mono mt-1 truncate">
+                https://wa.me/{activeFinancingNormalized}
+              </p>
             )}
-            <span>Salvar WhatsApp da Loja</span>
-          </button>
-        </div>
+          </div>
 
-        <p className="text-[11px] text-zinc-400 font-mono truncate">
-          Link direto gerado:{' '}
-          <span className="text-emerald-400">
-            {normalizedPreviewNumber
-              ? `https://wa.me/${normalizedPreviewNumber}?text=...`
-              : 'Informe DDI + DDD + número (ex: 5551999999999)'}
-          </span>
-        </p>
+          <div>
+            <label className="block text-xs font-medium text-zinc-300 mb-1">
+              Rótulo do Canal de Financiamento
+            </label>
+            <input
+              type="text"
+              value={form.financingWhatsappLabel || ''}
+              onChange={(e) =>
+                setForm({ ...form, financingWhatsappLabel: e.target.value })
+              }
+              placeholder="Financeiro / Simulação"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-emerald-500 rounded-lg text-sm text-white focus:outline-none"
+            />
+          </div>
+
+          <div className="sm:col-span-2">
+            <label className="block text-xs font-medium text-zinc-300 mb-1">
+              Taxa Mensal Ilustrativa de Financiamento (% a.m. — Opcional)
+            </label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              max="10"
+              value={
+                typeof form.financingMonthlyRatePct === 'number'
+                  ? form.financingMonthlyRatePct
+                  : ''
+              }
+              onChange={(e) => {
+                const raw = e.target.value.trim();
+                setForm({
+                  ...form,
+                  financingMonthlyRatePct:
+                    raw === '' ? null : Number(raw.replace(',', '.')),
+                });
+              }}
+              placeholder="Deixe vazio para exibir apenas o saldo a financiar sem inventar parcela"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-emerald-500 rounded-lg text-sm text-white font-mono focus:outline-none"
+            />
+            <p className="text-[11px] text-zinc-500 mt-1">
+              Quando vazio, o consultor virtual calcula exatamente <span className="font-mono text-zinc-300">preço − entrada</span> e informa que a parcela depende da análise bancária.
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* Dealership Data */}
@@ -286,8 +394,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
             Dados Institucionais da Revenda
           </h2>
           <p className="text-xs text-zinc-400 mt-0.5">
-            Estas informações são aplicadas automaticamente no cabeçalho dos contratos e
-            recibos ATPV-e.
+            Aplicados no chat, vitrine, ficha do veículo, contratos e recibos ATPV-e.
           </p>
         </div>
 
@@ -346,18 +453,6 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
 
           <div>
             <label className="block text-xs font-medium text-zinc-300 mb-1">
-              WhatsApp Comercial
-            </label>
-            <input
-              type="text"
-              value={form.whatsapp}
-              onChange={(e) => setForm({ ...form, whatsapp: e.target.value })}
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white font-mono focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium text-zinc-300 mb-1">
               Telefone Fixo
             </label>
             <input
@@ -365,6 +460,19 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
               value={form.phone}
               onChange={(e) => setForm({ ...form, phone: e.target.value })}
               className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white font-mono focus:outline-none"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-zinc-300 mb-1">
+              URL do Logotipo (Opcional)
+            </label>
+            <input
+              type="url"
+              value={form.logoUrl || ''}
+              onChange={(e) => setForm({ ...form, logoUrl: e.target.value })}
+              placeholder="https://..."
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white focus:outline-none"
             />
           </div>
 
@@ -416,7 +524,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
             Horários de Atendimento
           </h2>
           <p className="text-xs text-zinc-400 mt-0.5">
-            Utilizado pelo assistente virtual para agendamento automático de visitas.
+            Fonte oficial usada pelo assistente virtual para responder dúvidas de funcionamento e solicitações de visita.
           </p>
         </div>
 
@@ -475,7 +583,6 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-
           <div>
             <label className="block text-xs font-medium text-zinc-300 mb-1">
               Margem Mínima FIPE (%)
@@ -556,12 +663,20 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         </div>
       </div>
 
+      {settingsError && (
+        <div className="p-3.5 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center gap-2 text-xs text-red-200">
+          <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+          <span>{settingsError}</span>
+        </div>
+      )}
+
       {/* Action Footer */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <button
           type="button"
-          onClick={handleReset}
-          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium text-zinc-300 bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-colors"
+          disabled={savingSettings}
+          onClick={() => void handleReset()}
+          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium text-zinc-300 bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-colors disabled:opacity-50"
         >
           <RotateCcw className="w-3.5 h-3.5" />
           <span>Restaurar Padrões</span>
@@ -571,15 +686,22 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
           {savedNotice && (
             <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400">
               <Check className="w-4 h-4" />
-              <span>Configurações salvas</span>
+              <span>Configurações salvas no Neon</span>
             </span>
           )}
           <button
             type="submit"
-            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors"
+            disabled={savingSettings}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors disabled:opacity-60"
           >
-            <Save className="w-4 h-4" />
-            <span>Salvar Configurações</span>
+            {savingSettings ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Save className="w-4 h-4" />
+            )}
+            <span>
+              {savingSettings ? 'Salvando...' : 'Salvar Configurações'}
+            </span>
           </button>
         </div>
       </div>

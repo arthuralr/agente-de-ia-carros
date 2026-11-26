@@ -9,7 +9,8 @@ import {
   X,
 } from 'lucide-react';
 import { DealershipSettings } from '../../types';
-import { formatWhatsAppLink } from '../../utils/formatters';
+import { formatPhoneDisplay } from '../../utils/vehicleDomain';
+import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 
 interface PublicFooterProps {
   settings: DealershipSettings;
@@ -23,6 +24,8 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
   onOpenPrivacy,
 }) => {
   const [infoModal, setInfoModal] = useState<'address' | 'social' | null>(null);
+  const [handoffOpen, setHandoffOpen] = useState(false);
+  const activeSalesPhone = settings.salesWhatsapp || settings.whatsapp;
 
   return (
     <footer className="border-t border-white/[0.08] bg-[#0B0B0E] mt-16">
@@ -111,18 +114,14 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
               <span>Redes Sociais</span>
             </button>
 
-            <a
-              href={formatWhatsAppLink(
-                settings.whatsapp,
-                `Olá! Gostaria de mais informações sobre o estoque da ${settings.tradeName}.`
-              )}
-              target="_blank"
-              rel="noreferrer"
+            <button
+              type="button"
+              onClick={() => setHandoffOpen(true)}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors whitespace-nowrap"
             >
               <MessageCircle className="w-3.5 h-3.5" />
               <span>Contatos / WhatsApp</span>
-            </a>
+            </button>
           </div>
 
           <div className="flex flex-wrap items-center gap-4 text-xs text-zinc-500">
@@ -234,17 +233,19 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
                       <span>TikTok Showroom</span>
                       <span className="font-mono text-zinc-400">@armazemdocarro.sp</span>
                     </a>
-                    <a
-                      href={formatWhatsAppLink(settings.whatsapp)}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="flex items-center justify-between p-3.5 rounded-lg bg-[#09090B] border border-white/[0.08] hover:border-emerald-500/40 text-xs text-white transition-colors"
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInfoModal(null);
+                        setHandoffOpen(true);
+                      }}
+                      className="w-full flex items-center justify-between p-3.5 rounded-lg bg-[#09090B] border border-white/[0.08] hover:border-emerald-500/40 text-xs text-white transition-colors"
                     >
-                      <span>WhatsApp Comercial</span>
+                      <span>{settings.salesWhatsappLabel || 'WhatsApp Comercial'}</span>
                       <span className="font-mono text-emerald-400">
-                        {settings.whatsapp}
+                        {formatPhoneDisplay(activeSalesPhone)}
                       </span>
-                    </a>
+                    </button>
                   </div>
                 </div>
               )}
@@ -252,6 +253,14 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
           </div>
         </div>
       )}
+
+      <WhatsAppHandoffModal
+        isOpen={handoffOpen}
+        onClose={() => setHandoffOpen(false)}
+        settings={settings}
+        purpose="sales"
+        contextSummary="Informações sobre o estoque"
+      />
     </footer>
   );
 };

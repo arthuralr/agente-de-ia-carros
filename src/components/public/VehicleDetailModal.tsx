@@ -13,8 +13,14 @@ import {
 } from 'lucide-react';
 import { DealershipSettings, FipeLookupResult, Vehicle } from '../../types';
 import { inferVehicleCategory } from '../../data/mockData';
-import { formatBRL, formatKm, formatWhatsAppLink } from '../../utils/formatters';
+import { formatBRL, formatKm } from '../../utils/formatters';
 import { VehicleImage } from '../VehicleImage';
+import {
+  analyzeVehicleDataQuality,
+  computeFipeMetrics,
+  formatBrlCurrency,
+} from '../../utils/vehicleDomain';
+import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 
 interface VehicleDetailModalProps {
   vehicle: Vehicle | null;
@@ -33,11 +39,13 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
   const [liveFipe, setLiveFipe] = useState<FipeLookupResult | null>(null);
   const [loadingFipe, setLoadingFipe] = useState(false);
   const [fipeCheckError, setFipeCheckError] = useState<string | null>(null);
+  const [handoffModalOpen, setHandoffModalOpen] = useState(false);
 
   useEffect(() => {
     setActivePhotoIndex(0);
     setLiveFipe(null);
     setFipeCheckError(null);
+    setHandoffModalOpen(false);
   }, [vehicle]);
 
   if (!vehicle) return null;
@@ -47,17 +55,16 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
       ? vehicle.gallery
       : [vehicle.imageUrl];
   const category = inferVehicleCategory(vehicle);
-
-  const displayedFipePrice =
-    liveFipe?.recommended.valorNumerico || vehicle.fipePrice;
-  const fipeDiff =
-    displayedFipePrice > 0 ? displayedFipePrice - vehicle.price : 0;
-  const fipePctLabel =
-    displayedFipePrice > 0
-      ? ((Math.abs(fipeDiff) / displayedFipePrice) * 100)
-          .toFixed(1)
-          .replace('.', ',')
-      : '';
+  const quality = analyzeVehicleDataQuality(vehicle);
+  const effectiveVehicle: Vehicle = liveFipe?.recommended
+    ? {
+        ...vehicle,
+        fipePrice: liveFipe.recommended.valorNumerico || vehicle.fipePrice,
+        fipeReferenceMonth:
+          liveFipe.recommended.mesReferencia || vehicle.fipeReferenceMonth,
+      }
+    : vehicle;
+  const fipe = computeFipeMetrics(effectiveVehicle);
 
   const handleRefreshLiveFipe = async () => {
     if (!vehicle.fipeCode) return;
@@ -203,13 +210,13 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
                   {formatBRL(vehicle.price)}
                 </p>
 
-                {(displayedFipePrice > 0 || vehicle.fipeCode) && (
+                {(fipe.hasFipeValue || vehicle.fipeCode) && (
                   <div className="mt-3 p-3 rounded-lg bg-[#111114] border border-white/[0.06] space-y-1.5">
                     <div className="flex items-center justify-between gap-2">
                       <span className="inline-flex items-center gap-1.5 text-xs text-zinc-300 font-mono tabular-nums">
                         <BadgePercent className="w-3.5 h-3.5 text-red-500 shrink-0" />
                         <span>
-                          FIPE: {displayedFipePrice > 0 ? formatBRL(displayedFipePrice) : 'Não salvo'}
+                          FIPE: {fipe.hasFipeValue && fipe.fipePrice ? formatBrlCurrency(fipe.fipePrice) : 'Não cadastrada'}
                         </span>
                       </span>
                       {vehicle.fipeCode && (
@@ -219,21 +226,26 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
                       )}
                     </div>
 
-                    {fipeDiff !== 0 && displayedFipePrice > 0 && (
-                      <p
-                        className={`text-xs font-medium font-mono tabular-nums ${
-                          fipeDiff > 0 ? 'text-emerald-400' : 'text-amber-400'
-                        }`}
-                      >
-                        {fipeDiff > 0
-                          ? `${fipePctLabel}% abaixo da Tabela FIPE (${formatBRL(fipeDiff)} de vantagem)`
-                          : `${fipePctLabel}% acima da Tabela FIPE`}
+                    {fipe.hasFipeValue && (
+                      <p className="text-[11px] text-zinc-400">
+                        Referência:{' '}
+                        <span className={fipe.hasReferenceMonth ? 'text-zinc-200' : 'text-amber-300'}>
+                          {fipe.fipeReferenceMonth || 'Mês de referência não informado'}
+                        </span>
                       </p>
                     )}
 
-                    {liveFipe && (
-                      <p className="text-[11px] text-zinc-400">
-                        Atualizado ao vivo (BrasilAPI · Ref. {liveFipe.recommended.mesReferencia})
+                    {fipe.hasFipeValue && fipe.diffBrl !== null && fipe.diffPct !== null && fipe.diffBrl !== 0 && (
+                      <p
+                        className={`text-xs font-medium font-mono tabular-nums ${
+                          fipe.isConfirmedBelowFipeOffer ? 'text-emerald-400' : 'text-zinc-300'
+                        }`}
+                      >
+                        {fipe.diffBrl > 0
+                          ? fipe.hasReferenceMonth
+                            ? `${fipe.diffPct}% abaixo da FIPE (${formatBrlCurrency(fipe.diffBrl)})`
+                            : `Diferença de ${formatBrlCurrency(fipe.diffBrl)} (confirme o mês de referência)`
+                          : `${Math.abs(fipe.diffPct)}% acima da Tabela FIPE`}
                       </p>
                     )}
 
@@ -274,18 +286,14 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
                     <span>Tenho Interesse (Chat IA)</span>
                   </button>
 
-                  <a
-                    href={formatWhatsAppLink(
-                      settings.whatsapp,
-                      `Olá! Vi o ${vehicle.brand} ${vehicle.model} ${vehicle.version} (${vehicle.year}) no site da ${settings.tradeName} e gostaria de agendar uma visita.`
-                    )}
-                    target="_blank"
-                    rel="noreferrer"
+                  <button
+                    type="button"
+                    onClick={() => setHandoffModalOpen(true)}
                     className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium text-zinc-200 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08] transition-colors"
                   >
                     <MessageCircle className="w-4 h-4 text-emerald-400" />
-                    <span>Falar no WhatsApp ({settings.whatsapp})</span>
-                  </a>
+                    <span>Falar com consultor</span>
+                  </button>
                 </div>
               </div>
 
@@ -321,8 +329,14 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
                   </div>
                   <div className="py-2.5 flex justify-between gap-4">
                     <dt className="text-zinc-400">Câmbio</dt>
-                    <dd className="text-zinc-100 text-right">
-                      {vehicle.transmission}
+                    <dd
+                      className={`text-right ${
+                        quality.hasTransmissionConflict
+                          ? 'text-amber-300 font-medium'
+                          : 'text-zinc-100'
+                      }`}
+                    >
+                      {quality.displayTransmission}
                     </dd>
                   </div>
                   <div className="py-2.5 flex justify-between gap-4">
@@ -360,6 +374,15 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
           </div>
         </div>
       </div>
+
+      <WhatsAppHandoffModal
+        isOpen={handoffModalOpen}
+        onClose={() => setHandoffModalOpen(false)}
+        settings={settings}
+        purpose="sales"
+        vehicleLabel={`${vehicle.brand} ${vehicle.model} ${vehicle.year} (Ref. #${vehicle.id})`}
+        contextSummary={`Tenho interesse no ${vehicle.brand} ${vehicle.model} ${vehicle.year}`}
+      />
     </div>
   );
 };

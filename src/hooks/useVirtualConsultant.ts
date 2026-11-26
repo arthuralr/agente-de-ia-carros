@@ -4,10 +4,15 @@ import {
   ChatAudioMeta,
   ChatMessage,
   ChatReplyContext,
+  ChatSuggestedAction,
   ChatTriageStage,
   DealershipSettings,
   Lead,
   Vehicle,
+  VehicleCardData,
+  VehicleComparisonData,
+  VehicleFinancingSummary,
+  VehicleSearchFilters,
 } from '../types';
 import { formatBrazilianPhone } from '../utils/chatTags';
 import { formatBRL, formatKm } from '../utils/formatters';
@@ -62,9 +67,7 @@ function createWelcomeMessage(tradeName: string): ChatMessage {
   return {
     id: `msg-ia-welcome-${Date.now()}`,
     sender: 'ia',
-    text: `Olá! Sou o **Consultor Oficial** da **${tradeName}**. Todos os nossos seminovos contam com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
-
-Como posso te ajudar hoje? Toque em uma opção abaixo ou **envie sua dúvida por texto, áudio ou foto** direto!`,
+    text: `Olá! Bem-vindo à **${tradeName}**. Posso filtrar veículos disponíveis por preço, km ou câmbio, comparar opções, simular saldo de financiamento ou responder sobre horários e troca.\n\nEscolha um atalho abaixo ou me diga o carro que você procura:`,
     timestamp: nowTimePt(),
   };
 }
@@ -399,15 +402,29 @@ export function useVirtualConsultant({
   const lastConsultantMsgIdRef = useRef<number>(0);
   const lastBroadcastIdRef = useRef<number>(0);
 
-  // Derived 2-step conversational triage stage (active only for standalone /chat)
-  const triageStage: ChatTriageStage =
-    !persistStorageKey || targetVehicle
-      ? 'complete'
-      : customerName.trim().length < 2
-        ? 'ask_name'
-        : !hasValidPhoneDigits(customerWhatsapp)
-          ? 'ask_phone'
-          : 'complete';
+  const [activeFilters, setActiveFilters] = useState<VehicleSearchFilters>({});
+  const [recentVehicleIds, setRecentVehicleIds] = useState<string[]>([]);
+  const [focusedVehicleId, setFocusedVehicleId] = useState<string | null>(
+    targetVehicle?.id || null
+  );
+  const [compareVehicleIds, setCompareVehicleIds] = useState<string[]>([]);
+  const [lastFailedSend, setLastFailedSend] = useState<{
+    messages: ChatMessage[];
+    options?: {
+      userMessageId?: string;
+      replyTo?: ChatReplyContext | null;
+      audio?: ChatAudioMeta | null;
+      attachment?: ChatAttachment | null;
+    };
+  } | null>(null);
+
+  const activeFiltersRef = useRef<VehicleSearchFilters>({});
+  const recentVehicleIdsRef = useRef<string[]>([]);
+  const focusedVehicleIdRef = useRef<string | null>(targetVehicle?.id || null);
+  const compareVehicleIdsRef = useRef<string[]>([]);
+
+  // Non-blocking chat: visitors can search vehicles, financing, and hours immediately without forced contact capture
+  const triageStage: ChatTriageStage = 'complete';
 
   useEffect(() => {
     persistedLeadIdRef.current = persistedLeadId;
@@ -517,6 +534,13 @@ export function useVirtualConsultant({
             ...(customerNameRef.current.trim()
               ? { visitorName: customerNameRef.current.trim() }
               : {}),
+            chatContext: {
+              activeFilters: activeFiltersRef.current,
+              recentVehicleIds: recentVehicleIdsRef.current,
+              focusedVehicleId: focusedVehicleIdRef.current,
+              compareVehicleIds: compareVehicleIdsRef.current,
+              baseUrl: typeof window !== 'undefined' ? window.location.origin : '',
+            },
             messages: nextMessages.map((m) => ({
               sender: m.sender,
               text:
@@ -573,9 +597,10 @@ export function useVirtualConsultant({
               address: settings.address,
               city: settings.city,
               state: settings.state,
-              whatsapp: settings.whatsapp,
+              whatsapp: settings.salesWhatsapp || settings.whatsapp,
               hoursWeekdays: settings.hoursWeekdays,
               hoursSaturday: settings.hoursSaturday,
+              hoursSunday: settings.hoursSunday,
               aiAssistantName: settings.aiAssistantName,
             },
           }),
@@ -586,10 +611,12 @@ export function useVirtualConsultant({
         if (!response.ok) {
           const errData = (await response.json().catch(() => ({}))) as {
             error?: string;
+            stockQueryError?: boolean;
           };
           throw new Error(errData.error || 'Erro ao responder mensagem.');
         }
 
+        setLastFailedSend(null);
         const aiMsgId = `msg-ia-${Date.now()}`;
         const aiTimestamp = nowTimePt();
 
@@ -616,25 +643,77 @@ export function useVirtualConsultant({
           );
         };
 
-        if (!contentType.includes('text/event-stream') || !response.body) {
-          const data = (await response.json()) as {
-            reply: string;
-            transcription?: string;
-            visitorName?: string;
-          };
-          if (data.transcription) {
-            applyTranscriptionToUserMsg(data.transcription);
+        interface StructuredMetaPayload {
+          transcription?: string;
+          visitorName?: string;
+          vehicleCards?: VehicleCardData[];
+          comparison?: VehicleComparisonData | null;
+          financingSummary?: VehicleFinancingSummary | null;
+          activeFilters?: VehicleSearchFilters;
+          recentVehicleIds?: string[];
+          focusedVehicleId?: string | null;
+          promptAttachPhotos?: boolean;
+          suggestedActions?: ChatSuggestedAction[];
+          stockQueryError?: boolean;
+          isVisitInquiryOnly?: boolean;
+          suppressHandoff?: boolean;
+        }
+
+        let capturedMeta: Partial<ChatMessage> = {};
+        const applyStructuredMeta = (meta: StructuredMetaPayload) => {
+          if (meta.transcription) {
+            applyTranscriptionToUserMsg(meta.transcription);
           }
-          if (data.visitorName?.trim() && !customerNameRef.current.trim()) {
-            const cleanName = data.visitorName.trim();
+          if (meta.visitorName?.trim() && !customerNameRef.current.trim()) {
+            const cleanName = meta.visitorName.trim();
             customerNameRef.current = cleanName;
             setCustomerName(cleanName);
           }
+          if (meta.activeFilters !== undefined) {
+            activeFiltersRef.current = meta.activeFilters;
+            setActiveFilters(meta.activeFilters);
+          }
+          if (Array.isArray(meta.recentVehicleIds)) {
+            recentVehicleIdsRef.current = meta.recentVehicleIds;
+            setRecentVehicleIds(meta.recentVehicleIds);
+          }
+          if (meta.focusedVehicleId !== undefined) {
+            focusedVehicleIdRef.current = meta.focusedVehicleId;
+            setFocusedVehicleId(meta.focusedVehicleId);
+          }
+          capturedMeta = {
+            ...(Array.isArray(meta.vehicleCards) && meta.vehicleCards.length > 0
+              ? { vehicleCards: meta.vehicleCards }
+              : {}),
+            ...(meta.comparison ? { comparison: meta.comparison } : {}),
+            ...(meta.financingSummary
+              ? { financingSummary: meta.financingSummary }
+              : {}),
+            ...(meta.promptAttachPhotos ? { promptAttachPhotos: true } : {}),
+            ...(Array.isArray(meta.suggestedActions) &&
+            meta.suggestedActions.length > 0
+              ? { suggestedActions: meta.suggestedActions }
+              : {}),
+            ...(meta.stockQueryError ? { stockQueryError: true } : {}),
+            ...(meta.isVisitInquiryOnly ? { isVisitInquiryOnly: true } : {}),
+            ...(meta.suppressHandoff ? { suppressHandoff: true } : {}),
+          };
+          if (meta.stockQueryError) {
+            setLastFailedSend({ messages: nextMessages, options });
+          }
+        };
+
+        if (!contentType.includes('text/event-stream') || !response.body) {
+          const data = (await response.json()) as StructuredMetaPayload & {
+            reply: string;
+          };
+          applyStructuredMeta(data);
           const aiMsg: ChatMessage = {
             id: aiMsgId,
             sender: 'ia',
             text: data.reply,
             timestamp: aiTimestamp,
+            ...capturedMeta,
           };
           const updatedTranscript = [...workingMessages, aiMsg];
           setMessages(updatedTranscript);
@@ -659,6 +738,7 @@ export function useVirtualConsultant({
             sender: 'ia',
             text,
             timestamp: aiTimestamp,
+            ...capturedMeta,
           };
           if (!streamMessageInserted) {
             streamMessageInserted = true;
@@ -666,7 +746,9 @@ export function useVirtualConsultant({
             setMessages((prev) => [...prev, streamingMsg]);
           } else {
             setMessages((prev) =>
-              prev.map((m) => (m.id === aiMsgId ? { ...m, text } : m))
+              prev.map((m) =>
+                m.id === aiMsgId ? { ...m, ...capturedMeta, text } : m
+              )
             );
           }
         };
@@ -686,27 +768,15 @@ export function useVirtualConsultant({
             for (const line of lines) {
               const jsonStr = line.slice(5).trim();
               if (!jsonStr) continue;
-              const parsed = JSON.parse(jsonStr) as {
+              const parsed = JSON.parse(jsonStr) as StructuredMetaPayload & {
                 type: 'meta' | 'chunk' | 'done' | 'error';
                 text?: string;
                 reply?: string;
-                transcription?: string;
-                visitorName?: string;
                 error?: string;
               };
 
               if (parsed.type === 'meta') {
-                if (parsed.transcription) {
-                  applyTranscriptionToUserMsg(parsed.transcription);
-                }
-                if (
-                  parsed.visitorName?.trim() &&
-                  !customerNameRef.current.trim()
-                ) {
-                  const cleanName = parsed.visitorName.trim();
-                  customerNameRef.current = cleanName;
-                  setCustomerName(cleanName);
-                }
+                applyStructuredMeta(parsed);
               } else if (parsed.type === 'chunk' && parsed.text) {
                 accumulatedText += parsed.text;
                 upsertStreamingMessage(accumulatedText);
@@ -721,6 +791,7 @@ export function useVirtualConsultant({
                       sender: 'ia',
                       text: finalText,
                       timestamp: aiTimestamp,
+                      ...capturedMeta,
                     },
                   ];
                   if (persistedLeadIdRef.current && onSyncLeadChat) {
@@ -737,11 +808,12 @@ export function useVirtualConsultant({
           }
         }
       } catch (err: unknown) {
+        setLastFailedSend({ messages: nextMessages, options });
         if (didTimeout) {
           setErrorMsg(
             hasAudioPayload
               ? 'O processamento do áudio demorou mais que o esperado. Tente enviar um áudio mais curto ou escreva sua mensagem por texto.'
-              : 'O atendimento demorou mais que o esperado. Tente enviar sua mensagem novamente.'
+              : 'O atendimento demorou mais que o esperado. Clique em Tentar novamente.'
           );
           return;
         }
@@ -753,7 +825,7 @@ export function useVirtualConsultant({
             ? err.message
             : hasAudioPayload
               ? 'Não foi possível processar o áudio agora. Tente enviar novamente ou digite sua dúvida.'
-              : 'Não foi possível conectar ao assistente de IA.'
+              : 'Não foi possível conectar ao assistente no momento.'
         );
       } finally {
         window.clearTimeout(requestTimeoutId);
@@ -840,26 +912,15 @@ export function useVirtualConsultant({
         lastConsultantMsgIdRef.current = maxRestoredDbId;
 
         let restoredMessages: ChatMessage[];
-        if (isFullyIdentified) {
+        if (initialKnownName.length >= 2) {
           restoredMessages = personalizeRestoredHistory(
             savedSync.messages,
             settings.tradeName,
             initialKnownName
           );
-        } else if (initialKnownName.length >= 2) {
-          const lastMsg = savedSync.messages[savedSync.messages.length - 1];
-          const alreadyAskingPhone =
-            lastMsg?.sender === 'ia' &&
-            lastMsg.id.startsWith('msg-ia-triage-phone');
-          restoredMessages = alreadyAskingPhone
-            ? savedSync.messages
-            : [
-                ...savedSync.messages,
-                createTriageAskPhoneMessage(initialKnownName),
-              ];
         } else {
-          // No name saved yet -> start clean 2-step triage
-          restoredMessages = [createTriageAskNameMessage(settings.tradeName)];
+          // Restore previous text-only or rich history cleanly without blocking on triage
+          restoredMessages = savedSync.messages;
         }
 
         setMessages(restoredMessages);
@@ -889,7 +950,7 @@ export function useVirtualConsultant({
         setCustomerName('');
         setCustomerWhatsapp('');
         setErrorMsg(null);
-        setMessages([createTriageAskNameMessage(settings.tradeName)]);
+        setMessages([createWelcomeMessage(settings.tradeName)]);
         storageReadyRef.current = true;
       }
 
@@ -1243,11 +1304,16 @@ export function useVirtualConsultant({
     customerWhatsappRef.current = '';
     setCustomerName('');
     setCustomerWhatsapp('');
-    setMessages([
-      persistStorageKey
-        ? createTriageAskNameMessage(settings.tradeName)
-        : createWelcomeMessage(settings.tradeName),
-    ]);
+    activeFiltersRef.current = {};
+    recentVehicleIdsRef.current = [];
+    focusedVehicleIdRef.current = null;
+    compareVehicleIdsRef.current = [];
+    setActiveFilters({});
+    setRecentVehicleIds([]);
+    setFocusedVehicleId(null);
+    setCompareVehicleIds([]);
+    setLastFailedSend(null);
+    setMessages([createWelcomeMessage(settings.tradeName)]);
     storageReadyRef.current = true;
   }, [persistStorageKey, settings.tradeName, updateSessionId]);
 
@@ -1546,6 +1612,50 @@ export function useVirtualConsultant({
     ]
   );
 
+  const toggleCompareVehicle = useCallback((vehicleId: string) => {
+    setCompareVehicleIds((prev) => {
+      const next = prev.includes(vehicleId)
+        ? prev.filter((id) => id !== vehicleId)
+        : [...prev.slice(-2), vehicleId];
+      compareVehicleIdsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const clearCompareVehicles = useCallback(() => {
+    compareVehicleIdsRef.current = [];
+    setCompareVehicleIds([]);
+  }, []);
+
+  const compareSelectedVehicles = useCallback(() => {
+    const ids = compareVehicleIdsRef.current;
+    if (ids.length < 2) return;
+    const labels = ids
+      .map((id) => {
+        const found = vehicles.find((v) => v.id === id);
+        return found ? `${found.brand} ${found.model} ${found.year} (#${found.id})` : `#${id}`;
+      })
+      .join(' e ');
+    sendQuickPrompt(`Compare ${labels}`);
+    clearCompareVehicles();
+  }, [clearCompareVehicles, sendQuickPrompt, vehicles]);
+
+  const clearActiveFilters = useCallback(() => {
+    activeFiltersRef.current = {};
+    setActiveFilters({});
+    sendQuickPrompt('Limpar filtros e ver todo o estoque disponível');
+  }, [sendQuickPrompt]);
+
+  const retryLastMessage = useCallback(() => {
+    if (!lastFailedSend || isSending) return;
+    setErrorMsg(null);
+    void sendMessageToAi(
+      lastFailedSend.messages,
+      targetVehicle,
+      lastFailedSend.options
+    );
+  }, [isSending, lastFailedSend, sendMessageToAi, targetVehicle]);
+
   return {
     sessionId,
     messages,
@@ -1560,6 +1670,16 @@ export function useVirtualConsultant({
     hasStreamFirstToken,
     errorMsg,
     setErrorMsg,
+    canRetry: Boolean(lastFailedSend),
+    retryLastMessage,
+    activeFilters,
+    recentVehicleIds,
+    focusedVehicleId,
+    compareVehicleIds,
+    toggleCompareVehicle,
+    clearCompareVehicles,
+    compareSelectedVehicles,
+    clearActiveFilters,
     customerName,
     setCustomerName,
     customerWhatsapp,

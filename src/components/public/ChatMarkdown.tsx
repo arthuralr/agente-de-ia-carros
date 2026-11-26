@@ -4,15 +4,32 @@ interface ChatMarkdownProps {
   content: string;
   variant?: 'ai' | 'user';
   theme?: 'dark' | 'whatsapp';
+  onNavigateInternal?: (path: string) => void;
+}
+
+function isSafeLinkHref(rawHref: string): boolean {
+  const href = rawHref.trim();
+  if (!href) return false;
+  if (href.startsWith('/veiculo/') || href.startsWith('/chat') || href === '/') {
+    return true;
+  }
+  try {
+    const parsed = new URL(href);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
 }
 
 function renderInlineFormatting(
   text: string,
   variant: 'ai' | 'user',
-  theme: 'dark' | 'whatsapp'
+  theme: 'dark' | 'whatsapp',
+  onNavigateInternal?: (path: string) => void
 ): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  const tokenRegex = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g;
+  const tokenRegex =
+    /(\[[^\]]+\]\((?:https?:\/\/[^\s)]+|\/veiculo\/[a-zA-Z0-9_-]+)\)|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|https?:\/\/[^\s<>()]+|\/veiculo\/[a-zA-Z0-9_-]+)/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   let keyIdx = 0;
@@ -25,7 +42,68 @@ function renderInlineFormatting(
     }
 
     const token = match[0];
-    if (token.startsWith('**') && token.endsWith('**')) {
+    if (token.startsWith('[') && token.includes('](') && token.endsWith(')')) {
+      const mdMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      const label = mdMatch?.[1] || token;
+      const href = mdMatch?.[2] || '';
+      if (isSafeLinkHref(href)) {
+        const isInternal = href.startsWith('/');
+        nodes.push(
+          <a
+            key={`a-${keyIdx++}`}
+            href={href}
+            target={isInternal ? undefined : '_blank'}
+            rel={isInternal ? undefined : 'noopener noreferrer'}
+            onClick={(e) => {
+              if (isInternal && onNavigateInternal) {
+                e.preventDefault();
+                onNavigateInternal(href);
+              }
+            }}
+            className={
+              isWa
+                ? 'underline font-semibold text-[#006B58] hover:text-[#004D3F] break-all'
+                : 'underline font-semibold text-red-400 hover:text-red-300 break-all'
+            }
+          >
+            {label}
+          </a>
+        );
+      } else {
+        nodes.push(label);
+      }
+    } else if (token.startsWith('http://') || token.startsWith('https://') || token.startsWith('/veiculo/')) {
+      const cleanHref = token.replace(/[.,;:!?]+$/, '');
+      const trailing = token.slice(cleanHref.length);
+      const isInternal = cleanHref.startsWith('/');
+      if (isSafeLinkHref(cleanHref)) {
+        nodes.push(
+          <React.Fragment key={`u-${keyIdx++}`}>
+            <a
+              href={cleanHref}
+              target={isInternal ? undefined : '_blank'}
+              rel={isInternal ? undefined : 'noopener noreferrer'}
+              onClick={(e) => {
+                if (isInternal && onNavigateInternal) {
+                  e.preventDefault();
+                  onNavigateInternal(cleanHref);
+                }
+              }}
+              className={
+                isWa
+                  ? 'underline font-semibold text-[#006B58] hover:text-[#004D3F] break-all'
+                  : 'underline font-semibold text-red-400 hover:text-red-300 break-all'
+              }
+            >
+              {cleanHref}
+            </a>
+            {trailing}
+          </React.Fragment>
+        );
+      } else {
+        nodes.push(token);
+      }
+    } else if (token.startsWith('**') && token.endsWith('**')) {
       nodes.push(
         <strong
           key={`b-${keyIdx++}`}
@@ -159,6 +237,7 @@ export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
   content,
   variant = 'ai',
   theme = 'dark',
+  onNavigateInternal,
 }) => {
   const blocks = parseMarkdownBlocks(content);
   const isWa = theme === 'whatsapp';
@@ -186,7 +265,7 @@ export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
                   : 'font-display font-semibold text-white text-[13px] pt-0.5'
               }
             >
-              {renderInlineFormatting(block.text, variant, theme)}
+              {renderInlineFormatting(block.text, variant, theme, onNavigateInternal)}
             </p>
           );
         }
@@ -211,7 +290,7 @@ export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
                       isWa ? 'flex-1 text-[#111B21]' : 'flex-1 text-zinc-200'
                     }
                   >
-                    {renderInlineFormatting(item, variant, theme)}
+                    {renderInlineFormatting(item, variant, theme, onNavigateInternal)}
                   </span>
                 </li>
               ))}
@@ -236,7 +315,7 @@ export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
                       isWa ? 'flex-1 text-[#111B21]' : 'flex-1 text-zinc-200'
                     }
                   >
-                    {renderInlineFormatting(item, variant, theme)}
+                    {renderInlineFormatting(item, variant, theme, onNavigateInternal)}
                   </span>
                 </li>
               ))}
@@ -258,7 +337,7 @@ export const ChatMarkdown: React.FC<ChatMarkdownProps> = ({
             {block.lines.map((line, lineIdx) => (
               <React.Fragment key={lineIdx}>
                 {lineIdx > 0 && <br />}
-                {renderInlineFormatting(line, variant, theme)}
+                {renderInlineFormatting(line, variant, theme, onNavigateInternal)}
               </React.Fragment>
             ))}
           </p>

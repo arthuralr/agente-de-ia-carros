@@ -23,6 +23,7 @@ export interface ApiVehicleRow {
   price: string | number;
   fipe_code?: string | null;
   fipe_price?: string | number | null;
+  fipe_reference_month?: string | null;
   status: string | null;
   fuel: string | null;
   transmission: string | null;
@@ -119,16 +120,17 @@ export function mapDbVehicleToFrontend(row: ApiVehicleRow): Vehicle {
     fipePrice:
       Number.isFinite(dbFipePrice) && dbFipePrice > 0
         ? dbFipePrice
-        : seedMatch?.fipePrice || Math.round(priceNum * 1.04),
-    fipeCode: row.fipe_code?.trim() || seedMatch?.fipeCode,
+        : 0,
+    fipeCode: row.fipe_code?.trim() || undefined,
+    fipeReferenceMonth: row.fipe_reference_month?.trim() || null,
     color: seedMatch?.color || 'Showroom',
-    transmission: row.transmission || 'Automático',
-    fuel: row.fuel || 'Flex',
-    plate: seedMatch?.plate || 'ADC0N00',
+    transmission: (row.transmission || '').trim(),
+    fuel: (row.fuel || '').trim() || 'Flex',
+    plate: seedMatch?.plate || '',
     renavam: seedMatch?.renavam || '',
     chassis: seedMatch?.chassis || '',
     status: statusVal,
-    imageUrl: row.image_url || seedMatch?.imageUrl || '',
+    imageUrl: (row.image_url || '').trim(),
     gallery: seedMatch?.gallery,
     optionals: Array.isArray(row.options) ? row.options : [],
     createdAt: row.created_at

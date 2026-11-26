@@ -11,6 +11,7 @@ export interface DbVehicleRow {
   price: string;
   fipe_code?: string | null;
   fipe_price?: string | null;
+  fipe_reference_month?: string | null;
   status: string | null;
   fuel: string | null;
   transmission: string | null;
@@ -89,7 +90,8 @@ export async function seedNeonDatabaseIfEmpty(): Promise<void> {
     await client.query(`
       ALTER TABLE vehicles
       ADD COLUMN IF NOT EXISTS fipe_code VARCHAR(32),
-      ADD COLUMN IF NOT EXISTS fipe_price NUMERIC
+      ADD COLUMN IF NOT EXISTS fipe_price NUMERIC,
+      ADD COLUMN IF NOT EXISTS fipe_reference_month VARCHAR(64)
     `);
     await client.query(`
       ALTER TABLE leads

@@ -31,6 +31,7 @@ import {
 import {
   buildWhatsAppHandoffUrl,
   normalizeStoreWhatsAppNumber,
+  resolveWhatsAppDestination,
 } from './src/utils/whatsappHandoff';
 import {
   getPublicVapidKey,
@@ -40,6 +41,17 @@ import {
   triggerVisitorSessionPushInBackground,
   upsertPushSubscription,
 } from './src/utils/webPushServer';
+import { mapDbVehicleToFrontend } from './src/db/mappers';
+import {
+  mergeDealershipConfig,
+  DEFAULT_DEALERSHIP_CONFIG,
+} from './src/utils/vehicleDomain';
+import {
+  ChatTurnContextInput,
+  guardChatReply,
+  planChatTurn,
+} from './src/utils/chatOrchestrator';
+import { DealershipSettings } from './src/types';
 
 if (fs.existsSync('.env.local')) {
   dotenv.config({ path: '.env.local', override: true });
@@ -118,6 +130,7 @@ interface ChatRequestBody {
     optionals: string[];
   } | null;
   inventorySummary?: string;
+  chatContext?: ChatTurnContextInput | null;
   settings?: {
     tradeName: string;
     address: string;
@@ -126,6 +139,7 @@ interface ChatRequestBody {
     whatsapp: string;
     hoursWeekdays: string;
     hoursSaturday: string;
+    hoursSunday?: string;
     aiAssistantName: string;
   };
 }
@@ -498,6 +512,40 @@ async function getPersistedStoreWhatsAppNumber(): Promise<string> {
     return persisted.length >= 10 ? persisted : envFallback;
   } catch {
     return envFallback;
+  }
+}
+
+async function getPersistedDealershipConfig(): Promise<DealershipSettings> {
+  try {
+    const res = await pool.query<{ key: string; value: string }>(
+      "SELECT key, value FROM app_settings WHERE key IN ('dealership_config', 'store_whatsapp_number')"
+    );
+    let parsedConfig: Partial<DealershipSettings> | null = null;
+    let legacyStoreWa: string | null = null;
+
+    for (const row of res.rows) {
+      if (row.key === 'dealership_config') {
+        try {
+          parsedConfig = JSON.parse(row.value) as Partial<DealershipSettings>;
+        } catch {
+          parsedConfig = null;
+        }
+      } else if (row.key === 'store_whatsapp_number') {
+        legacyStoreWa = row.value;
+      }
+    }
+
+    const fallbackWa =
+      legacyStoreWa ||
+      normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) ||
+      '5511994821040';
+
+    return mergeDealershipConfig(parsedConfig, fallbackWa);
+  } catch {
+    const fallbackWa =
+      normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) ||
+      '5511994821040';
+    return mergeDealershipConfig(DEFAULT_DEALERSHIP_CONFIG, fallbackWa);
   }
 }
 
@@ -1070,7 +1118,7 @@ app.get('/api/health/db', async (_req, res) => {
 app.get('/api/public/vehicles', async (_req, res) => {
   try {
     const result = await pool.query<DbVehicleRow>(
-      "SELECT * FROM vehicles WHERE status = 'Disponivel' ORDER BY created_at DESC, id DESC"
+      "SELECT * FROM vehicles WHERE status IN ('Disponivel', 'Disponível') ORDER BY created_at DESC, id DESC"
     );
     res.json(result.rows);
   } catch (err: unknown) {
@@ -1080,13 +1128,41 @@ app.get('/api/public/vehicles', async (_req, res) => {
   }
 });
 
+app.get('/api/public/vehicles/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ error: 'Identificador de veículo inválido.' });
+    return;
+  }
+  try {
+    const result = await pool.query<DbVehicleRow>(
+      'SELECT * FROM vehicles WHERE id = $1 LIMIT 1',
+      [id]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Veículo não encontrado no catálogo.' });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Erro ao consultar ficha do veículo.';
+    res.status(500).json({ error: message });
+  }
+});
+
 app.get('/api/public/config', async (_req, res) => {
   try {
-    const [operationMode, storeWhatsappNumber] = await Promise.all([
+    const [operationMode, dealershipConfig] = await Promise.all([
       getPersistedOperationMode(),
-      getPersistedStoreWhatsAppNumber(),
+      getPersistedDealershipConfig(),
     ]);
-    res.json({ operationMode, storeWhatsappNumber });
+    const salesDestination = resolveWhatsAppDestination(dealershipConfig, 'sales');
+    res.json({
+      operationMode,
+      storeWhatsappNumber: salesDestination.normalizedNumber || '5511994821040',
+      dealershipConfig,
+    });
   } catch {
     const fallback: OperationMode =
       process.env.OPERATION_MODE === 'agent_only' ? 'agent_only' : 'full';
@@ -1096,6 +1172,7 @@ app.get('/api/public/config', async (_req, res) => {
     res.json({
       operationMode: fallback,
       storeWhatsappNumber: fallbackPhone,
+      dealershipConfig: mergeDealershipConfig(DEFAULT_DEALERSHIP_CONFIG, fallbackPhone),
     });
   }
 });
@@ -1433,12 +1510,153 @@ app.patch(
         [normalized]
       );
 
-      res.json({ storeWhatsappNumber: normalized });
+      // Keep centralized dealership_config synchronized with primary sales WhatsApp
+      const currentCfg = await getPersistedDealershipConfig();
+      const updatedCfg: DealershipSettings = {
+        ...currentCfg,
+        whatsapp: normalized,
+        salesWhatsapp: normalized,
+      };
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('dealership_config', $1, NOW())
+         ON CONFLICT (key)
+         DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [JSON.stringify(updatedCfg)]
+      );
+
+      res.json({ storeWhatsappNumber: normalized, dealershipConfig: updatedCfg });
     } catch (err: unknown) {
       const message =
         err instanceof Error
           ? err.message
           : 'Erro ao salvar WhatsApp comercial da loja no banco.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
+app.patch(
+  '/api/admin/settings/dealership',
+  requireAdminAuth,
+  async (req, res) => {
+    try {
+      const payload = (req.body?.dealershipConfig || req.body || {}) as Partial<DealershipSettings>;
+      const current = await getPersistedDealershipConfig();
+
+      const rawSalesWa =
+        typeof payload.salesWhatsapp === 'string'
+          ? payload.salesWhatsapp
+          : typeof payload.whatsapp === 'string'
+            ? payload.whatsapp
+            : current.salesWhatsapp || current.whatsapp;
+      const normalizedSalesWa = normalizeStoreWhatsAppNumber(rawSalesWa);
+
+      if (normalizedSalesWa && (normalizedSalesWa.length < 10 || normalizedSalesWa.length > 15)) {
+        res.status(400).json({
+          error: 'WhatsApp de Vendas inválido. Informe DDI + DDD + Número.',
+        });
+        return;
+      }
+
+      const rawFinWa =
+        typeof payload.financingWhatsapp === 'string'
+          ? payload.financingWhatsapp.trim()
+          : current.financingWhatsapp || '';
+      const normalizedFinWa = rawFinWa ? normalizeStoreWhatsAppNumber(rawFinWa) : '';
+      if (rawFinWa && (normalizedFinWa.length < 10 || normalizedFinWa.length > 15)) {
+        res.status(400).json({
+          error: 'WhatsApp de Financiamento inválido. Informe DDI + DDD + Número ou deixe em branco.',
+        });
+        return;
+      }
+
+      const rateVal =
+        payload.financingMonthlyRatePct === null || payload.financingMonthlyRatePct === undefined
+          ? payload.financingMonthlyRatePct === null
+            ? null
+            : current.financingMonthlyRatePct ?? null
+          : Number(payload.financingMonthlyRatePct);
+      const safeRate =
+        rateVal !== null && Number.isFinite(rateVal) && rateVal > 0 && rateVal <= 15
+          ? Number(rateVal.toFixed(2))
+          : null;
+
+      const cleanStr = (val: unknown, fallback: string, maxLen = 220): string =>
+        typeof val === 'string' ? val.trim().slice(0, maxLen) : fallback;
+
+      const updated: DealershipSettings = {
+        ...current,
+        tradeName: cleanStr(payload.tradeName, current.tradeName, 120) || current.tradeName,
+        legalName: cleanStr(payload.legalName, current.legalName, 160),
+        cnpj: cleanStr(payload.cnpj, current.cnpj, 32),
+        stateRegistration: cleanStr(payload.stateRegistration, current.stateRegistration, 32),
+        phone: cleanStr(payload.phone, current.phone, 40),
+        whatsapp: normalizedSalesWa || current.whatsapp,
+        salesWhatsapp: normalizedSalesWa || current.salesWhatsapp || current.whatsapp,
+        salesWhatsappLabel: cleanStr(
+          payload.salesWhatsappLabel,
+          current.salesWhatsappLabel || 'Consultor de Vendas',
+          80
+        ),
+        financingWhatsapp: normalizedFinWa,
+        financingWhatsappLabel: cleanStr(
+          payload.financingWhatsappLabel,
+          current.financingWhatsappLabel || 'Financeiro / Simulação',
+          80
+        ),
+        email: cleanStr(payload.email, current.email, 120),
+        address: cleanStr(payload.address, current.address, 220),
+        city: cleanStr(payload.city, current.city, 80),
+        state: cleanStr(payload.state, current.state, 10),
+        hoursWeekdays: cleanStr(payload.hoursWeekdays, current.hoursWeekdays, 120),
+        hoursSaturday: cleanStr(payload.hoursSaturday, current.hoursSaturday, 120),
+        hoursSunday: cleanStr(payload.hoursSunday, current.hoursSunday, 120),
+        defaultSocialCta: cleanStr(payload.defaultSocialCta, current.defaultSocialCta, 300),
+        aiAssistantName: cleanStr(payload.aiAssistantName, current.aiAssistantName, 120),
+        logoUrl: cleanStr(payload.logoUrl, current.logoUrl || '', 500),
+        minResaleMarginPct:
+          Number.isFinite(Number(payload.minResaleMarginPct))
+            ? Number(payload.minResaleMarginPct)
+            : current.minResaleMarginPct,
+        warrantyDays:
+          Number.isFinite(Number(payload.warrantyDays))
+            ? Math.max(0, Math.round(Number(payload.warrantyDays)))
+            : current.warrantyDays,
+        warrantyKm:
+          Number.isFinite(Number(payload.warrantyKm))
+            ? Math.max(0, Math.round(Number(payload.warrantyKm)))
+            : current.warrantyKm,
+        financingMonthlyRatePct: safeRate,
+      };
+
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('dealership_config', $1, NOW())
+         ON CONFLICT (key)
+         DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [JSON.stringify(updated)]
+      );
+
+      if (updated.salesWhatsapp) {
+        await pool.query(
+          `INSERT INTO app_settings (key, value, updated_at)
+           VALUES ('store_whatsapp_number', $1, NOW())
+           ON CONFLICT (key)
+           DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+          [updated.salesWhatsapp]
+        );
+      }
+
+      res.json({
+        dealershipConfig: updated,
+        storeWhatsappNumber: updated.salesWhatsapp,
+      });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Erro ao salvar configurações da loja no banco.';
       res.status(500).json({ error: message });
     }
   }
@@ -2985,6 +3203,7 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
       price,
       fipe_code,
       fipe_price,
+      fipe_reference_month,
       status,
       fuel,
       transmission,
@@ -3006,6 +3225,10 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
       typeof fipe_code === 'string' && fipe_code.trim()
         ? normalizeFipeCode(fipe_code) || fipe_code.trim()
         : null;
+    const normalizedFipeRefMonth =
+      typeof fipe_reference_month === 'string' && fipe_reference_month.trim()
+        ? fipe_reference_month.trim().slice(0, 64)
+        : null;
 
     if (!Number.isFinite(parsedYearFab) || !Number.isFinite(parsedYearModel)) {
       res.status(400).json({ error: 'Ano de fabricação e ano do modelo inválidos.' });
@@ -3020,8 +3243,8 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
         : 'Disponivel';
 
     const result = await pool.query<DbVehicleRow>(
-      `INSERT INTO vehicles (brand, model, version, year_fab, year_model, km, price, fipe_code, fipe_price, status, fuel, transmission, image_url, options)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      `INSERT INTO vehicles (brand, model, version, year_fab, year_model, km, price, fipe_code, fipe_price, fipe_reference_month, status, fuel, transmission, image_url, options)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        RETURNING *`,
       [
         String(brand).trim(),
@@ -3035,9 +3258,10 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
         Number.isFinite(parsedFipePrice) && parsedFipePrice > 0
           ? parsedFipePrice
           : null,
+        normalizedFipeRefMonth,
         vehicleStatus,
         fuel ? String(fuel).trim() : 'Flex',
-        transmission ? String(transmission).trim() : 'Automático',
+        transmission ? String(transmission).trim() : '',
         image_url ? String(image_url).trim() : '',
         Array.isArray(options) ? options.map(String) : [],
       ]
@@ -3067,6 +3291,7 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
       price,
       fipe_code,
       fipe_price,
+      fipe_reference_month,
       status,
       fuel,
       transmission,
@@ -3093,6 +3318,13 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
           ? Number(fipe_price)
           : null;
 
+    const cleanFipeRefMonth =
+      fipe_reference_month === undefined
+        ? undefined
+        : typeof fipe_reference_month === 'string' && fipe_reference_month.trim()
+          ? fipe_reference_month.trim().slice(0, 64)
+          : null;
+
     const result = await pool.query<DbVehicleRow>(
       `UPDATE vehicles
        SET brand = COALESCE($1, brand),
@@ -3104,12 +3336,13 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
            price = COALESCE($7, price),
            fipe_code = CASE WHEN $8::boolean THEN $9 ELSE fipe_code END,
            fipe_price = CASE WHEN $10::boolean THEN $11 ELSE fipe_price END,
-           status = COALESCE($12, status),
-           fuel = COALESCE($13, fuel),
-           transmission = COALESCE($14, transmission),
-           image_url = COALESCE($15, image_url),
-           options = COALESCE($16, options)
-       WHERE id = $17
+           fipe_reference_month = CASE WHEN $12::boolean THEN $13 ELSE fipe_reference_month END,
+           status = COALESCE($14, status),
+           fuel = COALESCE($15, fuel),
+           transmission = COALESCE($16, transmission),
+           image_url = COALESCE($17, image_url),
+           options = COALESCE($18, options)
+       WHERE id = $19
        RETURNING *`,
       [
         brand,
@@ -3123,6 +3356,8 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
         cleanFipeCode ?? null,
         fipe_price !== undefined,
         cleanFipePrice ?? null,
+        fipe_reference_month !== undefined,
+        cleanFipeRefMonth ?? null,
         normalizedStatus,
         fuel,
         transmission,
@@ -3612,22 +3847,8 @@ app.post('/api/ai/chat', async (req, res) => {
 
       const isPdf = parsedAttachment.mimeType === 'application/pdf';
       const attachmentAckReply = isPdf
-        ? `Recebi o seu anexo PDF (**${safeAttachmentName}**) e ele já foi registrado no seu atendimento!
-
-Sobre o que ele se trata?
-- É uma **proposta, simulação ou carta de crédito**?
-- É o **documento de um veículo** para avaliação na troca?
-- Ou alguma outra informação para a nossa equipe?
-
-Pode me explicar aqui por texto (ou áudio) que eu já continuo o seu atendimento!`
-        : `Recebi a sua foto (**${safeAttachmentName}**) e ela já foi registrada no seu atendimento!
-
-Sobre o que ela se trata?
-- É foto do seu **carro usado para avaliação na troca**? (Se sim, me informe **modelo, ano, versão e km**)
-- É referência de algum **veículo que você procura**?
-- Ou alguma outra dúvida sobre nosso estoque?
-
-Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você!`;
+        ? `Recebi o seu documento PDF (**${safeAttachmentName}**) e ele foi registrado no seu atendimento.\n\nEle é uma **proposta/simulação**, **documento do carro para pré-avaliação na troca** ou outra informação para a equipe?`
+        : `Foto **${safeAttachmentName}** recebida e anexada ao seu atendimento.\n\nSe for do seu carro para **pré-avaliação na troca**, pode anexar mais ângulos (frente, traseira, laterais, interior e painel com km) usando o botão **Anexar fotos** ou complementar os dados por texto.`;
 
       if (auditSessionId) {
         const storedUserContent =
@@ -3659,8 +3880,21 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
         (req.headers.accept?.includes('text/event-stream') ||
           (req.body as { stream?: boolean }).stream === true);
 
+      const attachmentMeta = {
+        promptAttachPhotos: !isPdf,
+        suggestedActions: !isPdf
+          ? [
+              {
+                id: 'act-attach-more-photos',
+                label: 'Anexar mais fotos',
+                kind: 'attach_photos',
+              },
+            ]
+          : [],
+      };
+
       if (!wantsStreamForAttachment) {
-        res.json({ reply: attachmentAckReply });
+        res.json({ reply: attachmentAckReply, ...attachmentMeta });
         return;
       }
 
@@ -3669,6 +3903,7 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders?.();
+      res.write(`data: ${JSON.stringify({ type: 'meta', ...attachmentMeta })}\n\n`);
       res.write(
         `data: ${JSON.stringify({ type: 'chunk', text: attachmentAckReply })}\n\n`
       );
@@ -3679,49 +3914,39 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
       return;
     }
 
-    const ai = getGeminiClient();
-
-    // Inicia consulta ao estoque real no Neon em paralelo com a transcrição de áudio para máxima agilidade
-    const dbInventoryPromise: Promise<string> = (async () => {
+    // Inicia consulta ao estoque real e configurações centralizadas no Neon em paralelo com áudio
+    const dbStockPromise: Promise<{
+      vehicles: ReturnType<typeof mapDbVehicleToFrontend>[];
+      failed: boolean;
+    }> = (async () => {
       try {
         const stockRes = await pool.query<DbVehicleRow>(
-          `SELECT brand, model, version, year_fab, year_model, km, price, fipe_code, fipe_price, status, fuel, transmission, options
-           FROM vehicles
-           WHERE status IN ('Disponivel', 'Disponível', 'Reservado')
-           ORDER BY created_at DESC, id DESC`
+          `SELECT * FROM vehicles ORDER BY created_at DESC, id DESC`
         );
-        if (stockRes.rows.length > 0) {
-          return stockRes.rows
-            .map((v) => {
-              const sellingPrice = Number(v.price);
-              const formattedPrice = new Intl.NumberFormat('pt-BR', {
-                style: 'currency',
-                currency: 'BRL',
-                maximumFractionDigits: 0,
-              }).format(sellingPrice);
-              const formattedKm = new Intl.NumberFormat('pt-BR').format(Number(v.km));
-              const opts =
-                Array.isArray(v.options) && v.options.length > 0
-                  ? v.options.join(', ')
-                  : 'Pacote de série';
-              const fipeNote = buildFipeComparisonSummary(
-                sellingPrice,
-                v.fipe_price ? Number(v.fipe_price) : null,
-                v.fipe_code
-              );
-              return `- ${v.brand} ${v.model} ${v.version || ''} | Ano: ${v.year_fab}/${v.year_model} | Km: ${formattedKm} km | Preço: ${formattedPrice}${fipeNote ? ` | ${fipeNote}` : ''} | Status: ${v.status} | Câmbio: ${v.transmission || 'N/I'} | Combustível: ${v.fuel || 'N/I'} | Opcionais: ${opts}`.trim();
+        return {
+          vehicles: stockRes.rows.map((r) =>
+            mapDbVehicleToFrontend({
+              ...r,
+              created_at:
+                r.created_at instanceof Date
+                  ? r.created_at.toISOString()
+                  : String(r.created_at || ''),
             })
-            .join('\n');
-        }
-        return '';
-      } catch {
-        return '';
+          ),
+          failed: false,
+        };
+      } catch (dbErr) {
+        console.error('[AI Chat Stock Query Failed]', dbErr);
+        return { vehicles: [], failed: true };
       }
     })();
+
+    const dealershipConfigPromise = getPersistedDealershipConfig();
 
     // Se o cliente enviou áudio, realiza transcrição calibrada via Gemini com detecção de áudio inaudível
     let audioTranscription: string | null = null;
     if (parsedAudio) {
+      const aiForAudio = getGeminiClient();
       const audioInlinePart = {
         inlineData: {
           mimeType: normalizeGeminiAudioMime(parsedAudio.mimeType),
@@ -3763,7 +3988,7 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
       for (const candidate of transcribeCandidates) {
         try {
           const resTranscribe = await withPromiseTimeout(
-            ai.models.generateContent({
+            aiForAudio.models.generateContent({
               model: candidate.model,
               contents: { parts: [audioInlinePart, transcribePrompt] },
               ...(candidate.config ? { config: candidate.config } : {}),
@@ -3806,7 +4031,6 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
         throw lastTranscribeErr;
       }
 
-      // Fallback seguro: áudio inaudível, mudo, cortado ou com ruído excessivo — pede reenvio sem inventar resposta
       if (isAudioTranscriptionUnintelligible(audioTranscription)) {
         const auditSessionId = sanitizeSessionId(body.sessionId);
         const auditOrigin = sanitizeOrigin(body.origem);
@@ -3876,35 +4100,63 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
       }
     }
 
-    const dbInventoryText = await dbInventoryPromise;
+    const [{ vehicles: freshDbVehicles, failed: stockQueryFailed }, authoritativeDealership] =
+      await Promise.all([dbStockPromise, dealershipConfigPromise]);
 
-    // Se o cliente ou veículo selecionado informar código FIPE, consulta BrasilAPI ao vivo quando necessário
-    let resolvedSelectedFipePrice = body.vehicle?.fipePrice;
-    let resolvedSelectedFipeRef = '';
-    if (
-      body.vehicle?.fipeCode &&
-      (!resolvedSelectedFipePrice || resolvedSelectedFipePrice <= 0)
-    ) {
-      try {
-        const yearDigits = body.vehicle.year.split('/').pop();
-        const yearNum = yearDigits ? Number(yearDigits) : undefined;
-        const liveFipe = await fetchBrasilApiFipe(body.vehicle.fipeCode, yearNum);
-        resolvedSelectedFipePrice = liveFipe.recommended.valorNumerico;
-        resolvedSelectedFipeRef = ` (Referência BrasilAPI: ${liveFipe.recommended.mesReferencia})`;
-      } catch {
-        // Ignora falha silenciosamente para não interromper o atendimento
+    const effectiveDealership = {
+      ...authoritativeDealership,
+      tradeName: authoritativeDealership.tradeName || dealership,
+      aiAssistantName: authoritativeDealership.aiAssistantName || assistantName,
+    };
+
+    const wantsStream =
+      (req.body as { stream?: boolean }).stream !== false &&
+      (req.headers.accept?.includes('text/event-stream') ||
+        (req.body as { stream?: boolean }).stream === true);
+
+    // Differentiate DB/query failure from a valid empty search result
+    if (stockQueryFailed) {
+      const recoverableMsg =
+        'Não consegui consultar o estoque atualizado no banco de dados agora. Isso é uma instabilidade temporária — clique em **Tentar novamente** em alguns instantes ou fale com um consultor.';
+      if (!wantsStream) {
+        res.status(503).json({
+          error: recoverableMsg,
+          reply: recoverableMsg,
+          stockQueryError: true,
+        });
+        return;
       }
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'meta',
+          stockQueryError: true,
+        })}\n\n`
+      );
+      res.write(
+        `data: ${JSON.stringify({ type: 'chunk', text: recoverableMsg })}\n\n`
+      );
+      res.write(
+        `data: ${JSON.stringify({ type: 'done', reply: recoverableMsg })}\n\n`
+      );
+      res.end();
+      return;
     }
 
-    // Verifica se o cliente digitou (ou falou no áudio) um código FIPE (ex: 001004-9)
-    let clientFipeLookupContext = '';
     const lastUserMessageRaw =
       [...body.messages].reverse().find((m) => m.sender === 'cliente')?.text ||
       '';
-    const fipeSearchText = audioTranscription
-      ? `${lastUserMessageRaw} ${audioTranscription}`
+    const latestClientUtterance = audioTranscription
+      ? `${lastUserMessageRaw} ${audioTranscription}`.trim()
       : lastUserMessageRaw;
-    const fipeCodeMatch = fipeSearchText.match(/\b\d{6}-?\d\b/);
+
+    // Verifica se o cliente digitou (ou falou no áudio) um código FIPE (ex: 001004-9)
+    let clientFipeLookupContext = '';
+    const fipeCodeMatch = latestClientUtterance.match(/\b\d{6}-?\d\b/);
     if (fipeCodeMatch) {
       try {
         const liveFipe = await fetchBrasilApiFipe(fipeCodeMatch[0]);
@@ -3917,54 +4169,35 @@ Pode me explicar aqui por texto (ou áudio) que eu já dou sequência para você
           .join('\n');
         clientFipeLookupContext = `\nConsulta oficial Tabela FIPE (BrasilAPI) realizada em tempo real para o código **${liveFipe.codigoFipe}**:\n${summaryLines}`;
       } catch {
-        // Se código digitado não existir na FIPE, segue atendimento normal sem travar
+        // Segue atendimento normal sem travar
       }
     }
 
-    const realStockContext =
-      dbInventoryText ||
-      body.inventorySummary ||
-      'Nenhum veículo listado no momento.';
+    // Resolve fresh selectedVehicle from DB if passed by client
+    const resolvedSelectedVehicle = body.vehicle
+      ? freshDbVehicles.find(
+          (v) =>
+            v.brand.toLowerCase() === body.vehicle!.brand.toLowerCase() &&
+            v.model.toLowerCase() === body.vehicle!.model.toLowerCase() &&
+            v.year === body.vehicle!.year
+        ) || null
+      : null;
 
-    const selectedVehicleFipeLine = body.vehicle
-      ? buildFipeComparisonSummary(
-          body.vehicle.price,
-          resolvedSelectedFipePrice,
-          body.vehicle.fipeCode
-        )
-      : '';
+    const reqOrigin =
+      (typeof body.chatContext?.baseUrl === 'string' && body.chatContext.baseUrl.trim()) ||
+      (req.headers.origin && typeof req.headers.origin === 'string' ? req.headers.origin : '');
 
-    const vehicleContext = body.vehicle
-      ? `Veículo selecionado pelo cliente:
-- Modelo: ${body.vehicle.brand} ${body.vehicle.model} ${body.vehicle.version}
-- Ano: ${body.vehicle.year} | Km: ${new Intl.NumberFormat('pt-BR').format(body.vehicle.km)} km
-- Preço à vista: ${new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL', maximumFractionDigits: 0 }).format(body.vehicle.price)}${
-          selectedVehicleFipeLine
-            ? `\n- Referência Oficial FIPE: ${selectedVehicleFipeLine}${resolvedSelectedFipeRef}`
-            : ''
-        }
-- Cor: ${body.vehicle.color} | Câmbio: ${body.vehicle.transmission} | Combustível: ${body.vehicle.fuel}
-- Status atual: ${body.vehicle.status}
-- Opcionais: ${Array.isArray(body.vehicle.optionals) && body.vehicle.optionals.length > 0 ? body.vehicle.optionals.join(', ') : 'Padrão de série'}${clientFipeLookupContext}
-
-Estoque completo disponível no banco de dados (caso o cliente pergunte sobre outros veículos):
-${realStockContext}`
-      : `Estoque real disponível no banco de dados (${dealership}):
-${realStockContext}${clientFipeLookupContext}`;
-
-    const conversationTranscript = body.messages
-      .map((m, idx) => {
-        const isLastClient =
-          idx === body.messages.length - 1 && m.sender === 'cliente';
-        let messageText = m.text;
-        if (isLastClient && audioTranscription) {
-          messageText = `[Áudio enviado pelo cliente — Transcrição]: "${audioTranscription}"${
-            m.text && m.text !== 'Mensagem de áudio' ? ` (${m.text})` : ''
-          }`;
-        }
-        return `${m.sender === 'cliente' ? 'Cliente' : assistantName}: ${messageText}`;
-      })
-      .join('\n');
+    const turnPlan = planChatTurn({
+      allVehicles: freshDbVehicles,
+      messages: body.messages,
+      latestUserUtterance: latestClientUtterance,
+      chatContext: {
+        ...(body.chatContext || {}),
+        baseUrl: reqOrigin,
+      },
+      dealership: effectiveDealership,
+      selectedVehicle: resolvedSelectedVehicle,
+    });
 
     const safeReplyToId =
       typeof body.replyTo?.id === 'string'
@@ -3981,22 +4214,11 @@ ${realStockContext}${clientFipeLookupContext}`;
           ? 'user'
           : null;
 
-    const replyContextPrompt = safeReplyToPreview
-      ? `\n\n[MENSAGEM CITADA PELO CLIENTE (REPLY)]\nO cliente respondeu especificamente a esta mensagem anterior (${
-          safeReplyToSender === 'assistant'
-            ? `enviada por ${assistantName}`
-            : 'enviada pelo próprio Cliente'
-        }):\n"${safeReplyToPreview}"\nResponda levando exatamente essa mensagem citada como referência principal.`
-      : '';
-
     const auditSessionId = sanitizeSessionId(body.sessionId);
     const auditOrigin = sanitizeOrigin(body.origem);
 
     const clientMessagesOnly = body.messages.filter((m) => m.sender === 'cliente');
     const isFirstClientTurn = clientMessagesOnly.length <= 1;
-    const latestClientUtterance = audioTranscription
-      ? `${lastUserMessageRaw} ${audioTranscription}`.trim()
-      : lastUserMessageRaw;
 
     const sanitizedBodyVisitorName =
       typeof body.visitorName === 'string' && body.visitorName.trim().length >= 2
@@ -4040,49 +4262,10 @@ ${realStockContext}${clientFipeLookupContext}`;
       detectedVisitorName || sanitizedBodyVisitorName || dbSessionVisitorName;
     const visitorNameForClientMeta = detectedVisitorName || dbSessionVisitorName;
 
-    const visitorContextLine = resolvedVisitorName
-      ? `\nNome já cadastrado do cliente nesta conversa: **${resolvedVisitorName}** (trate-o de forma cordial pelo primeiro nome e NÃO pergunte novamente como ele se chama).`
-      : '';
-
-    const systemInstruction = `Você é o Consultor Oficial da revenda "${dealership}" (${s?.address || 'Av. Ibirapuera, 2.840 — Moema'}, ${s?.city || 'São Paulo'}/${s?.state || 'SP'}).
-Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursSaturday || '09:00 às 16:00'} | WhatsApp: ${s?.whatsapp || '(11) 99482-1040'}.
-
-1. CONCISÃO RIGOROSA ESTILO WHATSAPP (OBRIGATÓRIO):
-- Responda de forma **curta, direta e escaneável** — como um vendedor ágil no WhatsApp.
-- Limite-se a **2 a 4 linhas curtas** OU no máximo **3 bullet points curtos** com \`- \`.
-- É PROIBIDO enviar introduções longas, repetições, despedidas extensas ou paredões de texto.
-- Vá direto ao ponto: destaque em negrito (\`**texto**\`) apenas o essencial (modelo, ano, preço, economia frente à FIPE ou condição principal).
-- Encerre sempre com **apenas 1 pergunta curta e objetiva** conduzindo ao próximo passo (ex.: visita, simulação de financiamento ou avaliação de troca).
-
-2. PERSONALIDADE COMERCIAL CONSULTIVA, FIPE OFICIAL E VERACIDADE:
-- Seminovos com **laudo cautelar 100% aprovado** e **garantia de 90 dias (CDC)**.
-- Utilize APENAS os dados reais do estoque e os valores oficiais da Tabela FIPE (BrasilAPI) fornecidos no contexto. NUNCA invente preços, valores FIPE, taxas exatas ou veículos fora do estoque. Se algo não constar, diga brevemente que confirmará com a equipe.
-- Quando houver valor FIPE no contexto, cite de forma sucinta o preço e a economia frente à tabela. Aceitamos usado na troca e financiamento bancário/carta contemplada.
-
-3. IDENTIFICAÇÃO E CONTINUIDADE (SEM REPETIÇÃO):
-- Se o nome do cliente estiver no contexto, chame-o naturalmente pelo primeiro nome e NUNCA peça o nome novamente.
-- Não peça novamente dados que o cliente já informou.
-
-4. MINIMIZAÇÃO DE DADOS E PRIVACIDADE (LGPD):
-- Solicite apenas **Nome** e **WhatsApp** quando necessário. É PROIBIDO pedir CPF, RG, CNH, endereço, renda ou dados bancários no chat.
-
-5. COMPREENSÃO DE ÁUDIO E FALLBACK HONESTO:
-- Se a transcrição do áudio estiver incompleta, cortada ou inaudível, não chute: peça em 1 frase curta para reenviar o áudio ou escrever por texto.`;
-
-    const contentsPrompt = `Dados reais do estoque no banco de dados:\n${vehicleContext}${visitorContextLine}\n\nHistórico da conversa:\n${conversationTranscript}${replyContextPrompt}\n\nResponda à última mensagem do cliente em no máximo 2 a 4 linhas curtas (ou até 3 tópicos breves), direto ao ponto e finalizando com 1 única pergunta curta.`;
-
-    const chatConfig = {
-      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-      maxOutputTokens: 360,
-      systemInstruction,
-    };
-
     if (auditSessionId) {
       const storedUserContent =
         lastUserMessageRaw.trim() ||
-        (parsedAudio
-          ? audioTranscription || 'Mensagem de áudio'
-          : '');
+        (parsedAudio ? audioTranscription || 'Mensagem de áudio' : '');
       await recordChatAuditTurn(
         auditSessionId,
         auditOrigin,
@@ -4105,16 +4288,104 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       }
     }
 
-    const wantsStream =
-      (req.body as { stream?: boolean }).stream !== false &&
-      (req.headers.accept?.includes('text/event-stream') ||
-        (req.body as { stream?: boolean }).stream === true);
+    const structuredMeta = {
+      ...(audioTranscription ? { transcription: audioTranscription } : {}),
+      ...(visitorNameForClientMeta ? { visitorName: visitorNameForClientMeta } : {}),
+      vehicleCards: turnPlan.vehicleCards,
+      comparison: turnPlan.comparison,
+      financingSummary: turnPlan.financingSummary,
+      activeFilters: turnPlan.activeFilters,
+      recentVehicleIds: turnPlan.recentVehicleIds,
+      focusedVehicleId: turnPlan.focusedVehicleId,
+      promptAttachPhotos: turnPlan.promptAttachPhotos,
+      suggestedActions: turnPlan.suggestedActions,
+      isVisitInquiryOnly: turnPlan.isVisitInquiryOnly,
+      suppressHandoff: turnPlan.suppressHandoff,
+      fichaUrl: turnPlan.fichaUrl,
+    };
+
+    // Fast deterministic path for exact-precision flows (visit inquiry, financing math, direct ficha, FIPE, 0-match alternatives, ambiguity)
+    if (turnPlan.useDeterministicDirectly && !clientFipeLookupContext) {
+      const finalReply = turnPlan.deterministicReply;
+      if (auditSessionId) {
+        await recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', finalReply);
+      }
+      if (!wantsStream) {
+        res.json({ reply: finalReply, ...structuredMeta });
+        return;
+      }
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+      res.write(`data: ${JSON.stringify({ type: 'meta', ...structuredMeta })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'chunk', text: finalReply })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done', reply: finalReply })}\n\n`);
+      res.end();
+      return;
+    }
+
+    const ai = getGeminiClient();
+
+    const conversationTranscript = body.messages
+      .map((m, idx) => {
+        const isLastClient =
+          idx === body.messages.length - 1 && m.sender === 'cliente';
+        let messageText = m.text;
+        if (isLastClient && audioTranscription) {
+          messageText = `[Áudio enviado pelo cliente — Transcrição]: "${audioTranscription}"${
+            m.text && m.text !== 'Mensagem de áudio' ? ` (${m.text})` : ''
+          }`;
+        }
+        return `${m.sender === 'cliente' ? 'Cliente' : effectiveDealership.aiAssistantName}: ${messageText}`;
+      })
+      .join('\n');
+
+    const replyContextPrompt = safeReplyToPreview
+      ? `\n\n[MENSAGEM CITADA PELO CLIENTE (REPLY)]\nO cliente respondeu especificamente a esta mensagem anterior (${
+          safeReplyToSender === 'assistant'
+            ? `enviada por ${effectiveDealership.aiAssistantName}`
+            : 'enviada pelo próprio Cliente'
+        }):\n"${safeReplyToPreview}"\nResponda levando exatamente essa mensagem citada como referência principal.`
+      : '';
+
+    const visitorContextLine = resolvedVisitorName
+      ? `\nNome do cliente nesta conversa: **${resolvedVisitorName}** (trate-o pelo primeiro nome se fizer sentido e NÃO pergunte novamente como se chama).`
+      : '';
+
+    const systemInstruction = `Você é o Consultor Digital da revenda "${effectiveDealership.tradeName}" (${effectiveDealership.address}, ${effectiveDealership.city}/${effectiveDealership.state}).
+Horários oficiais: Seg-Sex ${effectiveDealership.hoursWeekdays} | Sábado ${effectiveDealership.hoursSaturday} | Domingo ${effectiveDealership.hoursSunday}.
+
+1. VERACIDADE ABSOLUTA E DADOS VERIFICADOS PELO SERVIDOR (OBRIGATÓRIO):
+- Use EXCLUSIVAMENTE os fatos, veículos, preços, links e cálculos fornecidos no bloco [FATOS VERIFICADOS].
+- NUNCA invente carros, preços, parcelas mensais, taxas de juros, valores FIPE ou meses de referência.
+- Se um veículo estiver marcado com "Câmbio: EM CONFERÊNCIA CADASTRAL", NUNCA confirme que é automático ou manual — informe que está em conferência.
+- Em troca de usado: NUNCA ofereça "link para enviar fotos"; oriente o cliente a usar o botão **"Anexar fotos"** disponível no chat. Trate sempre como **pré-avaliação do consultor humano**.
+- Em visitas: NUNCA diga "visita confirmada"; use sempre **"solicitação de visita"** sujeita à confirmação da equipe.
+- Não exija telefone/WhatsApp de quem está apenas pesquisando.
+
+2. CONCISÃO ESTILO WHATSAPP:
+- Responda em **2 a 4 linhas curtas** ou até **3 bullet points curtos** com \`- \`.
+- Destaque em negrito (\`**texto**\`) apenas o essencial e encerre com **1 pergunta curta** para o próximo passo.
+- Os cards dos veículos já são exibidos visualmente abaixo da sua mensagem, então não repita fichas extensas no texto.
+
+3. PRIVACIDADE (LGPD):
+- Nunca solicite CPF, RG, CNH, renda ou dados bancários no chat.`;
+
+    const contentsPrompt = `[FATOS VERIFICADOS PELO SERVIDOR]\n${turnPlan.verifiedFactsPrompt}${clientFipeLookupContext}${visitorContextLine}\n\n[HISTÓRICO DA CONVERSA]\n${conversationTranscript}${replyContextPrompt}\n\nRedija uma resposta curta, objetiva e fiel aos [FATOS VERIFICADOS].`;
+
+    const chatConfig = {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+      maxOutputTokens: 360,
+      systemInstruction,
+    };
 
     if (!wantsStream) {
-      let response;
+      let reply = turnPlan.deterministicReply;
       let replyModelUsed = 'gemini-3.1-flash-lite';
       try {
-        response = await callGeminiWithRetry(
+        const response = await callGeminiWithRetry(
           () =>
             ai.models.generateContent({
               model: 'gemini-3.1-flash-lite',
@@ -4123,32 +4394,34 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
             }),
           parsedAudio ? 1 : 2
         );
+        recordAiUsageLog({
+          sessionId: auditSessionId,
+          feature: 'chat_text',
+          model: replyModelUsed,
+          usageMetadata: response.usageMetadata,
+        });
+        reply = guardChatReply(response.text?.trim() || '', turnPlan);
       } catch (chatErr) {
-        if (!parsedAudio || isNonFallbackGeminiError(chatErr)) {
+        if (isNonFallbackGeminiError(chatErr)) {
           throw chatErr;
         }
-        replyModelUsed = 'gemini-2.5-flash';
-        response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: contentsPrompt,
-          config: {
-            maxOutputTokens: 500,
-            systemInstruction,
-          },
-        });
-      }
-
-      recordAiUsageLog({
-        sessionId: auditSessionId,
-        feature: 'chat_text',
-        model: replyModelUsed,
-        usageMetadata: response.usageMetadata,
-      });
-
-      const reply = response.text?.trim();
-      if (!reply) {
-        res.status(502).json({ error: 'O assistente não retornou uma resposta válida.' });
-        return;
+        try {
+          replyModelUsed = 'gemini-2.5-flash';
+          const fallbackRes = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: contentsPrompt,
+            config: { maxOutputTokens: 480, systemInstruction },
+          });
+          recordAiUsageLog({
+            sessionId: auditSessionId,
+            feature: 'chat_text',
+            model: replyModelUsed,
+            usageMetadata: fallbackRes.usageMetadata,
+          });
+          reply = guardChatReply(fallbackRes.text?.trim() || '', turnPlan);
+        } catch {
+          reply = turnPlan.deterministicReply;
+        }
       }
 
       if (auditSessionId) {
@@ -4157,11 +4430,22 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
 
       res.json({
         reply,
-        ...(audioTranscription ? { transcription: audioTranscription } : {}),
-        ...(visitorNameForClientMeta ? { visitorName: visitorNameForClientMeta } : {}),
+        ...structuredMeta,
       });
       return;
     }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    res.write(`data: ${JSON.stringify({ type: 'meta', ...structuredMeta })}\n\n`);
+
+    let clientClosed = false;
+    res.on('close', () => {
+      clientClosed = true;
+    });
 
     let stream;
     let streamModelUsed = 'gemini-3.1-flash-lite';
@@ -4176,40 +4460,32 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
         parsedAudio ? 1 : 2
       );
     } catch (streamErr) {
-      if (!parsedAudio || isNonFallbackGeminiError(streamErr)) {
+      if (isNonFallbackGeminiError(streamErr)) {
         throw streamErr;
       }
-      streamModelUsed = 'gemini-2.5-flash';
-      stream = await ai.models.generateContentStream({
-        model: 'gemini-2.5-flash',
-        contents: contentsPrompt,
-        config: {
-          maxOutputTokens: 500,
-          systemInstruction,
-        },
-      });
+      try {
+        streamModelUsed = 'gemini-2.5-flash';
+        stream = await ai.models.generateContentStream({
+          model: 'gemini-2.5-flash',
+          contents: contentsPrompt,
+          config: {
+            maxOutputTokens: 480,
+            systemInstruction,
+          },
+        });
+      } catch {
+        const safeFallback = turnPlan.deterministicReply;
+        if (!clientClosed) {
+          if (auditSessionId) {
+            void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', safeFallback);
+          }
+          res.write(`data: ${JSON.stringify({ type: 'chunk', text: safeFallback })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: 'done', reply: safeFallback })}\n\n`);
+          res.end();
+        }
+        return;
+      }
     }
-
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders?.();
-
-    if (audioTranscription || visitorNameForClientMeta) {
-      res.write(
-        `data: ${JSON.stringify({
-          type: 'meta',
-          ...(audioTranscription ? { transcription: audioTranscription } : {}),
-          ...(visitorNameForClientMeta ? { visitorName: visitorNameForClientMeta } : {}),
-        })}\n\n`
-      );
-    }
-
-    let clientClosed = false;
-    res.on('close', () => {
-      clientClosed = true;
-    });
 
     let fullText = '';
     let lastStreamUsage: GeminiUsageMetadataLike | null = null;
@@ -4234,31 +4510,24 @@ Atendimento: Seg-Sex ${s?.hoursWeekdays || '09:00 às 19:00'} | Sáb ${s?.hoursS
       });
 
       if (!clientClosed) {
-        const trimmed = fullText.trim();
-        if (!trimmed) {
-          res.write(
-            `data: ${JSON.stringify({
-              type: 'error',
-              error: 'O assistente não retornou uma resposta válida.',
-            })}\n\n`
-          );
-        } else {
-          if (auditSessionId) {
-            void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', trimmed);
-          }
-          res.write(`data: ${JSON.stringify({ type: 'done', reply: trimmed })}\n\n`);
+        const guarded = guardChatReply(fullText.trim(), turnPlan);
+        if (auditSessionId) {
+          void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', guarded);
         }
+        res.write(`data: ${JSON.stringify({ type: 'done', reply: guarded })}\n\n`);
         res.end();
       } else if (auditSessionId && fullText.trim()) {
-        void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', fullText.trim());
+        const guarded = guardChatReply(fullText.trim(), turnPlan);
+        void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', guarded);
       }
     } catch (streamErr: unknown) {
-      const formatted = formatGeminiError(streamErr);
       console.error('[AI Chat Stream Error]', streamErr);
       if (!clientClosed) {
-        res.write(
-          `data: ${JSON.stringify({ type: 'error', error: formatted.message })}\n\n`
-        );
+        const safeFallback = turnPlan.deterministicReply;
+        if (auditSessionId) {
+          void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', safeFallback);
+        }
+        res.write(`data: ${JSON.stringify({ type: 'done', reply: safeFallback })}\n\n`);
         res.end();
       }
     }

@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   BadgePercent,
   Check,
   Edit3,
@@ -22,6 +23,10 @@ import {
 import { SHOWROOM_IMAGE_PRESETS } from '../../data/mockData';
 import { parseYearPair } from '../../db/mappers';
 import { formatBRL, formatKm } from '../../utils/formatters';
+import {
+  analyzeVehicleDataQuality,
+  computeFipeMetrics,
+} from '../../utils/vehicleDomain';
 import { VehicleImage } from '../VehicleImage';
 
 interface InventoryModuleProps {
@@ -73,6 +78,7 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
 }) => {
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'Todos' | VehicleStatus>('Todos');
+  const [reviewOnly, setReviewOnly] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingVehicle, setEditingVehicle] = useState<Vehicle | null>(null);
   const [customOptional, setCustomOptional] = useState('');
@@ -97,8 +103,9 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
     price: 0,
     fipePrice: 0,
     fipeCode: '',
+    fipeReferenceMonth: '',
     color: '',
-    transmission: 'Automático',
+    transmission: '',
     fuel: 'Flex',
     plate: '',
     renavam: '',
@@ -130,18 +137,19 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
       category: 'SUVs',
       year: '2024/2024',
       km: 0,
-      price: 150000,
-      fipePrice: 158000,
+      price: 0,
+      fipePrice: 0,
       fipeCode: '',
+      fipeReferenceMonth: '',
       color: 'Preto',
-      transmission: 'Automático',
+      transmission: '',
       fuel: 'Flex',
       plate: '',
       renavam: '',
       chassis: '',
       status: 'Disponível',
       imageUrl: SHOWROOM_IMAGE_PRESETS[0].url,
-      optionals: ['Bancos em Couro', 'Faróis Full LED'],
+      optionals: [],
     });
     setIsModalOpen(true);
   };
@@ -165,6 +173,7 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
       price: vehicle.price,
       fipePrice: vehicle.fipePrice,
       fipeCode: vehicle.fipeCode || '',
+      fipeReferenceMonth: vehicle.fipeReferenceMonth || '',
       color: vehicle.color,
       transmission: vehicle.transmission,
       fuel: vehicle.fuel,
@@ -215,6 +224,8 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
         ...prev,
         fipeCode: data.codigoFipe,
         fipePrice: data.recommended.valorNumerico || prev.fipePrice,
+        fipeReferenceMonth:
+          data.recommended.mesReferencia || prev.fipeReferenceMonth || '',
       }));
     } catch (err: unknown) {
       setFipeResult(null);
@@ -234,6 +245,8 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
       ...prev,
       fipeCode: chosen.codigoFipe || fipeResult.codigoFipe,
       fipePrice: chosen.valorNumerico,
+      fipeReferenceMonth:
+        chosen.mesReferencia || prev.fipeReferenceMonth || '',
     }));
   };
 
@@ -320,15 +333,32 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
     void onUpdateVehicle({ ...vehicle, status: nextStatus });
   };
 
+  const reviewCount = useMemo(
+    () => vehicles.filter((v) => analyzeVehicleDataQuality(v).needsReview).length,
+    [vehicles]
+  );
+
+  const formQuality = useMemo(
+    () =>
+      analyzeVehicleDataQuality({
+        ...formState,
+        id: editingVehicle?.id || 'draft',
+        createdAt: editingVehicle?.createdAt || '',
+        year: `${yearFabInput}/${yearModelInput}`,
+      }),
+    [formState, editingVehicle, yearFabInput, yearModelInput]
+  );
+
   const filteredVehicles = vehicles.filter((v) => {
     const matchesStatus = statusFilter === 'Todos' || v.status === statusFilter;
+    const matchesReview = !reviewOnly || analyzeVehicleDataQuality(v).needsReview;
     const term = search.trim().toLowerCase();
     const matchesSearch =
       !term ||
       `${v.brand} ${v.model} ${v.version} ${v.plate}`
         .toLowerCase()
         .includes(term);
-    return matchesStatus && matchesSearch;
+    return matchesStatus && matchesReview && matchesSearch;
   });
 
   return (
@@ -365,6 +395,21 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
               )
             )}
           </div>
+
+          {reviewCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setReviewOnly((prev) => !prev)}
+              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap ${
+                reviewOnly
+                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                  : 'bg-[#111114] border-amber-500/30 text-amber-300 hover:bg-amber-500/10'
+              }`}
+            >
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+              <span>Revisar cadastro ({reviewCount})</span>
+            </button>
+          )}
         </div>
 
         <button
@@ -426,7 +471,10 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.06] text-sm">
-                {filteredVehicles.map((vehicle) => (
+                {filteredVehicles.map((vehicle) => {
+                  const quality = analyzeVehicleDataQuality(vehicle);
+                  const fipe = computeFipeMetrics(vehicle);
+                  return (
                   <tr
                     key={vehicle.id}
                     className="hover:bg-white/[0.02] transition-colors"
@@ -440,16 +488,41 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                           />
                         </div>
                         <div className="min-w-0">
-                          <p className="font-medium text-white truncate">
-                            {vehicle.brand} {vehicle.model}
-                          </p>
+                          <div className="flex items-center gap-2">
+                            <p className="font-medium text-white truncate">
+                              {vehicle.brand} {vehicle.model}
+                            </p>
+                          </div>
                           <p className="text-xs text-zinc-400 truncate mt-0.5">
                             {vehicle.version}
                           </p>
                           <p className="text-[11px] text-zinc-500 mt-0.5 truncate">
-                            {vehicle.color} · {vehicle.transmission} · {vehicle.fuel} · Placa{' '}
-                            <span className="font-mono text-zinc-400">{vehicle.plate || 'N/I'}</span>
+                            {vehicle.color || 'Cor N/I'} ·{' '}
+                            <span
+                              className={
+                                quality.canonicalTransmission
+                                  ? 'text-zinc-400'
+                                  : 'text-amber-400 font-medium'
+                              }
+                            >
+                              {quality.displayTransmission}
+                            </span>{' '}
+                            · {vehicle.fuel} · Placa{' '}
+                            <span className="font-mono text-zinc-400">
+                              {vehicle.plate || 'N/I'}
+                            </span>
                           </p>
+                          {quality.needsReview && (
+                            <p
+                              title={quality.reviewFlags.join(' | ')}
+                              className="mt-1 inline-flex items-center gap-1.5 text-[11px] text-amber-300"
+                            >
+                              <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                              <span className="truncate max-w-[340px]">
+                                Revisar cadastro: {quality.reviewFlags[0]}
+                              </span>
+                            </p>
+                          )}
                         </div>
                       </div>
                     </td>
@@ -466,29 +539,41 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                       <span className="font-mono text-sm font-semibold text-white tabular-nums block">
                         {formatBRL(vehicle.price)}
                       </span>
-                      {vehicle.fipePrice > 0 && (() => {
-                        const diff = vehicle.fipePrice - vehicle.price;
-                        const pct = ((Math.abs(diff) / vehicle.fipePrice) * 100).toFixed(1).replace('.', ',');
-                        return (
-                          <div className="mt-0.5 flex flex-col items-end gap-0.5">
-                            <span className="text-[11px] text-zinc-400 font-mono tabular-nums">
-                              FIPE {formatBRL(vehicle.fipePrice)}
-                              {vehicle.fipeCode ? ` · ${vehicle.fipeCode}` : ''}
-                            </span>
-                            {diff !== 0 && (
+                      {fipe.hasFipeValue && fipe.fipePrice ? (
+                        <div className="mt-0.5 flex flex-col items-end gap-0.5">
+                          <span className="text-[11px] text-zinc-400 font-mono tabular-nums">
+                            FIPE {formatBRL(fipe.fipePrice)}
+                            {vehicle.fipeCode ? ` · ${vehicle.fipeCode}` : ''}
+                          </span>
+                          {fipe.hasReferenceMonth ? (
+                            fipe.diffBrl !== null && fipe.diffBrl !== 0 ? (
                               <span
                                 className={`text-[10px] font-mono tabular-nums font-medium ${
-                                  diff > 0 ? 'text-emerald-400' : 'text-amber-400'
+                                  fipe.diffBrl > 0
+                                    ? 'text-emerald-400'
+                                    : 'text-amber-400'
                                 }`}
                               >
-                                {diff > 0
-                                  ? `${pct}% abaixo da FIPE`
-                                  : `${pct}% acima da FIPE`}
+                                {fipe.diffBrl > 0
+                                  ? `${fipe.diffPct}% abaixo (${fipe.fipeReferenceMonth})`
+                                  : `${Math.abs(fipe.diffPct || 0)}% acima (${fipe.fipeReferenceMonth})`}
                               </span>
-                            )}
-                          </div>
-                        );
-                      })()}
+                            ) : (
+                              <span className="text-[10px] text-zinc-400">
+                                Ref.: {fipe.fipeReferenceMonth}
+                              </span>
+                            )
+                          ) : (
+                            <span className="text-[10px] text-amber-400">
+                              Mês ref. não informado
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-[10px] text-zinc-500">
+                          FIPE não informada
+                        </span>
+                      )}
                     </td>
 
                     <td className="py-3.5 px-4 whitespace-nowrap">
@@ -542,7 +627,8 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -572,6 +658,20 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
             </div>
 
             <form onSubmit={handleSubmit} className="p-6 overflow-y-auto space-y-6">
+              {formQuality.needsReview && (
+                <div className="p-3.5 rounded-lg bg-amber-950/40 border border-amber-500/35 text-xs text-amber-200 space-y-1.5">
+                  <p className="font-semibold flex items-center gap-2 text-amber-300">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span>Alertas de conferência deste cadastro</span>
+                  </p>
+                  <ul className="list-disc pl-5 space-y-1 text-amber-100/90">
+                    {formQuality.reviewFlags.map((flag, i) => (
+                      <li key={i}>{flag}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               {/* Photo Upload + Preview */}
               <div className="grid grid-cols-1 md:grid-cols-12 gap-5 items-start">
                 <div className="md:col-span-5 aspect-[4/3] rounded-lg overflow-hidden bg-zinc-950 border border-white/[0.08]">
@@ -808,6 +908,24 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                       <span>Consultar</span>
                     </button>
                   </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1">
+                    Mês de Referência FIPE
+                  </label>
+                  <input
+                    type="text"
+                    value={formState.fipeReferenceMonth || ''}
+                    onChange={(e) =>
+                      setFormState((prev) => ({
+                        ...prev,
+                        fipeReferenceMonth: e.target.value,
+                      }))
+                    }
+                    placeholder="Ex: novembro de 2026"
+                    className="w-full px-3 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white focus:outline-none"
+                  />
                 </div>
 
                 {(fipeError || fipeResult || (formState.fipePrice > 0 && formState.price > 0)) && (

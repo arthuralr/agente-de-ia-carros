@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   AlertCircle,
   Bot,
@@ -6,6 +6,7 @@ import {
   ExternalLink,
   Loader2,
   MessageCircle,
+  RefreshCw,
   Send,
   User,
   X,
@@ -15,10 +16,17 @@ import {
   DealershipSettings,
   Lead,
   Vehicle,
+  VehicleCardData,
 } from '../../types';
-import { formatBRL, formatWhatsAppLink } from '../../utils/formatters';
+import { formatBRL } from '../../utils/formatters';
 import { useVirtualConsultant } from '../../hooks/useVirtualConsultant';
 import { ChatMarkdown } from './ChatMarkdown';
+import {
+  ChatComparisonBlock,
+  ChatFinancingBlock,
+  ChatVehicleCards,
+} from './ChatVehicleCards';
+import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 
 interface AiChatDrawerProps {
   isOpen: boolean;
@@ -43,6 +51,8 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
   onOpenStandaloneChat,
   onOpenPrivacy,
 }) => {
+  const [handoffOpen, setHandoffOpen] = useState(false);
+
   const {
     messages,
     input,
@@ -50,6 +60,10 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
     isSending,
     hasStreamFirstToken,
     errorMsg,
+    canRetry,
+    retryLastMessage,
+    compareVehicleIds,
+    toggleCompareVehicle,
     customerName,
     setCustomerName,
     customerWhatsapp,
@@ -74,6 +88,21 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
     onCaptureLead,
     onSyncLeadChat,
   });
+
+  const handleOpenCardSheet = (card: VehicleCardData) => {
+    onClose();
+    window.history.pushState({}, '', `/veiculo/${encodeURIComponent(card.id)}`);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  };
+
+  const handleNavigateInternal = (href: string) => {
+    const match = href.match(/\/veiculo\/([^/?#]+)/i);
+    if (match && match[1]) {
+      onClose();
+      window.history.pushState({}, '', href);
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -274,7 +303,30 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
                   <ChatMarkdown
                     content={msg.text}
                     variant={isAi ? 'ai' : 'user'}
+                    onNavigateInternal={handleNavigateInternal}
                   />
+                  {isAi && msg.vehicleCards && msg.vehicleCards.length > 0 && (
+                    <ChatVehicleCards
+                      cards={msg.vehicleCards}
+                      selectedCompareIds={compareVehicleIds}
+                      onOpenSheet={handleOpenCardSheet}
+                      onToggleCompare={(card) => toggleCompareVehicle(card.id)}
+                      onSimulate={(card) =>
+                        sendQuickPrompt(
+                          `Quero simular financiamento do ${card.brand} ${card.model} ${card.year}`
+                        )
+                      }
+                    />
+                  )}
+                  {isAi && msg.comparison && (
+                    <ChatComparisonBlock
+                      comparison={msg.comparison}
+                      onOpenSheet={handleOpenCardSheet}
+                    />
+                  )}
+                  {isAi && msg.financingSummary && (
+                    <ChatFinancingBlock summary={msg.financingSummary} />
+                  )}
                 </div>
               </div>
             );
@@ -290,22 +342,28 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
           {errorMsg && (
             <div className="p-3 rounded-lg bg-red-950/50 border border-red-600/40 flex items-start gap-2 text-xs text-red-200">
               <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-              <div className="space-y-1.5">
+              <div className="space-y-2">
                 <p>{errorMsg}</p>
-                <a
-                  href={formatWhatsAppLink(
-                    settings.whatsapp,
-                    targetVehicle
-                      ? `Olá! Tenho interesse no ${targetVehicle.brand} ${targetVehicle.model} ${targetVehicle.year}.`
-                      : 'Olá! Gostaria de falar com um consultor da Armazém do Carro.'
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {canRetry && (
+                    <button
+                      type="button"
+                      onClick={() => retryLastMessage()}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-red-600 hover:bg-red-500 text-white font-semibold"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>Tentar novamente</span>
+                    </button>
                   )}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 text-emerald-400 hover:underline font-medium"
-                >
-                  <MessageCircle className="w-3.5 h-3.5" />
-                  <span>Continuar diretamente pelo WhatsApp</span>
-                </a>
+                  <button
+                    type="button"
+                    onClick={() => setHandoffOpen(true)}
+                    className="inline-flex items-center gap-1.5 text-emerald-400 hover:underline font-medium"
+                  >
+                    <MessageCircle className="w-3.5 h-3.5" />
+                    <span>Falar com consultor no WhatsApp</span>
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -366,6 +424,22 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
           </form>
         </div>
       </div>
+
+      <WhatsAppHandoffModal
+        isOpen={handoffOpen}
+        onClose={() => setHandoffOpen(false)}
+        settings={settings}
+        purpose="sales"
+        vehicleLabel={
+          targetVehicle
+            ? `${targetVehicle.brand} ${targetVehicle.model} ${targetVehicle.year}`
+            : null
+        }
+        leadName={customerName}
+        leadPhone={customerWhatsapp}
+        messages={messages}
+        vehicles={vehicles}
+      />
     </div>
   );
 };

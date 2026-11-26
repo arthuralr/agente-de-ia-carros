@@ -1,12 +1,26 @@
-import { ChatMessage, Vehicle } from '../types';
+import { ChatMessage, DealershipSettings, Vehicle } from '../types';
+
+export type HandoffPurpose = 'sales' | 'financing' | 'visit' | 'tradein';
+
+export interface WhatsAppDestination {
+  purpose: HandoffPurpose;
+  label: string;
+  rawNumber: string;
+  normalizedNumber: string;
+  isConfigured: boolean;
+}
 
 export interface WhatsAppHandoffParams {
   storeWhatsappNumber: string;
   storeName?: string;
   leadName?: string | null;
   leadPhone?: string | null;
+  includeContactData?: boolean;
   sessionId?: string | null;
   contextSummary?: string | null;
+  vehicleLabel?: string | null;
+  purpose?: HandoffPurpose;
+  destinationLabel?: string | null;
   messages?: ChatMessage[];
   vehicles?: Vehicle[];
   existingSummary?: string | null;
@@ -18,6 +32,55 @@ export interface WhatsAppHandoffResult {
   shortRef: string;
   normalizedStorePhone: string;
   contextSummary: string;
+  destinationLabel: string;
+  purpose: HandoffPurpose;
+}
+
+/**
+ * Resolves the active WhatsApp destination from the single centralized DealershipSettings.
+ * Supports optional financing WhatsApp with clear department label, falling back cleanly
+ * to the primary sales WhatsApp when financing is not separately configured.
+ */
+export function resolveWhatsAppDestination(
+  settings: Partial<DealershipSettings> | null | undefined,
+  purpose: HandoffPurpose = 'sales',
+  fallbackWhatsapp?: string | null
+): WhatsAppDestination {
+  const salesRaw =
+    (settings?.salesWhatsapp || '').trim() ||
+    (settings?.whatsapp || '').trim() ||
+    (fallbackWhatsapp || '').trim();
+  const financingRaw = (settings?.financingWhatsapp || '').trim();
+
+  if (purpose === 'financing' && financingRaw) {
+    const normalized = normalizeStoreWhatsAppNumber(financingRaw);
+    return {
+      purpose: 'financing',
+      label: (settings?.financingWhatsappLabel || 'Financeiro / Simulação').trim(),
+      rawNumber: financingRaw,
+      normalizedNumber: normalized,
+      isConfigured: Boolean(normalized),
+    };
+  }
+
+  const normalizedSales = normalizeStoreWhatsAppNumber(salesRaw);
+  const baseLabel = (settings?.salesWhatsappLabel || 'Consultor de Vendas').trim();
+  const purposeLabel =
+    purpose === 'visit'
+      ? `${baseLabel} (Solicitação de visita)`
+      : purpose === 'tradein'
+        ? `${baseLabel} (Pré-avaliação de troca)`
+        : purpose === 'financing'
+          ? `${baseLabel} (Simulação de financiamento)`
+          : baseLabel;
+
+  return {
+    purpose,
+    label: purposeLabel,
+    rawNumber: salesRaw,
+    normalizedNumber: normalizedSales,
+    isConfigured: Boolean(normalizedSales),
+  };
 }
 
 /**
@@ -89,7 +152,6 @@ export function extractHandoffContextFromMessages(
   leadName?: string | null,
   existingSummary?: string | null
 ): string {
-  // 1. If a saved commercial summary already exists, extract its Vehicle/Interest line
   if (existingSummary && existingSummary.trim()) {
     const match = existingSummary.match(
       /Ve[íi]culo\s*\/\s*Interesse:\*?\*?\s*([^\n]+)/i
@@ -103,7 +165,6 @@ export function extractHandoffContextFromMessages(
     }
   }
 
-  // 2. Scan recent substantive client messages (excluding pure name/phone triage turns)
   const clientTexts = messages
     .filter((m) => m.sender === 'cliente')
     .map((m) => {
@@ -121,7 +182,6 @@ export function extractHandoffContextFromMessages(
         !looksLikeShortNameOnly(txt, leadName)
     );
 
-  // 3. Match any vehicle from real inventory mentioned by the visitor
   const combinedClientLower = clientTexts.join(' ').toLowerCase();
   const matchedVehicle = vehicles.find((v) => {
     const model = v.model.trim().toLowerCase();
@@ -137,10 +197,13 @@ export function extractHandoffContextFromMessages(
     intents.push('simulação de financiamento');
   }
   if (/troca|usado|avaliar|meu carro|dar na troca/i.test(combinedClientLower)) {
-    intents.push('avaliação de troca');
+    intents.push('pré-avaliação de troca');
   }
-  if (/visita|agend|showroom|test.?drive|ver o carro|pessoalmente/i.test(combinedClientLower)) {
-    intents.push('agendamento de visita');
+  if (
+    /(?:agendar|marcar|solicitar)\s+(?:uma\s+)?visita|test.?drive/i.test(combinedClientLower) &&
+    !/n[ãa]o\s+agend|sem\s+agend/i.test(combinedClientLower)
+  ) {
+    intents.push('solicitação de visita');
   }
   if (/fipe|desconto|proposta|negoci|à vista|a vista/i.test(combinedClientLower)) {
     intents.push('proposta comercial');
@@ -168,25 +231,27 @@ export function extractHandoffContextFromMessages(
     return intents.slice(0, 2).join(' e ');
   }
 
-  return 'opções de estoque e simulação de atendimento';
+  return 'dúvidas sobre veículos do estoque';
 }
 
 /**
- * Lightweight local intent detector (zero AI tokens) to surface the green
- * "Falar com Consultor no WhatsApp" card whenever the visitor asks for a human,
- * direct negotiation, visit scheduling, or financing simulation.
+ * Lightweight local intent detector (zero AI tokens).
+ * Respects explicit "não agende" / exploratory hours questions so they NEVER trigger handoff cards.
  */
 export function detectHumanHandoffIntent(text: string): boolean {
   const clean = (text || '').trim();
   if (!clean) return false;
+  if (/n[ãa]o\s+(?:agende|quero\s+agendar|precisa\s+agendar)|sem\s+agendar/i.test(clean)) {
+    return false;
+  }
   return /(falar\s+com\s+(?:um\s+)?(?:consultor|vendedor|atendente|humano|gerente)|atendimento\s+humano|quero\s+(?:agendar|visitar|negociar|fechar|falar\s+no\s+whats)|agendar\s+(?:uma\s+)?visita|test[\s-]?drive|whats\s*app|solicitar\s+(?:uma\s+)?simula|negocia[çc][ãa]o\s+direta|passar\s+(?:pro|para\s+o)\s+vendedor)/i.test(
     clean
   );
 }
 
 /**
- * Assembles the pre-filled WhatsApp message and `https://wa.me/{phone}?text=...` link
- * purely from existing session data — zero API cost, zero Gemini tokens.
+ * Assembles the pre-filled WhatsApp message and `https://wa.me/{phone}?text=...` link.
+ * Customer personal contact data (name/phone) is included ONLY when `includeContactData` is true.
  */
 export function buildWhatsAppHandoffUrl(
   params: WhatsAppHandoffParams
@@ -195,29 +260,45 @@ export function buildWhatsAppHandoffUrl(
     params.storeWhatsappNumber
   );
   const storeName = (params.storeName || 'Armazém do Carro').trim();
-  const cleanName = (params.leadName || '').trim();
-  const cleanPhone = (params.leadPhone || '').trim();
+  const includeContact = Boolean(params.includeContactData);
+  const cleanName = includeContact ? (params.leadName || '').trim() : '';
+  const cleanPhone = includeContact ? (params.leadPhone || '').trim() : '';
   const shortRef = formatSessionShortId(params.sessionId);
+  const purpose: HandoffPurpose = params.purpose || 'sales';
+  const destinationLabel =
+    (params.destinationLabel || '').trim() ||
+    (purpose === 'financing' ? 'Financeiro / Simulação' : 'Consultor de Vendas');
 
-  const contextSummary = (
+  const rawContext =
     params.contextSummary?.trim() ||
+    (params.vehicleLabel ? `${params.vehicleLabel}` : '') ||
     extractHandoffContextFromMessages(
       params.messages,
       params.vehicles,
-      cleanName,
+      params.leadName,
       params.existingSummary
-    )
-  ).slice(0, 140);
+    );
+  const contextSummary = rawContext.slice(0, 140);
 
   const identityPart = cleanName
     ? cleanPhone
-      ? `Olá! Sou ${cleanName} (WhatsApp: ${cleanPhone}).`
+      ? `Olá! Sou ${cleanName} (${cleanPhone}).`
       : `Olá! Sou ${cleanName}.`
     : cleanPhone
-      ? `Olá! Meu WhatsApp é ${cleanPhone}.`
+      ? `Olá! Meu contato é ${cleanPhone}.`
       : 'Olá!';
 
-  const text = `${identityPart} Vim pelo atendimento virtual do ${storeName} e gostaria de continuar minha simulação/atendimento sobre: ${contextSummary}. (Ref: #${shortRef})`;
+  const actionLine =
+    purpose === 'visit'
+      ? `Gostaria de solicitar um horário de visita sobre: ${contextSummary}.`
+      : purpose === 'financing'
+        ? `Gostaria de solicitar uma simulação de financiamento para: ${contextSummary}.`
+        : purpose === 'tradein'
+          ? `Gostaria de continuar a pré-avaliação de troca sobre: ${contextSummary}.`
+          : `Vim pelo atendimento do ${storeName} e gostaria de falar sobre: ${contextSummary}.`;
+
+  const refPart = params.sessionId ? ` (Ref: #${shortRef})` : '';
+  const text = `${identityPart} ${actionLine}${refPart}`.trim();
 
   const url = normalizedStorePhone
     ? `https://wa.me/${normalizedStorePhone}?text=${encodeURIComponent(text)}`
@@ -229,5 +310,8 @@ export function buildWhatsAppHandoffUrl(
     shortRef,
     normalizedStorePhone,
     contextSummary,
+    destinationLabel,
+    purpose,
   };
 }
+

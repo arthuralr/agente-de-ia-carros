@@ -12,8 +12,9 @@ import {
   ChevronRight,
   Copy,
   Download,
-  ExternalLink,
   FileText,
+  Filter,
+  GitCompareArrows,
   Headset,
   Image as ImageIcon,
   Loader2,
@@ -28,7 +29,6 @@ import {
   Send,
   ShieldCheck,
   Trash2,
-  UserCheck,
   UserPlus,
   Wallet,
   X,
@@ -40,11 +40,13 @@ import {
   DealershipSettings,
   Lead,
   Vehicle,
+  VehicleCardData,
 } from '../../types';
 import { formatBrazilianPhone } from '../../utils/chatTags';
 import {
   buildWhatsAppHandoffUrl,
   detectHumanHandoffIntent,
+  HandoffPurpose,
 } from '../../utils/whatsappHandoff';
 import {
   AUDIO_CAPTURE_CONSTRAINTS,
@@ -58,10 +60,17 @@ import {
   prepareChatAttachment,
   stripMarkdownForPreview,
 } from '../../utils/chatMedia';
+import { formatBrlCurrency, formatKmBr } from '../../utils/vehicleDomain';
 import { useVirtualConsultant } from '../../hooks/useVirtualConsultant';
 import { useWebPush } from '../../hooks/useWebPush';
 import { ChatMarkdown } from './ChatMarkdown';
+import {
+  ChatComparisonBlock,
+  ChatFinancingBlock,
+  ChatVehicleCards,
+} from './ChatVehicleCards';
 import { PWAInstallBanner } from './PWAInstallBanner';
+import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 
 interface StandaloneChatPageProps {
   vehicles: Vehicle[];
@@ -71,6 +80,7 @@ interface StandaloneChatPageProps {
   onCaptureLead: (lead: Lead) => Promise<Lead>;
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
   onOpenCatalog: () => void;
+  onOpenVehicleSheet?: (vehicleId: string) => void;
   onOpenPrivacy?: () => void;
 }
 
@@ -82,6 +92,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   onCaptureLead,
   onSyncLeadChat,
   onOpenCatalog,
+  onOpenVehicleSheet,
   onOpenPrivacy,
 }) => {
   // Permite personalização leve via query string (ex.: ?loja=Parceiro) para uso B2B em links externos
@@ -113,10 +124,20 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
-  const [manualHandoffCardOpen, setManualHandoffCardOpen] = useState(false);
   const [handoffTrackedRef, setHandoffTrackedRef] = useState<string | null>(
     null
   );
+  const [handoffModalState, setHandoffModalState] = useState<{
+    isOpen: boolean;
+    purpose: HandoffPurpose;
+    vehicleLabel?: string | null;
+    contextSummary?: string | null;
+  }>({
+    isOpen: false,
+    purpose: 'sales',
+    vehicleLabel: null,
+    contextSummary: null,
+  });
   const [pushBannerDismissed, setPushBannerDismissed] = useState<boolean>(() => {
     try {
       return (
@@ -175,6 +196,14 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     hasStreamFirstToken,
     errorMsg,
     setErrorMsg,
+    canRetry,
+    retryLastMessage,
+    activeFilters,
+    clearActiveFilters,
+    compareVehicleIds,
+    toggleCompareVehicle,
+    clearCompareVehicles,
+    compareSelectedVehicles,
     customerName,
     setCustomerName,
     customerWhatsapp,
@@ -206,6 +235,10 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   });
 
   const isTriageComplete = triageStage === 'complete';
+  const userMessageCount = useMemo(
+    () => messages.filter((m) => m.sender === 'cliente').length,
+    [messages]
+  );
 
   const visitorPush = useWebPush({
     role: 'visitor',
@@ -229,9 +262,11 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   };
 
   const effectiveStoreWhatsapp =
-    storeWhatsappNumber?.trim() || effectiveSettings.whatsapp;
+    effectiveSettings.salesWhatsapp?.trim() ||
+    storeWhatsappNumber?.trim() ||
+    effectiveSettings.whatsapp;
 
-  // Assemble direct wa.me handoff link purely from captured session state (ZERO AI tokens)
+  // Assemble direct wa.me handoff preview purely from captured session state (ZERO AI tokens)
   const handoffData = useMemo(
     () =>
       buildWhatsAppHandoffUrl({
@@ -239,6 +274,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
         storeName: effectiveSettings.tradeName,
         leadName: customerName,
         leadPhone: customerWhatsapp,
+        includeContactData: false,
         sessionId,
         messages,
         vehicles,
@@ -254,22 +290,48 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     ]
   );
 
-  // Trigger 2 (automatic): detect when visitor asks for human consultant, visit, negotiation, or simulation
+  // Detect when visitor explicitly requests a consultant, financing, or visit (never for non-scheduling inquiries)
+  const lastAiMessage = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].sender === 'ia') return messages[i];
+    }
+    return null;
+  }, [messages]);
+
   const autoHandoffDetected = useMemo(() => {
     if (!isTriageComplete) return false;
-    const recentClientMsgs = messages
-      .filter((m) => m.sender === 'cliente')
-      .slice(-4);
-    return recentClientMsgs.some((m) =>
-      detectHumanHandoffIntent(m.text || m.audio?.transcription || '')
+    if (lastAiMessage?.suppressHandoff || lastAiMessage?.isVisitInquiryOnly) {
+      return false;
+    }
+    const lastClientMsg = [...messages]
+      .reverse()
+      .find((m) => m.sender === 'cliente');
+    if (!lastClientMsg) return false;
+    return detectHumanHandoffIntent(
+      lastClientMsg.text || lastClientMsg.audio?.transcription || ''
     );
-  }, [isTriageComplete, messages]);
+  }, [isTriageComplete, lastAiMessage, messages]);
 
-  const showInlineHandoffCard =
-    isTriageComplete && (manualHandoffCardOpen || autoHandoffDetected);
+  const openHandoffPreview = (
+    purpose: HandoffPurpose = 'sales',
+    vehicleLabel?: string | null,
+    contextSummary?: string | null
+  ) => {
+    setHandoffModalState({
+      isOpen: true,
+      purpose,
+      vehicleLabel: vehicleLabel ?? null,
+      contextSummary: contextSummary ?? null,
+    });
+  };
 
-  // Register handoff in Neon PostgreSQL + auto-create/update CRM card without blocking link navigation
-  const handleTrackWhatsAppHandoff = () => {
+  // Register handoff in Neon PostgreSQL only when the user confirms inside the preview modal
+  const handleTrackWhatsAppHandoff = (payload?: {
+    purpose: HandoffPurpose;
+    text: string;
+    destinationPhone: string;
+    includeContactData: boolean;
+  }) => {
     setHandoffTrackedRef(handoffData.shortRef);
     void fetch('/api/chat/whatsapp-handoff', {
       method: 'POST',
@@ -277,9 +339,16 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       keepalive: true,
       body: JSON.stringify({
         sessionId,
-        leadName: customerName.trim() || undefined,
-        leadPhone: customerWhatsapp.trim() || undefined,
-        contextSummary: handoffData.contextSummary,
+        leadName:
+          payload?.includeContactData && customerName.trim()
+            ? customerName.trim()
+            : undefined,
+        leadPhone:
+          payload?.includeContactData && customerWhatsapp.trim()
+            ? customerWhatsapp.trim()
+            : undefined,
+        contextSummary:
+          handoffModalState.contextSummary || handoffData.contextSummary,
         origem: '/chat',
         storeName: effectiveSettings.tradeName,
       }),
@@ -288,20 +357,63 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     });
   };
 
-  // Trigger 1: "Solicitar uma Simulação" header CTA
-  const handleTriggerSimulationHandoff = () => {
-    if (isTriageComplete) {
-      setManualHandoffCardOpen(true);
-      window.setTimeout(() => {
-        handoffCardRef.current?.scrollIntoView({
-          behavior: 'smooth',
-          block: 'center',
-        });
-      }, 60);
-    } else {
-      setLeadPanelOpen((prev) => !prev);
+  const handleOpenVehicleCardSheet = (card: VehicleCardData) => {
+    if (onOpenVehicleSheet) {
+      onOpenVehicleSheet(card.id);
+      return;
+    }
+    window.history.pushState({}, '', `/veiculo/${encodeURIComponent(card.id)}`);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  };
+
+  const handleInternalLinkNavigate = (href: string) => {
+    const match = href.match(/\/veiculo\/([^/?#]+)/i);
+    if (match && match[1]) {
+      if (onOpenVehicleSheet) {
+        onOpenVehicleSheet(decodeURIComponent(match[1]));
+      } else {
+        window.history.pushState({}, '', href);
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      }
     }
   };
+
+  const handleTriggerPhotoAttach = () => {
+    setAttachMenuOpen(false);
+    setMediaError(null);
+    imageInputRef.current?.click();
+  };
+
+  const activeFilterChips = useMemo(() => {
+    const chips: string[] = [];
+    if (activeFilters.transmission) {
+      chips.push(
+        activeFilters.transmission === 'automatico' ? 'Automático' : 'Manual'
+      );
+    }
+    if (activeFilters.maxPrice) {
+      chips.push(`Até ${formatBrlCurrency(activeFilters.maxPrice)}`);
+    }
+    if (activeFilters.minPrice) {
+      chips.push(`A partir de ${formatBrlCurrency(activeFilters.minPrice)}`);
+    }
+    if (activeFilters.maxKm) {
+      chips.push(`Até ${formatKmBr(activeFilters.maxKm)}`);
+    }
+    if (activeFilters.minYear) {
+      chips.push(`Ano ${activeFilters.minYear}+`);
+    }
+    if (activeFilters.brand) {
+      chips.push(activeFilters.brand);
+    }
+    if (activeFilters.model) {
+      chips.push(activeFilters.model);
+    }
+    if (activeFilters.belowFipeOnly) {
+      chips.push('Abaixo da FIPE');
+    }
+    return chips;
+  }, [activeFilters]);
 
   const sendRichMessageRef = useRef(sendRichMessage);
   useEffect(() => {
@@ -338,7 +450,6 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     setLightboxImage(null);
     setHeaderMenuOpen(false);
     setConfirmClearOpen(false);
-    setManualHandoffCardOpen(false);
     setHandoffTrackedRef(null);
     resetConversation();
   };
@@ -639,53 +750,37 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     {
       id: 'stock',
       icon: Car,
-      title: '🚗 Ver estoque e ofertas abaixo da FIPE',
-      subtitle: 'Modelos disponíveis hoje e economia na tabela oficial',
-      prompt:
-        'Quero ver o estoque disponível hoje e as melhores ofertas com comparativo da Tabela FIPE.',
+      title: 'Ver estoque disponível',
+      subtitle: 'Consultar modelos disponíveis com preço, ano, km e ficha',
+      prompt: 'Quais veículos vocês têm disponíveis no estoque hoje?',
+    },
+    {
+      id: 'automatic',
+      icon: Filter,
+      title: 'Buscar carro automático',
+      subtitle: 'Filtrar opções automáticas confirmadas no estoque real',
+      prompt: 'Quero ver opções de carros automáticos disponíveis no estoque.',
     },
     {
       id: 'finance',
       icon: Wallet,
-      title: '💰 Simular financiamento ou parcelas',
-      subtitle: 'Entrada, parcelas, taxas bancárias e carta de crédito',
-      prompt:
-        'Quero simular financiamento ou parcelas. Quais condições vocês trabalham?',
+      title: 'Simular financiamento',
+      subtitle: 'Calcular saldo a financiar com base na sua entrada e prazo',
+      prompt: 'Quero simular financiamento. Quais dados você precisa?',
     },
     {
       id: 'tradein',
       icon: RefreshCw,
-      title: '🔄 Avaliar meu carro na troca (enviar fotos)',
-      subtitle: 'Envie fotos do seu usado pelo clipe + para pré-avaliação',
-      prompt:
-        'Quero avaliar meu carro usado na troca. Quais dados e fotos devo enviar agora?',
+      title: 'Avaliar carro na troca',
+      subtitle: 'Informar dados do usado e anexar fotos para pré-avaliação',
+      prompt: 'Quero avaliar meu carro usado na troca.',
     },
     {
       id: 'visit',
       icon: CalendarClock,
-      title: '📍 Agendar visita / Falar com consultor',
-      subtitle: 'Showroom, horários de atendimento ou contato no WhatsApp',
-      prompt:
-        'Quero agendar uma visita no showroom ou falar com um consultor humano.',
-    },
-  ];
-
-  const quickChips = [
-    {
-      label: 'Ver modelos disponíveis',
-      prompt: 'Quais modelos vocês têm disponíveis no estoque hoje?',
-    },
-    {
-      label: 'Simular financiamento',
-      prompt: 'Como funciona o financiamento e quais as condições?',
-    },
-    {
-      label: 'Avaliar troca',
-      prompt: 'Vocês aceitam veículo usado na troca? Posso enviar fotos agora?',
-    },
-    {
-      label: 'Agendar visita',
-      prompt: 'Quais os horários e endereço para visita no showroom?',
+      title: 'Horários e endereço da loja',
+      subtitle: 'Ver showroom, funcionamento e como solicitar uma visita',
+      prompt: 'Qual o endereço e os horários de funcionamento da loja?',
     },
   ];
 
@@ -818,34 +913,31 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
         </form>
       )}
 
-      {/* Direct WhatsApp Handoff CTA inside Side Panel / Sheet */}
-      <div className="p-3.5 rounded-xl bg-[#E7FCEB] border border-[#25D366]/45 space-y-2.5">
+      {/* WhatsApp Handoff Preview CTA inside Side Panel / Sheet */}
+      <div className="p-3.5 rounded-xl bg-[#E7FCEB] border border-[#00A884]/35 space-y-2.5">
         <div>
           <p className="text-xs font-semibold text-[#075E54]">
-            Prefere falar agora no WhatsApp da loja?
+            Falar com consultor no WhatsApp
           </p>
           <p className="text-[11px] text-[#3B4A54] mt-0.5 leading-snug">
-            Já levamos seu nome, WhatsApp e o assunto{' '}
-            <strong className="text-[#111B21]">
-              ({handoffData.contextSummary})
-            </strong>{' '}
-            prontos para o consultor ·{' '}
+            Você revisa o texto e escolhe se deseja incluir seus dados antes de
+            abrir o WhatsApp ·{' '}
             <span className="font-mono text-[#075E54]">
               Ref #{handoffData.shortRef}
             </span>
           </p>
         </div>
-        <a
-          href={handoffData.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={handleTrackWhatsAppHandoff}
-          className="w-full min-h-[42px] py-2 px-3.5 rounded-xl text-xs font-semibold text-white bg-[#25D366] hover:bg-[#1EBE5D] shadow-xs transition-colors inline-flex items-center justify-center gap-2"
+        <button
+          type="button"
+          onClick={() => {
+            setLeadPanelOpen(false);
+            openHandoffPreview('sales');
+          }}
+          className="w-full min-h-[44px] py-2 px-3.5 rounded-xl text-xs font-semibold text-white bg-[#00A884] hover:bg-[#008F72] shadow-xs transition-colors inline-flex items-center justify-center gap-2 focus:outline-none focus:ring-2 focus:ring-[#00A884]"
         >
           <MessageCircle className="w-4 h-4 shrink-0" />
-          <span>Falar com Consultor no WhatsApp</span>
-          <ExternalLink className="w-3.5 h-3.5 shrink-0 opacity-90" />
-        </a>
+          <span>Revisar mensagem e abrir WhatsApp</span>
+        </button>
       </div>
 
       {/* Dealership Assurance Info */}
@@ -962,134 +1054,104 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </div>
             </div>
 
-            {/* Header Right Actions */}
-            <div className="flex items-center gap-1 shrink-0">
-              {/* Trigger 3: Always-accessible discreet WhatsApp Handoff quick button */}
-              <a
-                href={handoffData.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={handleTrackWhatsAppHandoff}
-                aria-label="Falar com Consultor no WhatsApp"
-                title={`Falar com Consultor no WhatsApp (Ref #${handoffData.shortRef})`}
-                className="min-h-[38px] px-2.5 sm:px-3 rounded-full bg-[#25D366] hover:bg-[#1EBE5D] text-[#052E16] text-xs font-semibold shadow-xs transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+            {/* Header Right Actions: Single Primary Consultant CTA + Compact Overflow Menu */}
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => openHandoffPreview('sales')}
+                aria-label="Falar com consultor no WhatsApp"
+                className="min-h-[40px] px-3 sm:px-3.5 rounded-full bg-[#25D366] hover:bg-[#1EBE5D] text-[#052E16] text-xs font-semibold shadow-xs transition-colors inline-flex items-center gap-1.5 whitespace-nowrap focus:outline-none focus:ring-2 focus:ring-white"
               >
                 <MessageCircle className="w-4 h-4 shrink-0" />
-                <span className="hidden md:inline">WhatsApp</span>
-              </a>
-
-              {/* Trigger 1: Solicitar uma Simulação */}
-              <button
-                type="button"
-                onClick={handleTriggerSimulationHandoff}
-                className={`min-h-[38px] px-2.5 sm:px-3 rounded-full text-xs font-medium transition-colors inline-flex items-center gap-1.5 whitespace-nowrap ${
-                  leadSaved
-                    ? 'bg-[#25D366]/20 text-[#D9FDD3] hover:bg-[#25D366]/30'
-                    : 'bg-white/12 text-white hover:bg-white/20'
-                }`}
-              >
-                {leadSaved ? (
-                  <>
-                    <UserCheck className="w-3.5 h-3.5 text-[#25D366]" />
-                    <span className="hidden sm:inline">Solicitar Simulação</span>
-                  </>
-                ) : (
-                  <>
-                    <UserPlus className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">
-                      Solicitar uma Simulação
-                    </span>
-                  </>
-                )}
+                <span className="hidden xs:inline sm:inline">Falar com consultor</span>
+                <span className="xs:hidden sm:hidden">Consultor</span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => void handleCopyShareLink()}
-                aria-label="Copiar link direto do atendimento"
-                title="Copiar link direto"
-                className="min-h-[40px] px-2.5 rounded-full text-xs font-medium text-white/90 hover:text-white hover:bg-white/10 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
-              >
-                {copiedLink ? (
-                  <>
-                    <Check className="w-4 h-4 text-[#25D366]" />
-                    <span className="hidden md:inline">Copiado</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-4 h-4" />
-                    <span className="hidden md:inline">Link</span>
-                  </>
-                )}
-              </button>
-
-              {/* Discreet Visitor Web Push Bell Icon (role = 'visitor') */}
-              <button
-                type="button"
-                disabled={visitorPush.isSubscribing}
-                onClick={() => void handleActivateVisitorPush()}
-                aria-label={
-                  visitorPush.isSubscribed
-                    ? 'Alertas push ativos'
-                    : 'Ativar notificações de respostas e novidades'
-                }
-                title={
-                  visitorPush.isSubscribed
-                    ? 'Alertas push ativos neste aparelho'
-                    : 'Ativar alertas de respostas e novidades'
-                }
-                className={`relative w-9 h-9 rounded-full transition-colors inline-flex items-center justify-center shrink-0 disabled:opacity-60 ${
-                  visitorPush.isSubscribed
-                    ? 'bg-[#25D366]/20 text-[#D9FDD3] hover:bg-[#25D366]/30'
-                    : 'text-white/90 hover:text-white hover:bg-white/10'
-                }`}
-              >
-                {visitorPush.isSubscribing ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : visitorPush.isSubscribed ? (
-                  <BellRing className="w-4 h-4 text-[#25D366]" />
-                ) : (
-                  <Bell className="w-4 h-4" />
-                )}
-              </button>
-
-              {/* Discreet WhatsApp-style Overflow Menu (Limpar / Nova conversa) */}
+              {/* Compact Overflow Menu */}
               <div className="relative">
                 <button
                   type="button"
                   onClick={() => setHeaderMenuOpen((prev) => !prev)}
-                  aria-label="Opções da conversa"
-                  title="Opções da conversa"
-                  className="w-9 h-9 rounded-full text-white/90 hover:text-white hover:bg-white/10 transition-colors inline-flex items-center justify-center"
+                  aria-label="Mais opções da conversa"
+                  aria-expanded={headerMenuOpen}
+                  className="w-10 h-10 rounded-full text-white/90 hover:text-white hover:bg-white/10 transition-colors inline-flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-white"
                 >
                   <MoreVertical className="w-4 h-4" />
                 </button>
 
                 {headerMenuOpen && (
-                  <div className="absolute right-0 top-[46px] z-40 w-60 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
-                    {!visitorPush.isSubscribed && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setHeaderMenuOpen(false);
-                          void handleActivateVisitorPush();
-                        }}
-                        className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-[#075E54] hover:bg-[#E7FCEB] flex items-center gap-2.5 transition-colors border-b border-[#E9EDEF]"
-                      >
-                        <Bell className="w-3.5 h-3.5 text-[#00A884] shrink-0" />
-                        <span>Ativar alertas de respostas</span>
-                      </button>
-                    )}
+                  <div className="absolute right-0 top-[48px] z-40 w-64 bg-white text-[#111B21] rounded-xl shadow-xl border border-[#D1D7DB] py-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMenuOpen(false);
+                        setLeadPanelOpen(true);
+                      }}
+                      className="w-full min-h-[42px] px-3.5 py-2 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors border-b border-[#E9EDEF]"
+                    >
+                      <UserPlus className="w-4 h-4 text-[#008069] shrink-0" />
+                      <span>
+                        {leadSaved
+                          ? 'Ver dados informados'
+                          : 'Deixar contato para retorno'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMenuOpen(false);
+                        void handleCopyShareLink();
+                      }}
+                      className="w-full min-h-[42px] px-3.5 py-2 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors border-b border-[#E9EDEF]"
+                    >
+                      {copiedLink ? (
+                        <Check className="w-4 h-4 text-[#00A884] shrink-0" />
+                      ) : (
+                        <Copy className="w-4 h-4 text-[#54656F] shrink-0" />
+                      )}
+                      <span>
+                        {copiedLink
+                          ? 'Link copiado!'
+                          : 'Copiar link do atendimento'}
+                      </span>
+                    </button>
+
+                    {visitorPush.isSupported &&
+                      visitorPush.permission !== 'denied' &&
+                      visitorPush.vapidConfigured !== false && (
+                        <button
+                          type="button"
+                          disabled={visitorPush.isSubscribing}
+                          onClick={() => {
+                            setHeaderMenuOpen(false);
+                            void handleActivateVisitorPush();
+                          }}
+                          className="w-full min-h-[42px] px-3.5 py-2 text-left text-xs font-medium text-[#075E54] hover:bg-[#E7FCEB] flex items-center gap-2.5 transition-colors border-b border-[#E9EDEF] disabled:opacity-50"
+                        >
+                          {visitorPush.isSubscribed ? (
+                            <BellRing className="w-4 h-4 text-[#00A884] shrink-0" />
+                          ) : (
+                            <Bell className="w-4 h-4 text-[#00A884] shrink-0" />
+                          )}
+                          <span>
+                            {visitorPush.isSubscribed
+                              ? 'Alertas push ativos'
+                              : 'Ativar alertas de respostas'}
+                          </span>
+                        </button>
+                      )}
+
                     <button
                       type="button"
                       onClick={() => {
                         setHeaderMenuOpen(false);
                         setConfirmClearOpen(true);
                       }}
-                      className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors"
+                      className="w-full min-h-[42px] px-3.5 py-2 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors"
                     >
-                      <RotateCcw className="w-3.5 h-3.5 text-[#54656F] shrink-0" />
-                      <span>Nova conversa / Trocar usuário</span>
+                      <RotateCcw className="w-4 h-4 text-[#54656F] shrink-0" />
+                      <span>Nova conversa / Limpar histórico</span>
                     </button>
                   </div>
                 )}
@@ -1103,8 +1165,8 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             appName={effectiveSettings.tradeName}
           />
 
-          {/* Light Post-Triage Visitor Web Push Opt-In Banner (role = 'visitor') */}
-          {isTriageComplete &&
+          {/* Subtle Visitor Web Push Opt-In Banner (deferred until user engages deeply, never blocking initial search) */}
+          {userMessageCount >= 3 &&
             !visitorPush.isSubscribed &&
             !pushBannerDismissed &&
             visitorPush.isSupported &&
@@ -1116,7 +1178,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     <Bell className="w-3.5 h-3.5" />
                   </span>
                   <p className="text-[11.5px] text-[#3B4A54] leading-snug truncate">
-                    Ative alertas para ser avisado quando o consultor responder ou enviar novidades.
+                    Quer ser avisado se um consultor responder por aqui?
                   </p>
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
@@ -1126,13 +1188,13 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     onClick={() => void handleActivateVisitorPush()}
                     className="px-2.5 py-1.5 rounded-full bg-[#00A884] hover:bg-[#008F72] text-white text-[11px] font-semibold transition-colors whitespace-nowrap disabled:opacity-60"
                   >
-                    {visitorPush.isSubscribing ? 'Ativando...' : 'Ativar alertas'}
+                    {visitorPush.isSubscribing ? 'Ativando...' : 'Ativar'}
                   </button>
                   <button
                     type="button"
                     onClick={handleDismissPushBanner}
                     aria-label="Dispensar convite de alertas"
-                    className="w-6 h-6 rounded-full hover:bg-black/5 text-[#667781] flex items-center justify-center"
+                    className="w-7 h-7 rounded-full hover:bg-black/5 text-[#667781] flex items-center justify-center"
                   >
                     <X className="w-3.5 h-3.5" />
                   </button>
@@ -1210,42 +1272,30 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
           {/* Scrollable Messages Area (#EFEAE2 Wallpaper) */}
           <div
-            className="flex-1 overflow-y-auto wa-chat-wallpaper px-3 sm:px-6 lg:px-10 py-4 space-y-2.5"
+            className="flex-1 overflow-y-auto overflow-x-hidden wa-chat-wallpaper px-2.5 sm:px-6 lg:px-10 py-4 space-y-2.5"
             onClick={() => {
               if (attachMenuOpen) setAttachMenuOpen(false);
               if (headerMenuOpen) setHeaderMenuOpen(false);
             }}
           >
-            {/* Classic Date Divider */}
-            <div className="flex justify-center pb-1">
-              <span className="px-3 py-1 rounded-lg bg-white/90 shadow-[0_1px_1px_rgba(11,20,26,0.1)] text-[11px] font-medium text-[#54656F] uppercase tracking-wide">
-                Hoje
-              </span>
-            </div>
-
             {/* Official Channel Notice */}
-            <div className="flex justify-center pb-2">
+            <div className="flex justify-center pb-1.5">
               <p className="max-w-md text-center px-3.5 py-1.5 rounded-lg bg-[#FFF5C4]/95 shadow-[0_1px_1px_rgba(11,20,26,0.08)] text-[11.5px] text-[#54656F] leading-snug">
-                Canal oficial de atendimento da{' '}
+                Atendimento online da{' '}
                 <strong className="text-[#111B21]">
                   {effectiveSettings.tradeName}
                 </strong>
-                . Estoque atualizado em tempo real · Responda qualquer mensagem
-                ou envie texto, áudio, fotos e PDF.
+                . Consulte o estoque real, fichas, financiamento ou envie fotos
+                do seu usado.
               </p>
             </div>
 
             {(() => {
               let activeMenuBubbleIdx = -1;
-              if (isTriageComplete) {
+              if (isTriageComplete && userMessageCount === 0) {
                 for (let i = messages.length - 1; i >= 0; i--) {
                   const candidate = messages[i];
-                  if (
-                    candidate.sender === 'ia' &&
-                    (candidate.id.startsWith('msg-ia-triage-complete') ||
-                      candidate.id.startsWith('msg-ia-return-welcome') ||
-                      candidate.id.startsWith('msg-ia-welcome'))
-                  ) {
+                  if (candidate.sender === 'ia') {
                     activeMenuBubbleIdx = i;
                     break;
                   }
@@ -1254,7 +1304,16 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               return messages.map((msg, index) => {
                 const isAi = msg.sender === 'ia';
                 const isWelcomeBubble =
-                  isTriageComplete && index === activeMenuBubbleIdx;
+                  isTriageComplete &&
+                  userMessageCount === 0 &&
+                  index === activeMenuBubbleIdx;
+                const isLatestAiMessage =
+                  isAi &&
+                  index ===
+                    messages.reduce(
+                      (acc, item, idx) => (item.sender === 'ia' ? idx : acc),
+                      -1
+                    );
                 const isImageAttachment =
                   msg.attachment?.mimeType.startsWith('image/');
                 const isPdfAttachment =
@@ -1302,7 +1361,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     )}
 
                     <div
-                      className={`relative max-w-[85%] sm:max-w-[76%] lg:max-w-[70%] px-3 pt-2 pb-1.5 shadow-[0_1px_1px_rgba(11,20,26,0.13)] ${
+                      className={`relative min-w-0 break-words max-w-[92%] sm:max-w-[82%] lg:max-w-[76%] px-3 pt-2 pb-1.5 shadow-[0_1px_1px_rgba(11,20,26,0.13)] ${
                         isAi
                           ? 'bg-white text-[#111B21] rounded-lg rounded-tl-none ml-2'
                           : 'bg-[#D9FDD3] text-[#111B21] rounded-lg rounded-tr-none mr-2'
@@ -1492,7 +1551,76 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                             content={msg.text}
                             variant={isAi ? 'ai' : 'user'}
                             theme="whatsapp"
+                            onNavigateInternal={handleInternalLinkNavigate}
                           />
+                        </div>
+                      )}
+
+                      {/* Rich Vehicle Cards (up to 3 per response) */}
+                      {isAi && msg.vehicleCards && msg.vehicleCards.length > 0 && (
+                        <ChatVehicleCards
+                          cards={msg.vehicleCards}
+                          selectedCompareIds={compareVehicleIds}
+                          onOpenSheet={handleOpenVehicleCardSheet}
+                          onToggleCompare={(card) => toggleCompareVehicle(card.id)}
+                          onSimulate={(card) =>
+                            sendQuickPrompt(
+                              `Quero simular financiamento do ${card.brand} ${card.model} ${card.year}`
+                            )
+                          }
+                        />
+                      )}
+
+                      {/* Side-by-Side Vehicle Comparison */}
+                      {isAi && msg.comparison && (
+                        <ChatComparisonBlock
+                          comparison={msg.comparison}
+                          onOpenSheet={handleOpenVehicleCardSheet}
+                        />
+                      )}
+
+                      {/* Deterministic Financing Balance Summary */}
+                      {isAi && msg.financingSummary && (
+                        <ChatFinancingBlock summary={msg.financingSummary} />
+                      )}
+
+                      {/* Direct Photo Attachment CTA for Trade-In */}
+                      {isAi && msg.promptAttachPhotos && (
+                        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={isSending || isProcessingFile}
+                            onClick={handleTriggerPhotoAttach}
+                            className="inline-flex items-center justify-center gap-2 px-3.5 py-2 min-h-[42px] rounded-xl bg-[#00A884] hover:bg-[#008F72] text-white text-xs font-semibold shadow-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[#00A884] disabled:opacity-50"
+                          >
+                            <Camera className="w-4 h-4 shrink-0" />
+                            <span>Anexar fotos do meu carro</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              openHandoffPreview('tradein', null, 'Avaliação de troca')
+                            }
+                            className="inline-flex items-center justify-center gap-1.5 px-3 py-2 min-h-[42px] rounded-xl border border-[#D1D7DB] bg-[#F8F9FA] hover:bg-[#EFEAE2] text-[#111B21] text-xs font-medium transition-colors"
+                          >
+                            <MessageCircle className="w-3.5 h-3.5 text-[#008069]" />
+                            <span>Falar com consultor</span>
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Recoverable Stock Query Error Retry */}
+                      {isAi && msg.stockQueryError && canRetry && (
+                        <div className="mt-2.5">
+                          <button
+                            type="button"
+                            disabled={isSending}
+                            onClick={() => retryLastMessage()}
+                            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[40px] rounded-lg bg-[#075E54] hover:bg-[#064E46] text-white text-xs font-semibold transition-colors disabled:opacity-50"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            <span>Tentar novamente</span>
+                          </button>
                         </div>
                       )}
 
@@ -1524,54 +1652,85 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                     )}
                   </div>
 
-                  {/* Interactive Structured Welcome Menu right below initial greeting */}
+                  {/* Opening Shortcuts Menu (shown ONLY before first user message) */}
                   {isWelcomeBubble && (
                     <div className="flex justify-start pl-2">
-                      <div className="w-full max-w-[88%] sm:max-w-[76%] lg:max-w-[460px] bg-white rounded-xl shadow-[0_1px_2px_rgba(11,20,26,0.14)] overflow-hidden border border-black/[0.05]">
-                        <div className="px-3.5 py-2.5 bg-[#F0F2F5] border-b border-[#E9EDEF] flex items-center justify-between gap-2">
+                      <div className="w-full max-w-[92%] sm:max-w-[78%] lg:max-w-[460px] bg-white rounded-xl shadow-[0_1px_2px_rgba(11,20,26,0.14)] overflow-hidden border border-black/[0.05]">
+                        <div className="px-3.5 py-2 bg-[#F0F2F5] border-b border-[#E9EDEF] flex items-center justify-between gap-2">
                           <span className="text-[11px] font-semibold uppercase tracking-wider text-[#075E54]">
-                            Menu Rápido de Atendimento
+                            Como posso ajudar?
                           </span>
                           <span className="text-[11px] text-[#667781]">
-                            Toque ou pergunte livremente
+                            Toque ou digite livremente
                           </span>
                         </div>
                         <div className="divide-y divide-[#E9EDEF]">
-                          {interactiveWelcomeOptions.map((opt) => (
-                            <button
-                              key={opt.id}
-                              type="button"
-                              disabled={isSending}
-                              onClick={() => {
-                                if (opt.id === 'visit') {
-                                  setManualHandoffCardOpen(true);
-                                }
-                                sendQuickPrompt(opt.prompt);
-                              }}
-                              className="w-full text-left px-3.5 py-2.5 hover:bg-[#F5F6F6] active:bg-[#E7FCEB] transition-colors flex items-center justify-between gap-3 disabled:opacity-50"
-                            >
-                              <div className="min-w-0">
-                                <p className="text-[13.5px] font-semibold text-[#111B21] leading-snug">
-                                  {opt.title}
-                                </p>
-                                <p className="text-[11.5px] text-[#667781] leading-snug mt-0.5">
-                                  {opt.subtitle}
-                                </p>
-                              </div>
-                              <ChevronRight className="w-4 h-4 text-[#00A884] shrink-0" />
-                            </button>
-                          ))}
-                        </div>
-                        <div className="px-3.5 py-2 bg-[#FAFAFA] border-t border-[#E9EDEF] text-[11px] text-[#54656F] leading-snug">
-                          Atendimento livre: digite qualquer dúvida, clique no{' '}
-                          <strong className="text-[#111B21]">microfone</strong>{' '}
-                          para mandar áudio ou no{' '}
-                          <strong className="text-[#111B21]">clipe</strong> para
-                          enviar fotos/PDF.
+                          {interactiveWelcomeOptions.map((opt) => {
+                            const IconComp = opt.icon;
+                            return (
+                              <button
+                                key={opt.id}
+                                type="button"
+                                disabled={isSending}
+                                onClick={() => sendQuickPrompt(opt.prompt)}
+                                className="w-full min-h-[48px] text-left px-3.5 py-2.5 hover:bg-[#F5F6F6] active:bg-[#E7FCEB] transition-colors flex items-center justify-between gap-3 disabled:opacity-50 focus:outline-none focus:bg-[#E7FCEB]"
+                              >
+                                <div className="flex items-start gap-2.5 min-w-0">
+                                  <IconComp className="w-4 h-4 text-[#008069] shrink-0 mt-0.5" />
+                                  <div className="min-w-0">
+                                    <p className="text-[13.5px] font-semibold text-[#111B21] leading-snug">
+                                      {opt.title}
+                                    </p>
+                                    <p className="text-[11.5px] text-[#667781] leading-snug mt-0.5">
+                                      {opt.subtitle}
+                                    </p>
+                                  </div>
+                                </div>
+                                <ChevronRight className="w-4 h-4 text-[#00A884] shrink-0" />
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
                     </div>
                   )}
+
+                  {/* Contextual Suggested Actions right below the latest assistant reply (after first turn) */}
+                  {isLatestAiMessage &&
+                    userMessageCount > 0 &&
+                    !isSending &&
+                    msg.suggestedActions &&
+                    msg.suggestedActions.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pl-2 pt-0.5">
+                        {msg.suggestedActions.slice(0, 3).map((action) => (
+                          <button
+                            key={action.id || action.label}
+                            type="button"
+                            onClick={() => {
+                              if (action.kind === 'attach_photos') {
+                                handleTriggerPhotoAttach();
+                              } else if (action.kind === 'handoff') {
+                                openHandoffPreview(
+                                  msg.financingSummary ? 'financing' : 'sales'
+                                );
+                              } else if (
+                                action.kind === 'open_sheet' &&
+                                action.vehicleId
+                              ) {
+                                handleInternalLinkNavigate(
+                                  action.sheetPath || `/veiculo/${action.vehicleId}`
+                                );
+                              } else if (action.promptText) {
+                                sendQuickPrompt(action.promptText);
+                              }
+                            }}
+                            className="min-h-[38px] px-3 py-1.5 rounded-full text-xs font-medium text-[#075E54] bg-white hover:bg-[#E7FCEB] border border-[#00A884]/35 shadow-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[#00A884]"
+                          >
+                            {action.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                 </div>
               );
             });
@@ -1593,20 +1752,20 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                   <span>
                     {isProcessingAudio
                       ? 'Transcrevendo e analisando áudio...'
-                      : 'Analisando e digitando resposta...'}
+                      : 'Consultando estoque e respondendo...'}
                   </span>
                 </div>
               </div>
             )}
 
-            {/* Smart Inline WhatsApp Handoff Card (Triggers 1 & 2, Zero AI Tokens) */}
-            {showInlineHandoffCard && (
+            {/* Contextual Consultant Handoff Card (only when visitor asks for consultant/visit/negotiation, NEVER on non-scheduling inquiries) */}
+            {autoHandoffDetected && !isSending && (
               <div ref={handoffCardRef} className="flex justify-start pl-2 pt-1">
-                <div className="w-full max-w-[90%] sm:max-w-[78%] lg:max-w-[460px] bg-white rounded-xl shadow-[0_2px_6px_rgba(11,20,26,0.14)] border border-[#25D366]/45 overflow-hidden">
-                  <div className="px-3.5 py-2.5 bg-[#E7FCEB] border-b border-[#25D366]/25 flex items-center justify-between gap-2">
+                <div className="w-full max-w-[92%] sm:max-w-[78%] lg:max-w-[460px] bg-white rounded-xl shadow-[0_2px_6px_rgba(11,20,26,0.14)] border border-[#00A884]/40 overflow-hidden">
+                  <div className="px-3.5 py-2.5 bg-[#E7FCEB] border-b border-[#00A884]/25 flex items-center justify-between gap-2">
                     <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold text-[#075E54]">
                       <MessageCircle className="w-4 h-4 text-[#00A884] shrink-0" />
-                      <span>Continuar no WhatsApp com Consultor</span>
+                      <span>Falar com consultor no WhatsApp</span>
                     </span>
                     <span className="text-[10.5px] font-mono text-[#075E54]/80 shrink-0">
                       Ref #{handoffData.shortRef}
@@ -1615,36 +1774,25 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
                   <div className="p-3.5 space-y-3">
                     <p className="text-xs text-[#3B4A54] leading-relaxed">
-                      Sua mensagem já vai preenchida com seus dados e o assunto{' '}
-                      <strong className="text-[#111B21]">
-                        {handoffData.contextSummary}
-                      </strong>{' '}
-                      para agilizar sua simulação ou visita na{' '}
-                      <strong className="text-[#111B21]">
-                        {effectiveSettings.tradeName}
-                      </strong>
-                      .
+                      Se preferir continuar com um consultor humano, você pode
+                      revisar a mensagem com o resumo do assunto antes de abrir
+                      o WhatsApp.
                     </p>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      <a
-                        href={handoffData.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={handleTrackWhatsAppHandoff}
-                        className="flex-1 min-w-[210px] min-h-[42px] px-4 py-2.5 rounded-xl bg-[#25D366] hover:bg-[#1EBE5D] text-white text-xs font-semibold shadow-xs transition-colors inline-flex items-center justify-center gap-2"
-                      >
-                        <MessageCircle className="w-4 h-4 shrink-0" />
-                        <span>Falar com Consultor no WhatsApp</span>
-                        <ExternalLink className="w-3.5 h-3.5 shrink-0 opacity-90" />
-                      </a>
-
                       <button
                         type="button"
-                        onClick={() => setLeadPanelOpen(true)}
-                        className="min-h-[42px] px-3 py-2 rounded-xl border border-[#D1D7DB] hover:bg-[#F0F2F5] text-[11.5px] font-medium text-[#3B4A54] transition-colors"
+                        onClick={() =>
+                          openHandoffPreview(
+                            lastAiMessage?.financingSummary
+                              ? 'financing'
+                              : 'sales'
+                          )
+                        }
+                        className="flex-1 min-w-[200px] min-h-[44px] px-4 py-2.5 rounded-xl bg-[#00A884] hover:bg-[#008F72] text-white text-xs font-semibold shadow-xs transition-colors inline-flex items-center justify-center gap-2 focus:outline-none focus:ring-2 focus:ring-[#00A884]"
                       >
-                        Dados / LGPD
+                        <MessageCircle className="w-4 h-4 shrink-0" />
+                        <span>Revisar e abrir WhatsApp</span>
                       </button>
                     </div>
                   </div>
@@ -1654,22 +1802,42 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
             {(errorMsg || mediaError) && (
               <div className="flex justify-center">
-                <div className="max-w-md p-3 rounded-lg bg-white border border-red-200 shadow-xs flex items-start gap-2.5 text-xs text-red-700">
+                <div className="max-w-md w-full p-3 rounded-lg bg-white border border-red-200 shadow-xs flex items-start gap-2.5 text-xs text-red-700">
                   <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                  <div className="space-y-1.5 flex-1">
-                    <p>{mediaError || errorMsg}</p>
-                    {errorMsg && (
-                      <a
-                        href={handoffData.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={handleTrackWhatsAppHandoff}
-                        className="inline-flex items-center gap-1.5 text-[#008069] hover:underline font-semibold"
-                      >
-                        <MessageCircle className="w-3.5 h-3.5" />
-                        <span>Falar com Consultor no WhatsApp</span>
-                      </a>
-                    )}
+                  <div className="space-y-2 flex-1 min-w-0">
+                    <p className="leading-relaxed">{mediaError || errorMsg}</p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {errorMsg && canRetry && (
+                        <button
+                          type="button"
+                          onClick={() => retryLastMessage()}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-semibold"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          <span>Tentar novamente</span>
+                        </button>
+                      )}
+                      {mediaError && (
+                        <button
+                          type="button"
+                          onClick={handleTriggerPhotoAttach}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#075E54] hover:bg-[#064E46] text-white text-xs font-semibold"
+                        >
+                          <Camera className="w-3.5 h-3.5" />
+                          <span>Selecionar outra foto</span>
+                        </button>
+                      )}
+                      {errorMsg && (
+                        <button
+                          type="button"
+                          onClick={() => openHandoffPreview('sales')}
+                          className="inline-flex items-center gap-1.5 text-[#008069] hover:underline font-semibold"
+                        >
+                          <MessageCircle className="w-3.5 h-3.5" />
+                          <span>Falar com consultor</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <button
                     type="button"
@@ -1678,7 +1846,7 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                       setErrorMsg(null);
                     }}
                     aria-label="Fechar aviso"
-                    className="text-red-500 hover:text-red-700 shrink-0"
+                    className="text-red-500 hover:text-red-700 shrink-0 p-1"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -1760,29 +1928,58 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </div>
             )}
 
-            {/* Horizontal Scrollable Quick Chips (only unlocked after 2-step triage & hidden during recording) */}
-            {!isRecording && isTriageComplete && (
-              <div className="px-3 sm:px-4 pt-2 pb-1 flex items-center gap-2 overflow-x-auto">
-                {quickChips.map((chip) => (
+            {/* Active Filters Bar (preserved across turns with 1-click clear) */}
+            {!isRecording && activeFilterChips.length > 0 && (
+              <div className="px-3 sm:px-4 pt-2 flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-1.5 overflow-x-auto min-w-0">
+                  <span className="text-[11px] font-semibold text-[#54656F] shrink-0">
+                    Filtros:
+                  </span>
+                  <span className="text-[11.5px] text-[#111B21] truncate">
+                    {activeFilterChips.join(' · ')}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={clearActiveFilters}
+                  className="text-[11.5px] font-semibold text-[#075E54] hover:underline whitespace-nowrap shrink-0 px-1.5 py-1"
+                >
+                  Limpar filtros
+                </button>
+              </div>
+            )}
+
+            {/* Selected Vehicles Comparison Tray */}
+            {!isRecording && compareVehicleIds.length > 0 && (
+              <div className="px-3 sm:px-4 pt-2 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <GitCompareArrows className="w-4 h-4 text-[#075E54] shrink-0" />
+                  <span className="text-xs text-[#111B21] truncate">
+                    {compareVehicleIds.length === 1
+                      ? '1 veículo selecionado para comparar (escolha mais 1)'
+                      : `${compareVehicleIds.length} veículos selecionados para comparar`}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {compareVehicleIds.length >= 2 && (
+                    <button
+                      type="button"
+                      disabled={isSending}
+                      onClick={() => compareSelectedVehicles()}
+                      className="min-h-[34px] px-3 py-1 rounded-lg bg-[#075E54] hover:bg-[#064E46] text-white text-xs font-semibold transition-colors whitespace-nowrap disabled:opacity-50"
+                    >
+                      Comparar ({compareVehicleIds.length})
+                    </button>
+                  )}
                   <button
-                    key={chip.label}
                     type="button"
-                    disabled={isSending}
-                    onClick={() => sendQuickPrompt(chip.prompt)}
-                    className="min-h-[34px] px-3 py-1 rounded-full text-xs font-medium text-[#111B21] bg-white hover:bg-[#E7FCEB] hover:text-[#075E54] border border-[#D1D7DB] shadow-[0_1px_1px_rgba(11,20,26,0.06)] transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+                    onClick={clearCompareVehicles}
+                    aria-label="Limpar seleção de comparação"
+                    className="min-h-[34px] px-2 py-1 rounded-lg text-xs text-[#54656F] hover:bg-black/5"
                   >
-                    {chip.label}
+                    Limpar
                   </button>
-                ))}
-                {!leadSaved && (
-                  <button
-                    type="button"
-                    onClick={() => setLeadPanelOpen(true)}
-                    className="min-h-[34px] px-3 py-1 rounded-full text-xs font-semibold text-[#075E54] bg-[#D9FDD3] hover:bg-[#C7F5C0] border border-[#00A884]/30 transition-colors whitespace-nowrap shrink-0"
-                  >
-                    Deixar meu WhatsApp
-                  </button>
-                )}
+                </div>
               </div>
             )}
 
@@ -1900,18 +2097,14 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
 
                 <input
                   ref={textInputRef}
-                  type={triageStage === 'ask_phone' ? 'tel' : 'text'}
-                  inputMode={triageStage === 'ask_phone' ? 'tel' : 'text'}
+                  type="text"
+                  inputMode="text"
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   placeholder={
-                    triageStage === 'ask_name'
-                      ? 'Digite seu nome...'
-                      : triageStage === 'ask_phone'
-                        ? 'Digite seu WhatsApp com DDD (ex: 11 99999-9999)...'
-                        : pendingAttachment
-                          ? 'Adicione uma legenda opcional ou envie...'
-                          : 'Mensagem'
+                    pendingAttachment
+                      ? 'Adicione uma legenda opcional ou envie...'
+                      : 'Digite sua mensagem...'
                   }
                   className="flex-1 min-h-[44px] px-4 py-2 bg-white border border-transparent focus:border-[#00A884]/50 rounded-full text-[15px] text-[#111B21] placeholder:text-[#667781] shadow-[0_1px_1px_rgba(11,20,26,0.08)] focus:outline-none"
                 />
@@ -2075,6 +2268,24 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
         </div>
       )}
 
+      {/* WhatsApp Handoff Preview Modal (user reviews message & opt-in before opening WhatsApp) */}
+      <WhatsAppHandoffModal
+        isOpen={handoffModalState.isOpen}
+        onClose={() =>
+          setHandoffModalState((prev) => ({ ...prev, isOpen: false }))
+        }
+        settings={effectiveSettings}
+        fallbackWhatsapp={storeWhatsappNumber}
+        purpose={handoffModalState.purpose}
+        vehicleLabel={handoffModalState.vehicleLabel}
+        contextSummary={handoffModalState.contextSummary}
+        sessionId={sessionId}
+        leadName={customerName}
+        leadPhone={customerWhatsapp}
+        messages={messages}
+        vehicles={vehicles}
+        onBeforeOpenWhatsApp={handleTrackWhatsAppHandoff}
+      />
     </div>
   );
 };

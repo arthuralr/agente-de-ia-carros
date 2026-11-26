@@ -1,4 +1,11 @@
-export type AppViewMode = 'catalog' | 'home' | 'chat' | 'privacy' | 'login' | 'admin';
+export type AppViewMode =
+  | 'catalog'
+  | 'home'
+  | 'chat'
+  | 'vehicle_detail'
+  | 'privacy'
+  | 'login'
+  | 'admin';
 
 export interface AdminUser {
   id: number;
@@ -34,6 +41,7 @@ export interface Vehicle {
   price: number;
   fipePrice: number;
   fipeCode?: string;
+  fipeReferenceMonth?: string | null;
   color: string;
   transmission: string;
   fuel: string;
@@ -92,6 +100,69 @@ export interface ChatAudioMeta {
 
 export type ChatTriageStage = 'ask_name' | 'ask_phone' | 'complete';
 
+export interface VehicleSearchFilters {
+  transmission?: 'automatico' | 'manual' | null;
+  maxPrice?: number | null;
+  minPrice?: number | null;
+  maxKm?: number | null;
+  minYear?: number | null;
+  brand?: string | null;
+  model?: string | null;
+  belowFipeOnly?: boolean | null;
+}
+
+export interface VehicleCardData {
+  id: string;
+  brand: string;
+  model: string;
+  version: string;
+  year: string;
+  price: number;
+  km: number;
+  status: VehicleStatus;
+  fuel: string;
+  transmission: string;
+  transmissionConfirmed: boolean;
+  transmissionConflictNote?: string | null;
+  imageUrl: string;
+  fipePrice: number | null;
+  fipeReferenceMonth: string | null;
+  fipeDiffBrl: number | null;
+  fipeDiffPct: number | null;
+  isConfirmedBelowFipeOffer: boolean;
+  sheetPath: string;
+  sheetUrl: string;
+  alternativeNote?: string | null;
+}
+
+export interface VehicleComparisonData {
+  vehicles: VehicleCardData[];
+  rows: Array<{ label: string; values: string[] }>;
+  highlights: string[];
+}
+
+export interface VehicleFinancingSummary {
+  vehicleId: string;
+  vehicleTitle: string;
+  vehiclePrice: number;
+  downPayment: number;
+  principalBalance: number;
+  months: number | null;
+  monthlyRatePct: number | null;
+  estimatedInstallment: number | null;
+  isIllustrativeOnly: boolean;
+  note: string;
+}
+
+export interface ChatSuggestedAction {
+  id: string;
+  label: string;
+  kind: 'prompt' | 'open_sheet' | 'compare' | 'attach_photos' | 'handoff';
+  promptText?: string;
+  vehicleId?: string;
+  sheetPath?: string;
+}
+
 export interface ChatMessage {
   id: string;
   sender: 'ia' | 'cliente';
@@ -104,6 +175,14 @@ export interface ChatMessage {
   senderLabel?: string;
   dbId?: number;
   broadcastId?: number;
+  vehicleCards?: VehicleCardData[];
+  comparison?: VehicleComparisonData | null;
+  financingSummary?: VehicleFinancingSummary | null;
+  promptAttachPhotos?: boolean;
+  suggestedActions?: ChatSuggestedAction[];
+  stockQueryError?: boolean;
+  isVisitInquiryOnly?: boolean;
+  suppressHandoff?: boolean;
 }
 
 export interface Lead {
@@ -225,6 +304,10 @@ export interface DealershipSettings {
   stateRegistration: string;
   phone: string;
   whatsapp: string;
+  salesWhatsapp?: string;
+  salesWhatsappLabel?: string;
+  financingWhatsapp?: string;
+  financingWhatsappLabel?: string;
   email: string;
   address: string;
   city: string;
@@ -237,4 +320,6 @@ export interface DealershipSettings {
   aiAssistantName: string;
   warrantyDays: number;
   warrantyKm: number;
+  financingMonthlyRatePct?: number | null;
+  logoUrl?: string;
 }
