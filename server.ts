@@ -43,8 +43,10 @@ import {
 } from './src/utils/webPushServer';
 import { mapDbVehicleToFrontend } from './src/db/mappers';
 import {
-  mergeDealershipConfig,
   DEFAULT_DEALERSHIP_CONFIG,
+  formatDealershipAddress,
+  formatDealershipHours,
+  mergeDealershipConfig,
 } from './src/utils/vehicleDomain';
 import {
   ChatTurnContextInput,
@@ -515,7 +517,13 @@ async function getPersistedStoreWhatsAppNumber(): Promise<string> {
   }
 }
 
-async function getPersistedDealershipConfig(): Promise<DealershipSettings> {
+interface PersistedDealershipConfigResult {
+  config: DealershipSettings;
+  configUnavailable: boolean;
+  hasPersistedConfig: boolean;
+}
+
+async function getPersistedDealershipConfig(): Promise<PersistedDealershipConfigResult> {
   try {
     const res = await pool.query<{ key: string; value: string }>(
       "SELECT key, value FROM app_settings WHERE key IN ('dealership_config', 'store_whatsapp_number')"
@@ -538,14 +546,21 @@ async function getPersistedDealershipConfig(): Promise<DealershipSettings> {
     const fallbackWa =
       legacyStoreWa ||
       normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) ||
-      '5511994821040';
+      '';
 
-    return mergeDealershipConfig(parsedConfig, fallbackWa);
+    return {
+      config: mergeDealershipConfig(parsedConfig, fallbackWa),
+      configUnavailable: false,
+      hasPersistedConfig: Boolean(parsedConfig),
+    };
   } catch {
     const fallbackWa =
-      normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) ||
-      '5511994821040';
-    return mergeDealershipConfig(DEFAULT_DEALERSHIP_CONFIG, fallbackWa);
+      normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) || '';
+    return {
+      config: mergeDealershipConfig(DEFAULT_DEALERSHIP_CONFIG, fallbackWa),
+      configUnavailable: true,
+      hasPersistedConfig: false,
+    };
   }
 }
 
@@ -1152,27 +1167,35 @@ app.get('/api/public/vehicles/:id', async (req, res) => {
 });
 
 app.get('/api/public/config', async (_req, res) => {
+  res.setHeader(
+    'Cache-Control',
+    'no-store, no-cache, must-revalidate, proxy-revalidate'
+  );
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
   try {
-    const [operationMode, dealershipConfig] = await Promise.all([
+    const [operationMode, persisted] = await Promise.all([
       getPersistedOperationMode(),
       getPersistedDealershipConfig(),
     ]);
-    const salesDestination = resolveWhatsAppDestination(dealershipConfig, 'sales');
+    const salesDestination = resolveWhatsAppDestination(persisted.config, 'sales');
     res.json({
       operationMode,
-      storeWhatsappNumber: salesDestination.normalizedNumber || '5511994821040',
-      dealershipConfig,
+      storeWhatsappNumber: salesDestination.normalizedNumber || '',
+      dealershipConfig: persisted.config,
+      configUnavailable: persisted.configUnavailable,
     });
   } catch {
     const fallback: OperationMode =
       process.env.OPERATION_MODE === 'agent_only' ? 'agent_only' : 'full';
     const fallbackPhone =
-      normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) ||
-      '5511994821040';
+      normalizeStoreWhatsAppNumber(process.env.STORE_WHATSAPP_NUMBER) || '';
     res.json({
       operationMode: fallback,
       storeWhatsappNumber: fallbackPhone,
       dealershipConfig: mergeDealershipConfig(DEFAULT_DEALERSHIP_CONFIG, fallbackPhone),
+      configUnavailable: true,
     });
   }
 });
@@ -1511,7 +1534,7 @@ app.patch(
       );
 
       // Keep centralized dealership_config synchronized with primary sales WhatsApp
-      const currentCfg = await getPersistedDealershipConfig();
+      const { config: currentCfg } = await getPersistedDealershipConfig();
       const updatedCfg: DealershipSettings = {
         ...currentCfg,
         whatsapp: normalized,
@@ -1525,6 +1548,7 @@ app.patch(
         [JSON.stringify(updatedCfg)]
       );
 
+      res.setHeader('Cache-Control', 'no-store');
       res.json({ storeWhatsappNumber: normalized, dealershipConfig: updatedCfg });
     } catch (err: unknown) {
       const message =
@@ -1542,7 +1566,7 @@ app.patch(
   async (req, res) => {
     try {
       const payload = (req.body?.dealershipConfig || req.body || {}) as Partial<DealershipSettings>;
-      const current = await getPersistedDealershipConfig();
+      const { config: current } = await getPersistedDealershipConfig();
 
       const rawSalesWa =
         typeof payload.salesWhatsapp === 'string'
@@ -1648,6 +1672,7 @@ app.patch(
         );
       }
 
+      res.setHeader('Cache-Control', 'no-store');
       res.json({
         dealershipConfig: updated,
         storeWhatsappNumber: updated.salesWhatsapp,
@@ -4100,8 +4125,10 @@ app.post('/api/ai/chat', async (req, res) => {
       }
     }
 
-    const [{ vehicles: freshDbVehicles, failed: stockQueryFailed }, authoritativeDealership] =
-      await Promise.all([dbStockPromise, dealershipConfigPromise]);
+    const [
+      { vehicles: freshDbVehicles, failed: stockQueryFailed },
+      { config: authoritativeDealership, configUnavailable: dealershipConfigUnavailable },
+    ] = await Promise.all([dbStockPromise, dealershipConfigPromise]);
 
     const effectiveDealership = {
       ...authoritativeDealership,
@@ -4196,6 +4223,7 @@ app.post('/api/ai/chat', async (req, res) => {
         baseUrl: reqOrigin,
       },
       dealership: effectiveDealership,
+      dealershipConfigUnavailable,
       selectedVehicle: resolvedSelectedVehicle,
     });
 
@@ -4354,19 +4382,29 @@ app.post('/api/ai/chat', async (req, res) => {
       ? `\nNome do cliente nesta conversa: **${resolvedVisitorName}** (trate-o pelo primeiro nome se fizer sentido e NÃO pergunte novamente como se chama).`
       : '';
 
-    const systemInstruction = `Você é o Consultor Digital da revenda "${effectiveDealership.tradeName}" (${effectiveDealership.address}, ${effectiveDealership.city}/${effectiveDealership.state}).
-Horários oficiais: Seg-Sex ${effectiveDealership.hoursWeekdays} | Sábado ${effectiveDealership.hoursSaturday} | Domingo ${effectiveDealership.hoursSunday}.
+    const officialAddressForPrompt = formatDealershipAddress(effectiveDealership);
+    const officialHoursForPrompt = formatDealershipHours(effectiveDealership);
+    const locationHeaderLine = officialAddressForPrompt
+      ? `Endereço oficial cadastrado no painel: ${officialAddressForPrompt}.`
+      : 'Endereço oficial: NÃO CADASTRADO no painel (oriente o cliente a confirmar com o consultor — NUNCA invente rua, bairro, cidade ou estado).';
+    const hoursHeaderLine = officialHoursForPrompt.hasAny
+      ? `Horários oficiais cadastrados: ${officialHoursForPrompt.summaryLine}.`
+      : 'Horários oficiais: NÃO CADASTRADOS no painel (oriente a confirmar com o consultor — NUNCA invente horários).';
+
+    const systemInstruction = `Você é o Consultor Digital da revenda "${effectiveDealership.tradeName}".
+${locationHeaderLine}
+${hoursHeaderLine}
 
 1. VERACIDADE ABSOLUTA E DADOS VERIFICADOS PELO SERVIDOR (OBRIGATÓRIO):
-- Use EXCLUSIVAMENTE os fatos, veículos, preços, links e cálculos fornecidos no bloco [FATOS VERIFICADOS].
-- NUNCA invente carros, preços, parcelas mensais, taxas de juros, valores FIPE ou meses de referência.
+- Use EXCLUSIVAMENTE os fatos, veículos, preços, endereço, horários, links e cálculos fornecidos no bloco [FATOS VERIFICADOS].
+- NUNCA invente carros, preços, parcelas mensais, taxas de juros, valores FIPE, meses de referência, endereços, bairros, cidades ou horários. Nunca deduza cidade a partir do DDD ou de mensagens antigas.
 - Se um veículo estiver marcado com "Câmbio: EM CONFERÊNCIA CADASTRAL", NUNCA confirme que é automático ou manual — informe que está em conferência.
 - Em troca de usado: NUNCA ofereça "link para enviar fotos"; oriente o cliente a usar o botão **"Anexar fotos"** disponível no chat. Trate sempre como **pré-avaliação do consultor humano**.
 - Em visitas: NUNCA diga "visita confirmada"; use sempre **"solicitação de visita"** sujeita à confirmação da equipe.
 - Não exija telefone/WhatsApp de quem está apenas pesquisando.
 
 2. CONCISÃO ESTILO WHATSAPP:
-- Responda em **2 a 4 linhas curtas** ou até **3 bullet points curtos** com \`- \`.
+- Responda a TODOS os pedidos da mensagem do cliente em **2 a 5 linhas curtas** ou até **4 bullet points curtos** com \`- \`.
 - Destaque em negrito (\`**texto**\`) apenas o essencial e encerre com **1 pergunta curta** para o próximo passo.
 - Os cards dos veículos já são exibidos visualmente abaixo da sua mensagem, então não repita fichas extensas no texto.
 

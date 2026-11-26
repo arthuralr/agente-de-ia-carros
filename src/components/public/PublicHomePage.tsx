@@ -8,7 +8,10 @@ import {
 } from 'lucide-react';
 import { DealershipSettings, Vehicle } from '../../types';
 import { formatBRL, formatKm } from '../../utils/formatters';
-import { analyzeVehicleDataQuality } from '../../utils/vehicleDomain';
+import {
+  analyzeVehicleDataQuality,
+  formatDealershipAddress,
+} from '../../utils/vehicleDomain';
 import { VehicleImage } from '../VehicleImage';
 import { PublicFooter } from './PublicFooter';
 
@@ -106,7 +109,9 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
           <div className="lg:col-span-6 flex flex-col justify-center space-y-6">
             <p className="text-xs font-medium text-red-400">
-              Showroom {settings.city} · {settings.address}
+              {formatDealershipAddress(settings)
+                ? `Showroom · ${formatDealershipAddress(settings)}`
+                : `${settings.tradeName} · Seminovos Selecionados`}
             </p>
 
             <h1 className="font-display text-4xl sm:text-5xl font-semibold tracking-tight text-white leading-[1.1] max-w-xl">

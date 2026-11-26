@@ -10,9 +10,11 @@ import {
   Save,
 } from 'lucide-react';
 import { DealershipSettings, OperationMode } from '../../types';
-import { INITIAL_SETTINGS } from '../../data/mockData';
 import { normalizeStoreWhatsAppNumber } from '../../utils/whatsappHandoff';
-import { formatPhoneDisplay } from '../../utils/vehicleDomain';
+import {
+  DEFAULT_DEALERSHIP_CONFIG,
+  formatPhoneDisplay,
+} from '../../utils/vehicleDomain';
 
 interface SettingsModuleProps {
   settings: DealershipSettings;
@@ -144,9 +146,9 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
     setSavingSettings(true);
     try {
       const next: DealershipSettings = {
-        ...INITIAL_SETTINGS,
-        whatsapp: activeSalesNormalized || INITIAL_SETTINGS.whatsapp,
-        salesWhatsapp: activeSalesNormalized || INITIAL_SETTINGS.whatsapp,
+        ...DEFAULT_DEALERSHIP_CONFIG,
+        whatsapp: activeSalesNormalized || DEFAULT_DEALERSHIP_CONFIG.whatsapp,
+        salesWhatsapp: activeSalesNormalized || DEFAULT_DEALERSHIP_CONFIG.whatsapp,
       };
       await onSaveSettings(next);
       setForm(next);
@@ -478,13 +480,14 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
 
           <div className="sm:col-span-2">
             <label className="block text-xs font-medium text-zinc-300 mb-1">
-              Endereço do Showroom
+              Endereço Oficial do Showroom (usado no chat, vitrine, rodapé e ficha)
             </label>
             <input
               type="text"
               value={form.address}
               onChange={(e) => setForm({ ...form, address: e.target.value })}
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white focus:outline-none"
+              placeholder="Ex.: Av. Exemplo, 1000 — Bairro (deixe vazio se preferir confirmação com consultor)"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white placeholder:text-zinc-600 focus:outline-none"
             />
           </div>
 
@@ -496,7 +499,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
               type="text"
               value={form.city}
               onChange={(e) => setForm({ ...form, city: e.target.value })}
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white focus:outline-none"
+              placeholder="Ex.: Cidade oficial da loja"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white placeholder:text-zinc-600 focus:outline-none"
             />
           </div>
 
@@ -511,7 +515,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
               onChange={(e) =>
                 setForm({ ...form, state: e.target.value.toUpperCase() })
               }
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white font-mono uppercase focus:outline-none"
+              placeholder="UF"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white font-mono uppercase placeholder:text-zinc-600 focus:outline-none"
             />
           </div>
         </div>
@@ -524,7 +529,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
             Horários de Atendimento
           </h2>
           <p className="text-xs text-zinc-400 mt-0.5">
-            Fonte oficial usada pelo assistente virtual para responder dúvidas de funcionamento e solicitações de visita.
+            Fonte oficial usada pelo assistente virtual, vitrine e ficha do veículo. Informe apenas o período (ex.: <span className="font-mono text-zinc-300">09h às 18h</span>).
           </p>
         </div>
 
@@ -539,7 +544,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
               onChange={(e) =>
                 setForm({ ...form, hoursWeekdays: e.target.value })
               }
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white focus:outline-none"
+              placeholder="Ex.: 09h às 18h"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white placeholder:text-zinc-600 focus:outline-none"
             />
           </div>
 
@@ -553,7 +559,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
               onChange={(e) =>
                 setForm({ ...form, hoursSaturday: e.target.value })
               }
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white focus:outline-none"
+              placeholder="Ex.: 09h às 13h"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white placeholder:text-zinc-600 focus:outline-none"
             />
           </div>
 
@@ -565,7 +572,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
               type="text"
               value={form.hoursSunday}
               onChange={(e) => setForm({ ...form, hoursSunday: e.target.value })}
-              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white focus:outline-none"
+              placeholder="Ex.: Fechado"
+              className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] focus:border-red-600 rounded-lg text-sm text-white placeholder:text-zinc-600 focus:outline-none"
             />
           </div>
         </div>

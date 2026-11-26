@@ -528,7 +528,21 @@ export function parseFiltersDeterministically(
     /\b(entrada|parcela|parcelas|financiar|financiamento|meses|vezes|\d+x)\b/i.test(norm);
 
   // 1. Transmission filter
-  if (/\b(qualquer cambio|tanto faz o cambio|sem preferencia de cambio)\b/i.test(norm)) {
+  if (
+    /\b(qualquer cambio|tanto faz o cambio|sem preferencia de cambio|manual ou automatico|automatico ou manual)\b/i.test(
+      norm
+    ) ||
+    (!isTradeInDescription &&
+      previousFilters?.transmission === 'automatico' &&
+      /\b(agora\s+)?(?:pode\s+ser|aceito|tambem\s+pode\s+ser|tanto\s+faz)\s+manual\b/i.test(
+        norm
+      )) ||
+    (!isTradeInDescription &&
+      previousFilters?.transmission === 'manual' &&
+      /\b(agora\s+)?(?:pode\s+ser|aceito|tambem\s+pode\s+ser|tanto\s+faz)\s+automatico\b/i.test(
+        norm
+      ))
+  ) {
     base.transmission = null;
     hasNewConstraints = true;
   } else if (
@@ -552,7 +566,7 @@ export function parseFiltersDeterministically(
   } else if (!isTradeInDescription) {
     const kmMatch =
       norm.match(
-        /(?:ate|no maximo|maximo de|menos de|abaixo de|com ate|com no maximo|<=?)\s*(\d+(?:[.,]\d+)?\s*(?:mil|k)|\d{1,3}(?:\.\d{3})+|\d{4,6})\s*(?:km|quilometros?)\b/i
+        /(?:ate|no maximo|maximo de|menos de|abaixo de|com ate|com no maximo|(?:aument[ae]r?|subir|sobe|mud[ae]r?|alter[ae]r?|passar|ir)\s+(?:o\s+limite\s+)?(?:para|pra)|<=?)\s*(\d+(?:[.,]\d+)?\s*(?:mil|k)|\d{1,3}(?:\.\d{3})+|\d{4,6})\s*(?:km|quilometros?)\b/i
       ) ||
       norm.match(
         /\b(\d+(?:[.,]\d+)?\s*(?:mil|k)|\d{1,3}(?:\.\d{3})+|\d{4,6})\s*(?:km|quilometros?)\s*(?:no maximo|ou menos|para baixo)\b/i
@@ -574,7 +588,7 @@ export function parseFiltersDeterministically(
     // Strip km phrases and down-payment phrases before scanning for budget
     const withoutKmAndDownPayment = norm
       .replace(
-        /(?:ate|no maximo|maximo de|menos de|abaixo de|com ate|<=?)?\s*\d+(?:[.,]\d+)?\s*(?:mil|k)?\s*(?:km|quilometros?)\b/gi,
+        /(?:ate|no maximo|maximo de|menos de|abaixo de|com ate|(?:aument[ae]r?|subir|sobe|mud[ae]r?|alter[ae]r?|passar)\s+(?:para|pra)|<=?)?\s*\d+(?:[.,]\d+)?\s*(?:mil|k)?\s*(?:km|quilometros?)\b/gi,
         ' '
       )
       .replace(
@@ -584,7 +598,7 @@ export function parseFiltersDeterministically(
 
     const priceMatch =
       withoutKmAndDownPayment.match(
-        /(?:ate|no maximo|maximo de|abaixo de|menos de|orcamento de|valor de|limite de|por ate|<=?)\s*(?:r\$\s*)?(\d+(?:[.,]\d+)?\s*(?:mil|k)|\d{1,3}(?:\.\d{3})+|\d{5,7})(?!\s*(?:km|meses|x\b|vezes|parcelas))/i
+        /(?:ate|no maximo|maximo de|abaixo de|menos de|orcamento de|valor de|limite de|por ate|(?:aument[ae]r?|subir|sobe|mud[ae]r?|alter[ae]r?|passar)\s+(?:o\s+orcamento\s+|o\s+valor\s+|o\s+limite\s+)?(?:para|pra)|<=?)\s*(?:r\$\s*)?(\d+(?:[.,]\d+)?\s*(?:mil|k)|\d{1,3}(?:\.\d{3})+|\d{5,7})(?!\s*(?:km|meses|x\b|vezes|parcelas))/i
       ) ||
       (!isFinancingDownPayment
         ? withoutKmAndDownPayment.match(
@@ -681,6 +695,70 @@ export function describeActiveFilters(filters?: VehicleSearchFilters | null): st
   if (filters.model) parts.push(`Modelo ${filters.model}`);
   if (filters.belowFipeOnly) parts.push('Confirmado abaixo da FIPE');
   return parts;
+}
+
+export interface VehicleFilterMatchCheck {
+  matches: boolean;
+  mismatches: string[];
+  shortReason: string | null;
+}
+
+/**
+ * Checks whether a specifically focused vehicle satisfies the previously active search filters.
+ * Used to clearly explain when a directly requested vehicle (e.g. Onix Manual) sits outside
+ * the customer's earlier search (e.g. Automáticos até R$ 60 mil).
+ */
+export function checkVehicleAgainstFilters(
+  vehicle: Vehicle,
+  filters?: VehicleSearchFilters | null
+): VehicleFilterMatchCheck {
+  if (!filters || !hasAnyActiveFilter(filters)) {
+    return { matches: true, mismatches: [], shortReason: null };
+  }
+
+  const quality = analyzeVehicleDataQuality(vehicle);
+  const fipe = computeFipeMetrics(vehicle);
+  const mismatches: string[] = [];
+
+  if (filters.transmission === 'automatico') {
+    if (quality.hasTransmissionConflict || quality.transmissionStatus === 'unconfirmed') {
+      mismatches.push('câmbio em conferência cadastral (sua busca anterior era por automáticos)');
+    } else if (quality.transmissionStatus !== 'confirmed_auto') {
+      mismatches.push('câmbio manual (fora da sua busca por automáticos)');
+    }
+  } else if (filters.transmission === 'manual') {
+    if (quality.hasTransmissionConflict || quality.transmissionStatus === 'unconfirmed') {
+      mismatches.push('câmbio em conferência cadastral (sua busca anterior era por manuais)');
+    } else if (quality.transmissionStatus !== 'confirmed_manual') {
+      mismatches.push('câmbio automático (fora da sua busca por manuais)');
+    }
+  }
+
+  if (filters.maxPrice && vehicle.price > filters.maxPrice) {
+    mismatches.push(
+      `preço ${formatBrlCurrency(vehicle.price)} acima do limite de ${formatBrlCurrency(filters.maxPrice)}`
+    );
+  }
+  if (filters.maxKm && vehicle.km > filters.maxKm) {
+    mismatches.push(
+      `km ${formatKmBr(vehicle.km)} acima do limite de ${formatKmBr(filters.maxKm)}`
+    );
+  }
+  if (filters.minYear) {
+    const modelYr = extractModelYear(vehicle.year);
+    if (modelYr && modelYr < filters.minYear) {
+      mismatches.push(`ano ${vehicle.year} abaixo de ${filters.minYear}`);
+    }
+  }
+  if (filters.belowFipeOnly && !fipe.isConfirmedBelowFipeOffer) {
+    mismatches.push('sem oferta confirmada abaixo da FIPE');
+  }
+
+  return {
+    matches: mismatches.length === 0,
+    mismatches,
+    shortReason: mismatches.length > 0 ? mismatches.join(' · ') : null,
+  };
 }
 
 /**
@@ -913,6 +991,23 @@ export function resolveVehicleReference(
       );
       if (byKw.length === 1) {
         return { status: 'resolved', vehicle: byKw[0], reason: 'version_disambiguated' };
+      }
+    }
+
+    // Disambiguate by explicitly mentioned transmission (e.g. "Onix manual" vs Onix automático/conflito)
+    if (/\b(manual|mecanico|mecanica)\b/i.test(norm) && !/\bautomatico\b/i.test(norm)) {
+      const byManual = mentioned.filter(
+        (v) => analyzeVehicleDataQuality(v).transmissionStatus === 'confirmed_manual'
+      );
+      if (byManual.length === 1) {
+        return { status: 'resolved', vehicle: byManual[0], reason: 'transmission_disambiguated' };
+      }
+    } else if (/\b(automatico|automatica)\b/i.test(norm) && !/\bmanual\b/i.test(norm)) {
+      const byAuto = mentioned.filter(
+        (v) => analyzeVehicleDataQuality(v).transmissionStatus === 'confirmed_auto'
+      );
+      if (byAuto.length === 1) {
+        return { status: 'resolved', vehicle: byAuto[0], reason: 'transmission_disambiguated' };
       }
     }
 
@@ -1229,27 +1324,28 @@ export function buildVehicleComparison(
 }
 
 /**
- * Default centralized dealership configuration used as baseline when DB settings are partial.
- * IMPORTANT: Never silently overwrite an active store_whatsapp_number from Neon.
+ * Default centralized dealership configuration used as baseline when DB settings are empty.
+ * IMPORTANT: Never hardcode any demo city/street address (e.g. São Paulo/Moema or Gravataí)
+ * as a fallback, and never silently overwrite an active store_whatsapp_number from Neon.
  */
 export const DEFAULT_DEALERSHIP_CONFIG: DealershipSettings = {
   tradeName: 'Armazém do Carro',
-  legalName: 'Armazém do Carro Veículos Ltda.',
-  cnpj: '34.812.904/0001-68',
-  stateRegistration: '124.890.331.110',
-  phone: '(11) 3842-9100',
+  legalName: 'Armazém do Carro',
+  cnpj: '',
+  stateRegistration: '',
+  phone: '',
   whatsapp: '',
   salesWhatsapp: '',
   salesWhatsappLabel: 'Consultor de Vendas',
   financingWhatsapp: '',
   financingWhatsappLabel: 'Financeiro / Simulação',
-  email: 'contato@armazemdocarro.com.br',
-  address: 'Av. dos Bandeirantes, 2840 — Moema',
-  city: 'São Paulo',
-  state: 'SP',
-  hoursWeekdays: 'Segunda a Sexta, das 09h às 19h',
-  hoursSaturday: 'Sábado, das 09h às 16h',
-  hoursSunday: 'Domingo: fechado',
+  email: '',
+  address: '',
+  city: '',
+  state: '',
+  hoursWeekdays: '',
+  hoursSaturday: '',
+  hoursSunday: '',
   minResaleMarginPct: 12,
   defaultSocialCta: 'Fale com nossa equipe para conferir a ficha completa e disponibilidade.',
   aiAssistantName: 'Consultor Digital Armazém do Carro',
@@ -1258,6 +1354,108 @@ export const DEFAULT_DEALERSHIP_CONFIG: DealershipSettings = {
   financingMonthlyRatePct: null,
   logoUrl: '',
 };
+
+/**
+ * Formats the dealership address cleanly from the persisted admin fields.
+ * Preserves the admin's exact text, omits empty optional components, and avoids
+ * duplicating city/state if the admin already included them in the main address field.
+ * Returns null if no address component is configured (never returns a demo fallback).
+ */
+export function formatDealershipAddress(
+  settings?: Partial<DealershipSettings> | null
+): string | null {
+  if (!settings) return null;
+  const street = (settings.address || '').trim();
+  const city = (settings.city || '').trim();
+  const state = (settings.state || '').trim().toUpperCase();
+
+  const cityState =
+    city && state ? `${city}/${state}` : city || state || '';
+
+  if (!street && !cityState) return null;
+  if (street && !cityState) return street;
+  if (!street && cityState) return cityState;
+
+  const normStreet = normalizeTextForMatch(street);
+  const normCity = normalizeTextForMatch(city);
+  const hasCityAlready = Boolean(normCity && normStreet.includes(normCity));
+  if (hasCityAlready) {
+    if (state && !new RegExp(`\\b${state.toLowerCase()}\\b`).test(normStreet)) {
+      return `${street}/${state}`;
+    }
+    return street;
+  }
+
+  return `${street} — ${cityState}`;
+}
+
+/**
+ * Builds a Google Maps query URL strictly from the admin-saved address.
+ * Returns null if no address is configured.
+ */
+export function buildDealershipMapsUrl(
+  settings?: Partial<DealershipSettings> | null
+): string | null {
+  const formatted = formatDealershipAddress(settings);
+  if (!formatted) return null;
+  return `https://maps.google.com/?q=${encodeURIComponent(formatted)}`;
+}
+
+/**
+ * Strips duplicated leading day prefixes (e.g., "Sábado, das 09h às 16h" -> "das 09h às 16h")
+ * so UI/chat never prints "Sábado: Sábado, das 09h às 16h" or "Domingo: Domingo: fechado".
+ */
+export function formatScheduleValue(
+  dayKind: 'weekdays' | 'saturday' | 'sunday',
+  rawValue?: string | null
+): string | null {
+  const clean = (rawValue || '').trim();
+  if (!clean) return null;
+
+  const patterns: Record<'weekdays' | 'saturday' | 'sunday', RegExp> = {
+    weekdays:
+      /^(?:de\s+)?(?:segunda(?:\s*-?\s*feira)?\s*(?:a|à|ate|até|-|–)\s*sexta(?:\s*-?\s*feira)?|seg\.?\s*(?:a|-|–)\s*sex\.?)\s*[:,;\-–]?\s*/i,
+    saturday: /^(?:aos\s+)?s[aá]b(?:ados?|ado|\.)?\s*[:,;\-–]?\s*/i,
+    sunday:
+      /^(?:aos\s+)?dom(?:ingos?|ingo|\.)?(?:\s*e\s*feriados?)?\s*[:,;\-–]?\s*/i,
+  };
+
+  const stripped = clean.replace(patterns[dayKind], '').trim();
+  return stripped || clean;
+}
+
+export interface FormattedDealershipHours {
+  weekdays: string | null;
+  saturday: string | null;
+  sunday: string | null;
+  hasAny: boolean;
+  inlineSummary: string | null;
+  summaryLine: string | null;
+}
+
+export function formatDealershipHours(
+  settings?: Partial<DealershipSettings> | null
+): FormattedDealershipHours {
+  const weekdays = formatScheduleValue('weekdays', settings?.hoursWeekdays);
+  const saturday = formatScheduleValue('saturday', settings?.hoursSaturday);
+  const sunday = formatScheduleValue('sunday', settings?.hoursSunday);
+  const hasAny = Boolean(weekdays || saturday || sunday);
+
+  const parts: string[] = [];
+  if (weekdays) parts.push(`Seg–Sex: ${weekdays}`);
+  if (saturday) parts.push(`Sábado: ${saturday}`);
+  if (sunday) parts.push(`Domingo: ${sunday}`);
+  const summary = parts.length > 0 ? parts.join(' · ') : null;
+
+  return {
+    weekdays,
+    saturday,
+    sunday,
+    hasAny,
+    inlineSummary: summary,
+    summaryLine: summary,
+  };
+}
 
 export function mergeDealershipConfig(
   dbConfig?: Partial<DealershipSettings> | null,

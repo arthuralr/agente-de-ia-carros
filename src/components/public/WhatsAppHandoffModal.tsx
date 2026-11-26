@@ -14,7 +14,10 @@ import {
   HandoffPurpose,
   resolveWhatsAppDestination,
 } from '../../utils/whatsappHandoff';
-import { formatPhoneDisplay } from '../../utils/vehicleDomain';
+import {
+  formatPhoneDisplay,
+  getVehicleDisplayTitle,
+} from '../../utils/vehicleDomain';
 
 interface WhatsAppHandoffModalProps {
   isOpen: boolean;
@@ -22,6 +25,9 @@ interface WhatsAppHandoffModalProps {
   settings: DealershipSettings;
   fallbackWhatsapp?: string;
   purpose?: HandoffPurpose;
+  focusedVehicle?: Vehicle | null;
+  recentVehicles?: Vehicle[];
+  baseUrl?: string;
   vehicleLabel?: string | null;
   contextSummary?: string | null;
   sessionId?: string | null;
@@ -43,6 +49,9 @@ export const WhatsAppHandoffModal: React.FC<WhatsAppHandoffModalProps> = ({
   settings,
   fallbackWhatsapp,
   purpose = 'sales',
+  focusedVehicle = null,
+  recentVehicles = [],
+  baseUrl,
   vehicleLabel,
   contextSummary,
   sessionId,
@@ -53,21 +62,53 @@ export const WhatsAppHandoffModal: React.FC<WhatsAppHandoffModalProps> = ({
   onBeforeOpenWhatsApp,
 }) => {
   const [selectedPurpose, setSelectedPurpose] = useState<HandoffPurpose>(purpose);
+  const [selectedVehicleId, setSelectedVehicleId] = useState<string>(
+    focusedVehicle?.id ? String(focusedVehicle.id) : ''
+  );
   const [includeContactData, setIncludeContactData] = useState(false);
   const [customMessage, setCustomMessage] = useState('');
   const [isEdited, setIsEdited] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const hasSeparateFinancing = Boolean((settings.financingWhatsapp || '').trim());
+  const selectableRecentVehicles = useMemo(() => {
+    const seen = new Set<string>();
+    const list: Vehicle[] = [];
+    for (const v of recentVehicles) {
+      if (!v || seen.has(String(v.id))) continue;
+      seen.add(String(v.id));
+      list.push(v);
+    }
+    return list;
+  }, [recentVehicles]);
+  const showVehicleSelector =
+    !focusedVehicle && !vehicleLabel && selectableRecentVehicles.length >= 2;
 
   useEffect(() => {
     if (isOpen) {
       setSelectedPurpose(purpose);
+      setSelectedVehicleId(focusedVehicle?.id ? String(focusedVehicle.id) : '');
       setIncludeContactData(false);
       setIsEdited(false);
       setCopied(false);
     }
-  }, [isOpen, purpose, contextSummary, vehicleLabel]);
+  }, [isOpen, purpose, contextSummary, vehicleLabel, focusedVehicle]);
+
+  const effectiveFocusedVehicle = useMemo(() => {
+    if (focusedVehicle) return focusedVehicle;
+    if (selectedVehicleId) {
+      return (
+        selectableRecentVehicles.find(
+          (v) => String(v.id) === String(selectedVehicleId)
+        ) ||
+        (vehicles || []).find(
+          (v) => String(v.id) === String(selectedVehicleId)
+        ) ||
+        null
+      );
+    }
+    return null;
+  }, [focusedVehicle, selectedVehicleId, selectableRecentVehicles, vehicles]);
 
   const destination = useMemo(
     () => resolveWhatsAppDestination(settings, selectedPurpose, fallbackWhatsapp),
@@ -84,10 +125,14 @@ export const WhatsAppHandoffModal: React.FC<WhatsAppHandoffModalProps> = ({
         includeContactData,
         sessionId,
         contextSummary,
-        vehicleLabel,
+        vehicleLabel: effectiveFocusedVehicle ? null : vehicleLabel,
+        focusedVehicle: effectiveFocusedVehicle,
+        baseUrl:
+          baseUrl ||
+          (typeof window !== 'undefined' ? window.location.origin : ''),
         purpose: selectedPurpose,
         destinationLabel: destination.label,
-        messages,
+        messages: showVehicleSelector && !selectedVehicleId ? [] : messages,
         vehicles,
       }),
     [
@@ -100,7 +145,11 @@ export const WhatsAppHandoffModal: React.FC<WhatsAppHandoffModalProps> = ({
       sessionId,
       contextSummary,
       vehicleLabel,
+      effectiveFocusedVehicle,
+      baseUrl,
       selectedPurpose,
+      showVehicleSelector,
+      selectedVehicleId,
       messages,
       vehicles,
     ]
@@ -212,6 +261,34 @@ export const WhatsAppHandoffModal: React.FC<WhatsAppHandoffModalProps> = ({
                   </span>
                 </button>
               </div>
+            </div>
+          )}
+
+          {/* Optional vehicle picker when user discussed multiple vehicles with no single focus */}
+          {showVehicleSelector && (
+            <div className="space-y-1.5">
+              <label
+                htmlFor="wa-handoff-vehicle"
+                className="block text-xs font-medium text-zinc-700"
+              >
+                Veículo de interesse na mensagem (opcional)
+              </label>
+              <select
+                id="wa-handoff-vehicle"
+                value={selectedVehicleId}
+                onChange={(e) => {
+                  setSelectedVehicleId(e.target.value);
+                  setIsEdited(false);
+                }}
+                className="w-full min-h-[42px] rounded-xl border border-zinc-300 bg-white px-3 py-2 text-xs text-zinc-900 focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600"
+              >
+                <option value="">Atendimento geral (sem veículo específico)</option>
+                {selectableRecentVehicles.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {getVehicleDisplayTitle(v)} {v.year} (Ref. #{v.id})
+                  </option>
+                ))}
+              </select>
             </div>
           )}
 

@@ -12,7 +12,6 @@ import {
 } from './types';
 import {
   INITIAL_ACTIVITY,
-  INITIAL_SETTINGS,
   INITIAL_VEHICLES,
 } from './data/mockData';
 import {
@@ -42,17 +41,11 @@ import { PWAInstallBanner } from './components/public/PWAInstallBanner';
 import { AdminLoginPage } from './components/auth/AdminLoginPage';
 import { adminFetch, clearAdminSessionToken } from './utils/authSession';
 import { normalizeStoreWhatsAppNumber } from './utils/whatsappHandoff';
-import { buildVehicleSheetPath, mergeDealershipConfig } from './utils/vehicleDomain';
-
-function loadStored<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
-}
+import {
+  buildVehicleSheetPath,
+  DEFAULT_DEALERSHIP_CONFIG,
+  mergeDealershipConfig,
+} from './utils/vehicleDomain';
 
 const MODULE_PATH_MAP: Record<NavModule, string> = {
   dashboard: '/admin/visao-geral',
@@ -163,15 +156,11 @@ export default function App() {
     INITIAL_VEHICLES.filter((v) => v.status === 'Disponível')
   );
   const [leads, setLeads] = useState<Lead[]>([]);
-  const [settings, setSettings] = useState<DealershipSettings>(() =>
-    loadStored('armazem_settings_v1', INITIAL_SETTINGS)
+  const [settings, setSettings] = useState<DealershipSettings>(
+    DEFAULT_DEALERSHIP_CONFIG
   );
   const [operationMode, setOperationMode] = useState<OperationMode>('full');
-  const [storeWhatsappNumber, setStoreWhatsappNumber] = useState<string>(() =>
-    normalizeStoreWhatsAppNumber(
-      loadStored('armazem_settings_v1', INITIAL_SETTINGS).whatsapp
-    ) || '5511994821040'
-  );
+  const [storeWhatsappNumber, setStoreWhatsappNumber] = useState<string>('');
   const [activities, setActivities] = useState<ActivityLog[]>(INITIAL_ACTIVITY);
 
   // Public Chat Lead Token Store (allows public visitors to append chat turns without admin auth)
@@ -290,45 +279,47 @@ export default function App() {
     }
   }, [handleUnauthorizedSession]);
 
+  const hydratePublicConfig = useCallback(async () => {
+    try {
+      const cfgRes = await fetch('/api/public/config', { cache: 'no-store' });
+      if (!cfgRes.ok) return;
+      const cfg = (await cfgRes.json()) as {
+        operationMode?: OperationMode;
+        storeWhatsappNumber?: string;
+        dealershipConfig?: Partial<DealershipSettings>;
+      };
+      if (cfg.operationMode === 'agent_only' || cfg.operationMode === 'full') {
+        setOperationMode(cfg.operationMode);
+      }
+      if (cfg.storeWhatsappNumber) {
+        const normalized = normalizeStoreWhatsAppNumber(
+          cfg.storeWhatsappNumber
+        );
+        if (normalized.length >= 10) {
+          setStoreWhatsappNumber(normalized);
+        }
+      }
+      if (cfg.dealershipConfig) {
+        setSettings(
+          mergeDealershipConfig(cfg.dealershipConfig, cfg.storeWhatsappNumber)
+        );
+      } else if (cfg.storeWhatsappNumber) {
+        setSettings((prev) =>
+          mergeDealershipConfig(prev, cfg.storeWhatsappNumber)
+        );
+      }
+    } catch {
+      // Keep current config if offline
+    }
+  }, []);
+
   // Verify existing HttpOnly cookie session + hydrate public storefront on mount
   useEffect(() => {
     let active = true;
 
     async function initApp() {
       void hydratePublicVehicles();
-
-      try {
-        const cfgRes = await fetch('/api/public/config');
-        if (active && cfgRes.ok) {
-          const cfg = (await cfgRes.json()) as {
-            operationMode?: OperationMode;
-            storeWhatsappNumber?: string;
-            dealershipConfig?: Partial<DealershipSettings>;
-          };
-          if (cfg.operationMode === 'agent_only' || cfg.operationMode === 'full') {
-            setOperationMode(cfg.operationMode);
-          }
-          if (cfg.storeWhatsappNumber) {
-            const normalized = normalizeStoreWhatsAppNumber(
-              cfg.storeWhatsappNumber
-            );
-            if (normalized.length >= 10) {
-              setStoreWhatsappNumber(normalized);
-            }
-          }
-          if (cfg.dealershipConfig) {
-            setSettings(
-              mergeDealershipConfig(cfg.dealershipConfig, cfg.storeWhatsappNumber)
-            );
-          } else if (cfg.storeWhatsappNumber) {
-            setSettings((prev) =>
-              mergeDealershipConfig(prev, cfg.storeWhatsappNumber)
-            );
-          }
-        }
-      } catch {
-        // Keep default 'full' mode if offline
-      }
+      await hydratePublicConfig();
 
       try {
         const res = await adminFetch('/api/auth/me');
@@ -357,7 +348,20 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [hydrateAdminData, hydratePublicVehicles]);
+  }, [hydrateAdminData, hydratePublicConfig, hydratePublicVehicles]);
+
+  // Re-hydrate official public dealership config when switching between routes so Admin edits reflect immediately
+  useEffect(() => {
+    if (
+      viewMode === 'catalog' ||
+      viewMode === 'home' ||
+      viewMode === 'chat' ||
+      viewMode === 'vehicle_detail' ||
+      viewMode === 'privacy'
+    ) {
+      void hydratePublicConfig();
+    }
+  }, [hydratePublicConfig, viewMode]);
 
   // Browser back/forward route listener
   useEffect(() => {
@@ -403,13 +407,7 @@ export default function App() {
     viewMode,
   ]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem('armazem_settings_v1', JSON.stringify(settings));
-    } catch {
-      // Storage quota ignored
-    }
-  }, [settings]);
+  // Do not persist stale dealership settings to localStorage as authoritative source; Neon /api/public/config is the source of truth.
 
   const pushActivity = (
     title: string,

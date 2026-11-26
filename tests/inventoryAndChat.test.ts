@@ -3,11 +3,16 @@ import assert from 'node:assert/strict';
 import {
   analyzeVehicleDataQuality,
   analyzeVisitIntent,
+  buildDealershipMapsUrl,
   buildVehicleComparison,
   buildVehicleSheetPath,
+  checkVehicleAgainstFilters,
   computeFinancingSummary,
   computeFipeMetrics,
+  DEFAULT_DEALERSHIP_CONFIG,
   extractTradeInInfo,
+  formatDealershipAddress,
+  formatDealershipHours,
   parseFinancingParams,
   parseFiltersDeterministically,
   resolveVehicleReference,
@@ -599,4 +604,275 @@ test('12. Real Neon brand/model formatting resolves Onix ambiguity, Onix 2021 fi
     ['13', '14']
   );
 });
+
+test('13. Official Admin address & hours have zero demo defaults, deduplicate day prefixes, and distinguish empty vs unavailable', () => {
+  // Zero hardcoded demo address or city in default config
+  assert.equal(DEFAULT_DEALERSHIP_CONFIG.address, '');
+  assert.equal(DEFAULT_DEALERSHIP_CONFIG.city, '');
+  assert.equal(DEFAULT_DEALERSHIP_CONFIG.state, '');
+  assert.equal(formatDealershipAddress(DEFAULT_DEALERSHIP_CONFIG), null);
+  assert.equal(buildDealershipMapsUrl(DEFAULT_DEALERSHIP_CONFIG), null);
+
+  // Deduplicates prefixed hours saved by admin ("Sábado, das 09h às 16h" / "Domingo: fechado")
+  const prefixedSettings: DealershipSettings = {
+    ...TEST_SETTINGS,
+    address: 'Av. Brasil, 500 — Centro',
+    city: 'Campinas',
+    state: 'SP',
+    hoursWeekdays: 'Segunda a Sexta, das 08h30 às 18h30',
+    hoursSaturday: 'Sábado, das 09h às 16h',
+    hoursSunday: 'Domingo: fechado',
+  };
+  const hours = formatDealershipHours(prefixedSettings);
+  assert.equal(hours.weekdays, 'das 08h30 às 18h30');
+  assert.equal(hours.saturday, 'das 09h às 16h');
+  assert.equal(hours.sunday, 'fechado');
+  assert.equal((hours.summaryLine || '').includes('Sábado: Sábado'), false);
+  assert.equal((hours.summaryLine || '').includes('Domingo: Domingo'), false);
+
+  // Empty address -> honest consultant confirmation message (never demo city/street)
+  const emptySettings: DealershipSettings = {
+    ...DEFAULT_DEALERSHIP_CONFIG,
+    whatsapp: '5511994821040',
+    salesWhatsapp: '5511994821040',
+  };
+  const emptyPlan = planChatTurn({
+    allVehicles: NEON_FIXTURE_VEHICLES,
+    messages: [{ sender: 'cliente', text: 'Qual o endereço e horário da loja?' }],
+    latestUserUtterance: 'Qual o endereço e horário da loja?',
+    chatContext: {},
+    dealership: emptySettings,
+  });
+  assert.match(emptyPlan.deterministicReply, /confirme o endereço(?: atualizado)? com nosso consultor/i);
+  assert.doesNotMatch(emptyPlan.deterministicReply, /Bandeirantes|Ibirapuera|Moema|Centenário|Gravataí/i);
+
+  // Temporary DB config read error -> distinct honest error message
+  const unavailablePlan = planChatTurn({
+    allVehicles: NEON_FIXTURE_VEHICLES,
+    messages: [{ sender: 'cliente', text: 'Qual o endereço da loja?' }],
+    latestUserUtterance: 'Qual o endereço da loja?',
+    chatContext: {},
+    dealership: emptySettings,
+    dealershipConfigUnavailable: true,
+  });
+  assert.match(unavailablePlan.deterministicReply, /não foi possível consultar|não consegui consultar/i);
+});
+
+test('14. Multi-intent message answers trade-in + photo attachment + official address & Saturday hours without scheduling', () => {
+  const settingsWithPrefixedHours: DealershipSettings = {
+    ...TEST_SETTINGS,
+    address: 'Rua das Flores, 250 — Centro',
+    city: 'Curitiba',
+    state: 'PR',
+    hoursSaturday: 'Sábado, das 09h às 16h',
+    hoursSunday: 'Domingo: fechado',
+  };
+  const msg =
+    'Tenho um Sandero 2018 1.6 manual com 110 mil km na troca. O que falta e onde envio as fotos? Qual o endereço e horário de sábado? Não agende nada.';
+
+  const plan = planChatTurn({
+    allVehicles: NEON_FIXTURE_VEHICLES,
+    messages: [{ sender: 'cliente', text: msg }],
+    latestUserUtterance: msg,
+    chatContext: {},
+    dealership: settingsWithPrefixedHours,
+  });
+
+  assert.equal(plan.intent, 'trade_in_and_visit');
+  assert.equal(plan.promptAttachPhotos, true);
+  assert.equal(plan.isVisitInquiryOnly, true);
+  assert.equal(plan.suppressHandoff, true);
+  assert.match(plan.deterministicReply, /Sandero/i);
+  assert.match(plan.deterministicReply, /2018/);
+  assert.match(plan.deterministicReply, /110\.000/);
+  assert.match(plan.deterministicReply, /Anexar fotos/i);
+  assert.doesNotMatch(plan.deterministicReply, /link das fotos|envie um link/i);
+  assert.ok(plan.deterministicReply.includes('Rua das Flores, 250 — Centro'));
+  assert.ok(plan.deterministicReply.includes('Curitiba/PR'));
+  assert.match(plan.deterministicReply, /Sábado:\*{0,2}\s*das 09h às 16h/i);
+  assert.equal(plan.deterministicReply.includes('Sábado: Sábado'), false);
+  assert.equal(plan.deterministicReply.includes('Sábado:** Sábado'), false);
+  assert.match(plan.deterministicReply, /nenhum agendamento foi criado/i);
+});
+
+test('15. WhatsApp handoff preserves focused vehicle context, ficha link, and separates interest vs trade-in vehicle', () => {
+  const realOnix2021: Vehicle = {
+    ...NEON_FIXTURE_VEHICLES[4],
+    id: '13',
+    brand: 'Chevrolet Onix',
+    model: 'JOY Hatch 1.0 8V Black Edition Flex Mec.',
+    version: '2021',
+    year: '2021/2021',
+    price: 55900,
+    km: 82700,
+    transmission: 'Manual',
+  };
+
+  // Explicit focusedVehicle (from card, ficha, or active chat focus) + Sandero trade-in in messages
+  const handoff = buildWhatsAppHandoffUrl({
+    storeWhatsappNumber: '5511994821040',
+    storeName: 'Armazém do Carro',
+    sessionId: 'sess-onix-42',
+    focusedVehicle: realOnix2021,
+    baseUrl: 'https://loja.exemplo.com',
+    includeContactData: false,
+    leadName: 'Carlos Teste',
+    leadPhone: '(11) 98888-7777',
+    messages: [
+      {
+        id: 'm1',
+        sender: 'cliente',
+        text: 'Me confirma se o Onix 2021 é manual e simula com R$ 20 mil de entrada em 48x',
+        timestamp: '10:00',
+      },
+      {
+        id: 'm2',
+        sender: 'cliente',
+        text: 'Tenho um Sandero 2018 1.6 manual com 110 mil km na troca',
+        timestamp: '10:02',
+      },
+    ],
+    vehicles: [realOnix2021],
+  });
+
+  assert.equal(handoff.resolvedVehicleId, '13');
+  assert.match(handoff.text, /Chevrolet Onix/i);
+  assert.ok(handoff.text.includes('https://loja.exemplo.com/veiculo/13'));
+  assert.match(handoff.text, /Usado na troca:.*Sandero/i);
+  // Opt-in unchecked by default -> personal data NOT included
+  assert.equal(handoff.text.includes('Carlos Teste'), false);
+  assert.equal(handoff.text.includes('98888-7777'), false);
+
+  // Even without explicit focusedVehicle, Neon-shaped brand/model resolves from chat transcript
+  const inferred = buildWhatsAppHandoffUrl({
+    storeWhatsappNumber: '5511994821040',
+    storeName: 'Armazém do Carro',
+    sessionId: 'sess-onix-43',
+    baseUrl: 'https://loja.exemplo.com',
+    messages: [
+      {
+        id: 'm1',
+        sender: 'cliente',
+        text: 'Quero saber do Onix 2021',
+        timestamp: '10:00',
+      },
+    ],
+    vehicles: [realOnix2021],
+  });
+  assert.equal(inferred.resolvedVehicleId, '13');
+  assert.match(inferred.text, /Chevrolet Onix/i);
+});
+
+test('16. Out-of-filter specific vehicle confirmation + ficha + financing preserves prior search filters and supports incremental filter relaxation', () => {
+  const turn1 = parseFiltersDeterministically(
+    'Quero carro automático até R$ 60 mil com no máximo 90 mil km'
+  );
+  assert.equal(turn1.filters.transmission, 'automatico');
+  assert.equal(turn1.filters.maxPrice, 60000);
+  assert.equal(turn1.filters.maxKm, 90000);
+
+  // Check helper detects Onix 2021 (Manual) is outside prior Automatic filter
+  const mismatch = checkVehicleAgainstFilters(NEON_FIXTURE_VEHICLES[4], turn1.filters);
+  assert.equal(mismatch.matches, false);
+  assert.match(mismatch.shortReason || '', /manual|automático/i);
+
+  // Combined confirmation + ficha + financing while Automatic filter is active
+  const combinedMsg =
+    'Me confirma se o Onix 2021 é manual, manda a ficha e simula com R$ 20 mil de entrada em 48x';
+  const finPlan = planChatTurn({
+    allVehicles: NEON_FIXTURE_VEHICLES,
+    messages: [
+      { sender: 'cliente', text: 'Quero carro automático até R$ 60 mil com no máximo 90 mil km' },
+      { sender: 'cliente', text: combinedMsg },
+    ],
+    latestUserUtterance: combinedMsg,
+    chatContext: {
+      activeFilters: turn1.filters,
+      baseUrl: 'http://localhost:3000',
+    },
+    dealership: TEST_SETTINGS,
+  });
+
+  assert.equal(finPlan.intent, 'financing');
+  assert.equal(finPlan.focusedVehicleId, '13');
+  // Prior search filter preserved so user can return to it
+  assert.equal(finPlan.activeFilters.transmission, 'automatico');
+  assert.equal(finPlan.financingSummary?.principalBalance, 35900);
+  assert.equal(finPlan.financingSummary?.estimatedInstallment, null);
+  assert.match(finPlan.deterministicReply, /Manual/i);
+  assert.ok(finPlan.deterministicReply.includes('/veiculo/13'));
+  assert.match(finPlan.deterministicReply, /fora da sua busca anterior/i);
+  assert.ok(
+    finPlan.suggestedActions.some((a) => /voltar à busca/i.test(a.label))
+  );
+
+  // Incremental filter relaxation: "agora pode ser manual e aumente para 110 mil km"
+  const turn3 = parseFiltersDeterministically(
+    'agora pode ser manual e aumente para 110 mil km',
+    turn1.filters
+  );
+  assert.equal(turn3.filters.transmission, null);
+  assert.equal(turn3.filters.maxPrice, 60000);
+  assert.equal(turn3.filters.maxKm, 110000);
+});
+
+test('17. Direct question about specific vehicle outside active search ("E o Onix manual?") resolves directly and offers return to search', () => {
+  const plan = planChatTurn({
+    allVehicles: NEON_FIXTURE_VEHICLES,
+    messages: [
+      { sender: 'cliente', text: 'Quero carro automático até R$ 60 mil com até 90 mil km' },
+      { sender: 'cliente', text: 'E o Onix manual?' },
+    ],
+    latestUserUtterance: 'E o Onix manual?',
+    chatContext: {
+      activeFilters: { transmission: 'automatico', maxPrice: 60000, maxKm: 90000 },
+      baseUrl: 'http://localhost:3000',
+    },
+    dealership: TEST_SETTINGS,
+  });
+
+  assert.equal(plan.focusedVehicleId, '13');
+  assert.equal(plan.vehicleCards[0]?.id, '13');
+  assert.equal(plan.activeFilters.transmission, 'automatico');
+  assert.match(plan.deterministicReply, /fora da sua busca anterior/i);
+  assert.ok(plan.deterministicReply.includes('/veiculo/13'));
+  assert.ok(plan.suggestedActions.some((a) => /voltar à busca/i.test(a.label)));
+});
+
+test('18. Positive FIPE scenario renders consistent R$ and % diff with reference month in both metrics and chat sheet', () => {
+  const vehicleWithFipe: Vehicle = {
+    ...NEON_FIXTURE_VEHICLES[4],
+    id: '13',
+    price: 55900,
+    fipePrice: 60000,
+    fipeCode: '004519-5',
+    fipeReferenceMonth: 'novembro de 2026',
+  };
+
+  const metrics = computeFipeMetrics(vehicleWithFipe);
+  assert.equal(metrics.hasFipeValue, true);
+  assert.equal(metrics.hasReferenceMonth, true);
+  assert.equal(metrics.diffBrl, 4100);
+  assert.equal(metrics.diffPct, 6.8);
+  assert.equal(metrics.isConfirmedBelowFipeOffer, true);
+
+  const plan = planChatTurn({
+    allVehicles: [vehicleWithFipe],
+    messages: [{ sender: 'cliente', text: 'Manda a ficha do Onix 2021' }],
+    latestUserUtterance: 'Manda a ficha do Onix 2021',
+    chatContext: { baseUrl: 'http://localhost:3000' },
+    dealership: TEST_SETTINGS,
+  });
+
+  assert.equal(plan.vehicleCards[0]?.isConfirmedBelowFipeOffer, true);
+  assert.equal(plan.vehicleCards[0]?.fipePrice, 60000);
+  assert.equal(plan.vehicleCards[0]?.fipeDiffBrl, 4100);
+  assert.equal(plan.vehicleCards[0]?.fipeDiffPct, 6.8);
+  assert.equal(plan.vehicleCards[0]?.fipeReferenceMonth, 'novembro de 2026');
+  assert.ok(plan.deterministicReply.includes('60.000'));
+  assert.ok(plan.deterministicReply.includes('novembro de 2026'));
+  assert.ok(plan.deterministicReply.includes('4.100'));
+  assert.ok(plan.deterministicReply.includes('6.8%'));
+});
+
 

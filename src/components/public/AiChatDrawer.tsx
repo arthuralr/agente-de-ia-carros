@@ -430,6 +430,8 @@ export const AiChatDrawer: React.FC<AiChatDrawerProps> = ({
         onClose={() => setHandoffOpen(false)}
         settings={settings}
         purpose="sales"
+        focusedVehicle={targetVehicle}
+        baseUrl={typeof window !== 'undefined' ? window.location.origin : ''}
         vehicleLabel={
           targetVehicle
             ? `${targetVehicle.brand} ${targetVehicle.model} ${targetVehicle.year}`

@@ -20,9 +20,12 @@ import { ApiVehicleRow, mapDbVehicleToFrontend } from '../../db/mappers';
 import { VehicleImage } from '../VehicleImage';
 import {
   analyzeVehicleDataQuality,
+  buildDealershipMapsUrl,
   buildVehicleSheetUrl,
   computeFipeMetrics,
   formatBrlCurrency,
+  formatDealershipAddress,
+  formatDealershipHours,
   formatKmBr,
   getVehicleDisplayTitle,
   isVehicleAvailable,
@@ -513,12 +516,37 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
                     Garantia legal de {settings.warrantyDays} dias · {settings.tradeName}
                   </span>
                 </p>
-                <p>
-                  {settings.address}, {settings.city}/{settings.state}
-                </p>
-                <p>
-                  {settings.hoursWeekdays} · {settings.hoursSaturday}
-                </p>
+                {(() => {
+                  const formattedAddress = formatDealershipAddress(settings);
+                  const mapsUrl = buildDealershipMapsUrl(settings);
+                  const formattedHours = formatDealershipHours(settings);
+                  return (
+                    <>
+                      {formattedAddress ? (
+                        <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span>{formattedAddress}</span>
+                          {mapsUrl && (
+                            <a
+                              href={mapsUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-emerald-400 hover:underline font-medium"
+                            >
+                              Ver no mapa
+                            </a>
+                          )}
+                        </p>
+                      ) : (
+                        <p>Confirme o endereço com nosso consultor.</p>
+                      )}
+                      {formattedHours.hasAny ? (
+                        <p>{formattedHours.summaryLine}</p>
+                      ) : (
+                        <p>Confirme os horários de atendimento com nosso consultor.</p>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             </div>
           </div>
@@ -531,6 +559,8 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
         settings={settings}
         fallbackWhatsapp={storeWhatsappNumber}
         purpose={handoffPurpose}
+        focusedVehicle={vehicle}
+        baseUrl={typeof window !== 'undefined' ? window.location.origin : ''}
         vehicleLabel={`${title} ${vehicle.year} (Ref. #${vehicle.id})`}
         contextSummary={`Tenho interesse no ${title} ${vehicle.year} (${formatBrlCurrency(vehicle.price)})`}
       />

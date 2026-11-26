@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { DealershipSettings } from '../../types';
 import { formatWhatsAppLink } from '../../utils/formatters';
+import { formatDealershipAddress } from '../../utils/vehicleDomain';
 
 interface PrivacyPolicyPageProps {
   settings: DealershipSettings;
@@ -157,8 +158,11 @@ export const PrivacyPolicyPage: React.FC<PrivacyPolicyPageProps> = ({
               <span>Canal do Controlador / Encarregado de Dados (DPO)</span>
             </div>
             <p className="text-xs text-zinc-400">
-              {settings.legalName} · {settings.address}, {settings.city}/
-              {settings.state} · E-mail:{' '}
+              {settings.legalName}
+              {formatDealershipAddress(settings)
+                ? ` · ${formatDealershipAddress(settings)}`
+                : ''}{' '}
+              · E-mail:{' '}
               <span className="text-zinc-200 font-mono">{settings.email}</span>
             </p>
           </div>

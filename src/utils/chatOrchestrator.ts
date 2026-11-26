@@ -10,15 +10,19 @@ import {
 import {
   analyzeVehicleDataQuality,
   analyzeVisitIntent,
+  buildDealershipMapsUrl,
   buildVehicleComparison,
   buildVehicleSheetPath,
   buildVehicleSheetUrl,
+  checkVehicleAgainstFilters,
   computeFinancingSummary,
   computeFipeMetrics,
   describeActiveFilters,
   extractTradeInInfo,
   extractVehicleMatchTokens,
   formatBrlCurrency,
+  formatDealershipAddress,
+  formatDealershipHours,
   formatKmBr,
   getVehicleDisplayTitle,
   hasAnyActiveFilter,
@@ -44,6 +48,7 @@ export interface ChatTurnPlan {
     | 'visit_inquiry'
     | 'visit_request'
     | 'trade_in'
+    | 'trade_in_and_visit'
     | 'comparison'
     | 'vehicle_sheet'
     | 'financing'
@@ -64,6 +69,102 @@ export interface ChatTurnPlan {
   isVisitInquiryOnly: boolean;
   suppressHandoff: boolean;
   fichaUrl: string | null;
+}
+
+function buildOfficialLocationAndHours(
+  dealership: DealershipSettings,
+  configUnavailable = false
+): {
+  addressLine: string | null;
+  mapsUrl: string | null;
+  hours: ReturnType<typeof formatDealershipHours>;
+  hasWhatsApp: boolean;
+  markdownLines: string[];
+  factsText: string;
+} {
+  const addressLine = configUnavailable ? null : formatDealershipAddress(dealership);
+  const mapsUrl = configUnavailable ? null : buildDealershipMapsUrl(dealership);
+  const hours = configUnavailable
+    ? {
+        weekdays: null,
+        saturday: null,
+        sunday: null,
+        hasAny: false,
+        inlineSummary: null,
+        summaryLine: null,
+      }
+    : formatDealershipHours(dealership);
+  const hasWhatsApp = Boolean((dealership.salesWhatsapp || dealership.whatsapp || '').trim());
+
+  const markdownLines: string[] = [];
+  if (configUnavailable) {
+    markdownLines.push(
+      `- **Localização e horários:** não foi possível consultar os dados atualizados da loja agora (falha temporária). Tente novamente em instantes${
+        hasWhatsApp ? ' ou confirme com nosso consultor' : ''
+      }.`
+    );
+  } else {
+    if (addressLine) {
+      markdownLines.push(
+        `- **Endereço:** ${addressLine}${mapsUrl ? ` · [Ver no mapa](${mapsUrl})` : ''}`
+      );
+    } else {
+      markdownLines.push(
+        `- **Endereço:** confirme o endereço atualizado com nosso consultor${
+          hasWhatsApp ? ' (botão **Falar com consultor** acima)' : ''
+        }.`
+      );
+    }
+
+    if (hours.hasAny) {
+      if (hours.weekdays) markdownLines.push(`- **Segunda a sexta:** ${hours.weekdays}`);
+      if (hours.saturday) markdownLines.push(`- **Sábado:** ${hours.saturday}`);
+      if (hours.sunday) markdownLines.push(`- **Domingo:** ${hours.sunday}`);
+    } else {
+      markdownLines.push(
+        `- **Horários:** confirme os horários de atendimento com nosso consultor.`
+      );
+    }
+  }
+
+  const factsText = configUnavailable
+    ? 'CONFIGURAÇÃO DA LOJA TEMPORARIAMENTE INDISPONÍVEL (NÃO INVENTE ENDEREÇO NEM HORÁRIO).'
+    : [
+        `Endereço oficial (${dealership.tradeName}): ${addressLine || 'NÃO CADASTRADO (diga para confirmar com o consultor; NUNCA invente endereço)'}`,
+        `Horários oficiais: ${hours.inlineSummary || 'NÃO CADASTRADOS (diga para confirmar com o consultor)'}`,
+      ].join('\n');
+
+  return {
+    addressLine,
+    mapsUrl,
+    hours,
+    hasWhatsApp,
+    markdownLines,
+    factsText,
+  };
+}
+
+function buildReturnToSearchAction(
+  prevFilters: VehicleSearchFilters
+): ChatSuggestedAction | null {
+  if (!hasAnyActiveFilter(prevFilters)) return null;
+  const desc = describeActiveFilters(prevFilters).join(', ');
+  return {
+    id: 'act-return-search',
+    label: 'Voltar à busca anterior',
+    kind: 'prompt',
+    promptText: `Voltar à minha busca anterior: ${desc}`,
+  };
+}
+
+function buildOutOfFilterNote(
+  vehicle: Vehicle,
+  prevFilters: VehicleSearchFilters
+): string {
+  const check = checkVehicleAgainstFilters(vehicle, prevFilters);
+  if (check.matches || !check.shortReason) return '';
+  const quality = analyzeVehicleDataQuality(vehicle);
+  return `\n- **Relação com sua busca anterior:** ${getVehicleDisplayTitle(vehicle)} ${vehicle.year} · **${quality.displayTransmission}** — este veículo está fora da sua busca anterior (${check.shortReason}).`;
 }
 
 function formatVehicleFactLine(v: Vehicle, origin?: string | null): string {
@@ -154,6 +255,7 @@ export function planChatTurn(params: {
   latestUserUtterance: string;
   chatContext?: ChatTurnContextInput | null;
   dealership: DealershipSettings;
+  dealershipConfigUnavailable?: boolean;
   selectedVehicle?: Vehicle | null;
 }): ChatTurnPlan {
   const {
@@ -162,6 +264,7 @@ export function planChatTurn(params: {
     latestUserUtterance,
     chatContext,
     dealership,
+    dealershipConfigUnavailable = false,
     selectedVehicle,
   } = params;
 
@@ -188,21 +291,125 @@ export function planChatTurn(params: {
     userHistoryTexts.push(latestUserUtterance);
   }
 
-  // -------------------------------------------------------------------------
-  // 1. VISIT INQUIRY VS VISIT REQUEST (Never schedule on exploratory question!)
-  // -------------------------------------------------------------------------
+  const locationInfo = buildOfficialLocationAndHours(
+    dealership,
+    dealershipConfigUnavailable
+  );
+
+  // Detect independent compatible intents upfront so multi-intent messages cover ALL requests
   const visitIntent = analyzeVisitIntent(latestUserUtterance);
+  const isTradeInTurn =
+    /\b(troca|usado na troca|dar na troca|avaliar meu|meu carro|tenho um|enviar fotos|mandar fotos|fotos do carro|onde envio as fotos)\b/i.test(
+      normMsg
+    ) && !/\b(comparar)\b/i.test(normMsg);
+
+  // Isolate trade-in relevant messages so prior stock queries (e.g., "Onix 2021") never contaminate trade-in extraction
+  const tradeInHistoryTexts = userHistoryTexts.filter((txt, idx) => {
+    if (idx === userHistoryTexts.length - 1) return true;
+    return /\b(troca|usado|meu carro|tenho um|avaliar meu|sinistro|leilao|pintura|km|quilometragem|manual|automatico|flex|gasolina|versao|modelo|cor)\b/i.test(
+      normalizeTextForMatch(txt)
+    ) && !/\b(ficha|simula|entrada|parcela|estoque|busc|procur|quero carro|me confirma)\b/i.test(
+      normalizeTextForMatch(txt)
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // 1A. COMBINED MULTI-INTENT: TRADE-IN + VISIT / ADDRESS / HOURS
+  // -------------------------------------------------------------------------
+  if (isTradeInTurn && visitIntent !== 'none') {
+    const tradeInfo = extractTradeInInfo(tradeInHistoryTexts);
+    const knownParts: string[] = [];
+    if (tradeInfo.model) knownParts.push(tradeInfo.model);
+    if (tradeInfo.version) knownParts.push(tradeInfo.version);
+    if (tradeInfo.year) knownParts.push(tradeInfo.year);
+    if (tradeInfo.engine) knownParts.push(tradeInfo.engine);
+    if (tradeInfo.transmission) knownParts.push(tradeInfo.transmission);
+    if (tradeInfo.km) knownParts.push(tradeInfo.km);
+
+    const knownSummary =
+      knownParts.length > 0
+        ? `Anotei os dados do seu usado: **${knownParts.join(' · ')}**.`
+        : 'Vamos reunir os dados do seu usado para a **pré-avaliação do consultor**.';
+
+    const missingLine =
+      tradeInfo.missingFields.length > 0
+        ? `Para completar a pré-avaliação, informe apenas o que faltou: **${tradeInfo.missingFields.join(', ')}** (além de eventuais detalhes estéticos/mecânicos ou sinistro).`
+        : 'Os dados principais já estão anotados — basta enviar as fotos para a pré-avaliação humana.';
+
+    const visitFooter =
+      visitIntent === 'inquiry_only'
+        ? 'Sem problema — **nenhum agendamento foi criado**.'
+        : 'Se quiser, posso encaminhar uma **solicitação de visita** para confirmação de horário com um consultor.';
+
+    const deterministicReply =
+      `**1. Pré-avaliação na troca e envio de fotos**\n` +
+      `- ${knownSummary}\n` +
+      `- ${missingLine}\n` +
+      `- **Onde enviar as fotos:** use o botão **Anexar fotos** logo abaixo (ou o ícone de clipe no campo de mensagem) para mandar frente, traseira, laterais, interior e painel com a quilometragem.\n\n` +
+      `**2. Endereço e horários da loja**\n` +
+      `${locationInfo.markdownLines.join('\n')}\n\n` +
+      visitFooter;
+
+    return {
+      intent: 'trade_in_and_visit',
+      useDeterministicDirectly: true,
+      deterministicReply,
+      verifiedFactsPrompt: `PEDIDO COMBINADO (TROCA + LOCALIZAÇÃO/HORÁRIO):\n- Usado informado: ${knownParts.join(', ') || 'nenhum'}\n- Faltando: ${tradeInfo.missingFields.join(', ') || 'nada obrigatório'}\n${locationInfo.factsText}\n- Visita: ${visitIntent === 'inquiry_only' ? 'APENAS CONSULTA — NÃO AGENDAR' : 'SOLICITAÇÃO DE VISITA'}`,
+      activeFilters: prevFilters,
+      recentVehicleIds: recentIds,
+      focusedVehicleId: focusedId,
+      vehicleCards: [],
+      comparison: null,
+      financingSummary: null,
+      promptAttachPhotos: true,
+      suggestedActions: [
+        {
+          id: 'act-attach-photos',
+          label: 'Anexar fotos',
+          kind: 'attach_photos',
+        },
+        ...(visitIntent === 'request_visit'
+          ? [
+              {
+                id: 'act-handoff-combined',
+                label: 'Falar com consultor',
+                kind: 'handoff' as const,
+              },
+            ]
+          : []),
+      ],
+      isVisitInquiryOnly: visitIntent === 'inquiry_only',
+      suppressHandoff: visitIntent === 'inquiry_only',
+      fichaUrl: null,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // 1B. VISIT INQUIRY VS VISIT REQUEST (Never schedule on exploratory question!)
+  // -------------------------------------------------------------------------
   if (visitIntent === 'inquiry_only') {
-    const addressLine = [dealership.address, dealership.city, dealership.state]
-      .filter(Boolean)
-      .join(' — ');
-    const deterministicReply = `Nosso atendimento funciona assim:\n- **Segunda a sexta:** ${dealership.hoursWeekdays}\n- **Sábado:** ${dealership.hoursSaturday}\n- **Domingo:** ${dealership.hoursSunday}\n- **Endereço:** ${addressLine}\n\nSem problema — nenhum agendamento foi criado. Se quiser ver algum carro do estoque ou tirar outra dúvida, é só chamar por aqui.`;
+    const headerLine = dealershipConfigUnavailable
+      ? 'Não consegui consultar o endereço e os horários atualizados agora:'
+      : `Confira as informações oficiais da **${dealership.tradeName}**:`;
+
+    const deterministicReply =
+      `${headerLine}\n${locationInfo.markdownLines.join('\n')}\n\n` +
+      `Sem problema — **nenhum agendamento foi criado**. Se quiser consultar algum carro do estoque ou tirar outra dúvida, é só mandar por aqui.`;
+
+    const actions: ChatSuggestedAction[] = [];
+    if ((!locationInfo.addressLine || !locationInfo.hours.hasAny || dealershipConfigUnavailable) && locationInfo.hasWhatsApp) {
+      actions.push({
+        id: 'act-confirm-address-consultant',
+        label: 'Confirmar com consultor',
+        kind: 'handoff',
+      });
+    }
 
     return {
       intent: 'visit_inquiry',
       useDeterministicDirectly: true,
       deterministicReply,
-      verifiedFactsPrompt: `HORÁRIOS E ENDEREÇO OFICIAIS (${dealership.tradeName}): Seg-Sex ${dealership.hoursWeekdays} | Sábado ${dealership.hoursSaturday} | Domingo ${dealership.hoursSunday} | Endereço: ${addressLine}. O cliente fez apenas uma consulta exploratória e pediu para NÃO agendar. Responda com os dados acima e confirme que nada foi agendado.`,
+      verifiedFactsPrompt: `${locationInfo.factsText}\nO cliente fez apenas uma consulta exploratória e pediu para NÃO agendar.`,
       activeFilters: prevFilters,
       recentVehicleIds: recentIds,
       focusedVehicleId: focusedId,
@@ -210,7 +417,7 @@ export function planChatTurn(params: {
       comparison: null,
       financingSummary: null,
       promptAttachPhotos: false,
-      suggestedActions: [],
+      suggestedActions: actions,
       isVisitInquiryOnly: true,
       suppressHandoff: true,
       fichaUrl: null,
@@ -225,9 +432,6 @@ export function planChatTurn(params: {
       focusedId
     );
     const targetVehicle = ref.status === 'resolved' ? ref.vehicle! : null;
-    const addressLine = [dealership.address, dealership.city, dealership.state]
-      .filter(Boolean)
-      .join(' — ');
 
     let statusNote = '';
     if (targetVehicle && !isVehicleAvailable(targetVehicle)) {
@@ -238,18 +442,17 @@ export function planChatTurn(params: {
       ? ` para conhecer o **${getVehicleDisplayTitle(targetVehicle)} ${targetVehicle.year}**`
       : '';
 
-    const deterministicReply = `Posso encaminhar sua **solicitação de visita**${vehiclePart} para um consultor confirmar o horário com você (a visita só fica confirmada após retorno da equipe).\n- **Endereço:** ${addressLine}\n- **Horários:** ${dealership.hoursWeekdays} | ${dealership.hoursSaturday}${statusNote}\n\nSe quiser prosseguir, use o botão **Falar com consultor** para revisar a mensagem antes de abrir o WhatsApp.`;
+    const deterministicReply =
+      `Posso encaminhar sua **solicitação de visita**${vehiclePart} para um consultor confirmar o horário com você (a visita só fica confirmada após retorno da equipe).\n` +
+      `${locationInfo.markdownLines.join('\n')}${statusNote}\n\n` +
+      `Se quiser prosseguir, use o botão **Falar com consultor** para revisar a mensagem antes de abrir o WhatsApp.`;
 
     const cards = targetVehicle ? [toVehicleCardData(targetVehicle, origin)] : [];
     return {
       intent: 'visit_request',
-      useDeterministicDirectly: false,
+      useDeterministicDirectly: true,
       deterministicReply,
-      verifiedFactsPrompt: `SOLICITAÇÃO DE VISITA (NÃO É VISITA CONFIRMADA):
-- Endereço oficial: ${addressLine}
-- Horários oficiais: Seg-Sex ${dealership.hoursWeekdays} | Sábado ${dealership.hoursSaturday} | Domingo ${dealership.hoursSunday}
-${targetVehicle ? formatVehicleFactLine(targetVehicle, origin) : '- Nenhum veículo específico selecionado ainda.'}
-REGRA: Trate explicitamente como "solicitação de visita" pendente de confirmação com o consultor; NUNCA diga "visita confirmada".`,
+      verifiedFactsPrompt: `SOLICITAÇÃO DE VISITA (NÃO É VISITA CONFIRMADA):\n${locationInfo.factsText}\n${targetVehicle ? formatVehicleFactLine(targetVehicle, origin) : '- Nenhum veículo específico selecionado ainda.'}\nREGRA: Trate explicitamente como "solicitação de visita" pendente de confirmação com o consultor; NUNCA diga "visita confirmada".`,
       activeFilters: prevFilters,
       recentVehicleIds: targetVehicle ? [targetVehicle.id] : recentIds,
       focusedVehicleId: targetVehicle ? targetVehicle.id : focusedId,
@@ -270,13 +473,8 @@ REGRA: Trate explicitamente como "solicitação de visita" pendente de confirma�
   // -------------------------------------------------------------------------
   // 2. TRADE-IN (USADO NA TROCA) — Reuse details, never offer "photo link"
   // -------------------------------------------------------------------------
-  const isTradeInTurn =
-    /\b(troca|usado na troca|dar na troca|avaliar meu|meu carro|tenho um|enviar fotos|mandar fotos|fotos do carro)\b/i.test(
-      normMsg
-    ) && !/\b(ficha|comparar)\b/i.test(normMsg);
-
   if (isTradeInTurn) {
-    const tradeInfo = extractTradeInInfo(userHistoryTexts);
+    const tradeInfo = extractTradeInInfo(tradeInHistoryTexts);
     const knownParts: string[] = [];
     if (tradeInfo.model) knownParts.push(tradeInfo.model);
     if (tradeInfo.version) knownParts.push(tradeInfo.version);
@@ -537,14 +735,36 @@ REGRA: Compare APENAS os veículos acima usando campos reais cadastrados. Não a
         monthlyRatePct: dealership.financingMonthlyRatePct ?? null,
       });
 
+      const targetQuality = analyzeVehicleDataQuality(targetVehicle);
+      const sheetPath = buildVehicleSheetPath(targetVehicle.id);
+      const sheetUrl = buildVehicleSheetUrl(targetVehicle.id, origin);
+      const outOfFilterNote = buildOutOfFilterNote(targetVehicle, prevFilters);
+      const returnSearchAct = outOfFilterNote
+        ? buildReturnToSearchAction(prevFilters)
+        : null;
+
       const termLine = summary.months ? ` em **${summary.months}x**` : '';
       const installmentBlock = summary.estimatedInstallment
         ? `- **Estimativa ilustrativa${termLine}:** aprox. **${formatBrlCurrency(summary.estimatedInstallment)}/mês** (taxa ilustrativa de ${summary.monthlyRatePct?.toFixed(2).replace('.', ',')}% a.m., sujeita à análise de crédito, IOF e tarifas).`
         : `- **Parcela mensal${termLine}:** não calculada porque a taxa efetiva depende da análise de crédito e do banco escolhido (sem chute de parcela).`;
 
-      const deterministicReply = `Para o **${summary.vehicleTitle}** (${formatBrlCurrency(summary.vehiclePrice)}):\n- **Entrada informada:** ${formatBrlCurrency(summary.downPayment)}\n- **Saldo a financiar (antes de juros e encargos):** **${formatBrlCurrency(summary.principalBalance)}**\n${installmentBlock}\n\nSe quiser, você pode abrir a ficha completa ou, quando preferir, solicitar uma simulação real com um consultor (opcional).`;
+      const deterministicReply =
+        `Para o **${summary.vehicleTitle}** (${formatBrlCurrency(summary.vehiclePrice)} · **${targetQuality.displayTransmission}** · ${formatKmBr(targetVehicle.km)}):` +
+        `${outOfFilterNote}\n` +
+        `- **Entrada informada:** ${formatBrlCurrency(summary.downPayment)}\n` +
+        `- **Saldo a financiar (antes de juros e encargos):** **${formatBrlCurrency(summary.principalBalance)}**\n` +
+        `${installmentBlock}\n` +
+        `- **Ficha completa:** [Abrir ficha do veículo](${sheetPath})\n\n` +
+        `Quando preferir, você pode solicitar uma simulação real com um consultor (opcional).`;
 
       const cards = [toVehicleCardData(targetVehicle, origin)];
+      const baseActions = buildContextualActions(cards, {
+        includeSimulate: false,
+        includeHandoff: true,
+        handoffLabel: 'Solicitar simulação real (opcional)',
+      });
+      if (returnSearchAct) baseActions.push(returnSearchAct);
+
       return {
         intent: 'financing',
         useDeterministicDirectly: true,
@@ -563,19 +783,21 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         comparison: null,
         financingSummary: summary,
         promptAttachPhotos: false,
-        suggestedActions: buildContextualActions(cards, {
-          includeSimulate: false,
-          includeHandoff: true,
-          handoffLabel: 'Solicitar simulação real (opcional)',
-        }),
+        suggestedActions: baseActions,
         isVisitInquiryOnly: false,
         suppressHandoff: false,
-        fichaUrl: buildVehicleSheetUrl(targetVehicle.id, origin),
+        fichaUrl: sheetUrl,
       };
     }
 
     if (targetVehicle) {
-      const deterministicReply = `Para simular o **${getVehicleDisplayTitle(targetVehicle)} ${targetVehicle.year}** (**${formatBrlCurrency(targetVehicle.price)}**), qual valor de **entrada** e em quantos **meses** (ex.: 36x, 48x ou 60x) você pretende financiar?`;
+      const targetQuality = analyzeVehicleDataQuality(targetVehicle);
+      const outOfFilterNote = buildOutOfFilterNote(targetVehicle, prevFilters);
+      const returnSearchAct = outOfFilterNote
+        ? buildReturnToSearchAction(prevFilters)
+        : null;
+      const sheetPath = buildVehicleSheetPath(targetVehicle.id);
+      const deterministicReply = `Para simular o **${getVehicleDisplayTitle(targetVehicle)} ${targetVehicle.year}** (**${formatBrlCurrency(targetVehicle.price)}** · **${targetQuality.displayTransmission}**):${outOfFilterNote}\n- **Ficha:** [Abrir ficha do veículo](${sheetPath})\n\nQual valor de **entrada** e em quantos **meses** (ex.: 36x, 48x ou 60x) você pretende financiar?`;
       return {
         intent: 'financing',
         useDeterministicDirectly: true,
@@ -588,7 +810,7 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         comparison: null,
         financingSummary: null,
         promptAttachPhotos: false,
-        suggestedActions: [],
+        suggestedActions: returnSearchAct ? [returnSearchAct] : [],
         isVisitInquiryOnly: false,
         suppressHandoff: true,
         fichaUrl: buildVehicleSheetUrl(targetVehicle.id, origin),
@@ -647,18 +869,36 @@ ${formatVehicleFactLine(targetVehicle, origin)}
       const availabilityLine = isVehicleAvailable(v)
         ? 'Disponível em estoque'
         : `Status atual: **${v.status}** (não disponível para venda imediata)`;
+      const fipeDiffText =
+        f.hasFipeValue && f.hasReferenceMonth && f.diffBrl !== null && f.diffPct !== null
+          ? f.diffBrl > 0
+            ? ` (${formatBrlCurrency(f.diffBrl)} / ${f.diffPct}% abaixo da FIPE)`
+            : f.diffBrl < 0
+              ? ` (${formatBrlCurrency(Math.abs(f.diffBrl))} / ${Math.abs(f.diffPct)}% acima da FIPE)`
+              : ' (no valor da FIPE)'
+          : '';
       const fipeLine = !f.hasFipeValue
         ? 'FIPE: não cadastrada neste veículo'
         : f.hasReferenceMonth
-          ? `FIPE (${f.fipeReferenceMonth}): ${formatBrlCurrency(f.fipePrice!)}`
+          ? `FIPE (${f.fipeReferenceMonth}): ${formatBrlCurrency(f.fipePrice!)}${fipeDiffText}`
           : `FIPE: ${formatBrlCurrency(f.fipePrice!)} (mês de referência não informado)`;
       const conflictWarning = q.hasTransmissionConflict
         ? `\n- **Observação de cadastro:** ${q.conflictDetail} (confirmar com a loja).`
         : '';
+      const outOfFilterNote = buildOutOfFilterNote(v, prevFilters);
+      const returnSearchAct = outOfFilterNote
+        ? buildReturnToSearchAction(prevFilters)
+        : null;
 
-      const deterministicReply = `Aqui está a ficha do **${getVehicleDisplayTitle(v)} ${v.version}** (${v.year}):\n- **Preço à vista:** ${formatBrlCurrency(v.price)} · **${formatKmBr(v.km)}** · ${q.displayTransmission}\n- **${availabilityLine}** · ${fipeLine}${conflictWarning}\n- **Link direto da ficha:** [Abrir ficha do veículo](${sheetPath})\n\nQuer simular financiamento ou comparar com outro veículo?`;
+      const deterministicReply = `Aqui está a ficha do **${getVehicleDisplayTitle(v)}** (${v.year}):\n- **Preço à vista:** ${formatBrlCurrency(v.price)} · **${formatKmBr(v.km)}** · **${q.displayTransmission}**\n- **${availabilityLine}** · ${fipeLine}${conflictWarning}${outOfFilterNote}\n- **Link direto da ficha:** [Abrir ficha do veículo](${sheetPath})\n\nQuer simular financiamento ou comparar com outro veículo?`;
 
       const cards = [toVehicleCardData(v, origin)];
+      const actions = buildContextualActions(cards, {
+        includeSimulate: isVehicleAvailable(v),
+        includeHandoff: true,
+      });
+      if (returnSearchAct) actions.push(returnSearchAct);
+
       return {
         intent: 'vehicle_sheet',
         useDeterministicDirectly: true,
@@ -671,10 +911,81 @@ ${formatVehicleFactLine(targetVehicle, origin)}
         comparison: null,
         financingSummary: null,
         promptAttachPhotos: false,
-        suggestedActions: buildContextualActions(cards, {
-          includeSimulate: isVehicleAvailable(v),
-          includeHandoff: true,
-        }),
+        suggestedActions: actions,
+        isVisitInquiryOnly: false,
+        suppressHandoff: false,
+        fichaUrl: sheetUrl,
+      };
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 5.5 DIRECT SPECIFIC-VEHICLE CONFIRMATION / INSPECTION (preserves prior search!)
+  // Handles queries like "E o Onix manual?", "Me confirma se o Onix 2021 é manual"
+  // without clobbering the previous search filters.
+  // -------------------------------------------------------------------------
+  const looksLikeFilterAdjustment =
+    /\b(agora\s+pode|aument[ae]r?|subir|sobe|mud[ae]r?|alter[ae]r?|limpar|remover|voltar\s+a\s+busca|todos\s+os\s+carros|estoque|ate\s+r?\$?\s*\d|no\s+maximo|menos\s+de\s+\d)\b/i.test(
+      normMsg
+    );
+  if (!looksLikeFilterAdjustment && !/\bfipe\b/i.test(normMsg)) {
+    const directRef = resolveVehicleReference(
+      latestUserUtterance,
+      allVehicles,
+      recentIds,
+      focusedId
+    );
+    const explicitlyMentionsModel =
+      directRef.status === 'resolved' &&
+      directRef.reason &&
+      !['focused_anaphora', 'single_context'].includes(directRef.reason);
+
+    if (explicitlyMentionsModel && directRef.vehicle) {
+      const v = directRef.vehicle;
+      const q = analyzeVehicleDataQuality(v);
+      const f = computeFipeMetrics(v);
+      const sheetPath = buildVehicleSheetPath(v.id);
+      const sheetUrl = buildVehicleSheetUrl(v.id, origin);
+      const outOfFilterNote = buildOutOfFilterNote(v, prevFilters);
+      const returnSearchAct = outOfFilterNote
+        ? buildReturnToSearchAction(prevFilters)
+        : null;
+      const fipeSummary = !f.hasFipeValue
+        ? 'FIPE não cadastrada'
+        : f.hasReferenceMonth
+          ? `FIPE (${f.fipeReferenceMonth}): ${formatBrlCurrency(f.fipePrice!)}`
+          : `FIPE: ${formatBrlCurrency(f.fipePrice!)} (mês de referência não informado)`;
+      const conflictWarning = q.hasTransmissionConflict
+        ? `\n- **Atenção:** ${q.conflictDetail} (confirmar com a loja).`
+        : '';
+
+      const deterministicReply =
+        `Sobre o **${getVehicleDisplayTitle(v)}** (${v.year}):\n` +
+        `- **Câmbio cadastrado:** **${q.displayTransmission}** · **${formatBrlCurrency(v.price)}** · **${formatKmBr(v.km)}** · ${v.status}\n` +
+        `- **${fipeSummary}**${conflictWarning}${outOfFilterNote}\n` +
+        `- **Ficha completa:** [Abrir ficha do veículo](${sheetPath})\n\n` +
+        `Quer simular financiamento deste veículo ou voltar para a busca anterior?`;
+
+      const cards = [toVehicleCardData(v, origin)];
+      const actions = buildContextualActions(cards, {
+        includeSimulate: isVehicleAvailable(v),
+        includeHandoff: true,
+      });
+      if (returnSearchAct) actions.push(returnSearchAct);
+
+      return {
+        intent: 'vehicle_sheet',
+        useDeterministicDirectly: true,
+        deterministicReply,
+        verifiedFactsPrompt: `CONSULTA DIRETA DE VEÍCULO ESPECÍFICO:\n${formatVehicleFactLine(v, origin)}`,
+        activeFilters: prevFilters,
+        recentVehicleIds: [v.id],
+        focusedVehicleId: v.id,
+        vehicleCards: cards,
+        comparison: null,
+        financingSummary: null,
+        promptAttachPhotos: false,
+        suggestedActions: actions,
         isVisitInquiryOnly: false,
         suppressHandoff: false,
         fichaUrl: sheetUrl,
@@ -956,9 +1267,7 @@ ${nearLines.join('\n') || 'Nenhuma alternativa próxima.'}`,
     deterministicReply: fallbackReply,
     verifiedFactsPrompt: `${focusFact}${activeFilterNote}ESTOQUE REAL DISPONÍVEL NO BANCO DE DADOS (${available.length} veículos):
 ${stockLines || 'Nenhum veículo disponível no momento.'}
-ENDEREÇO E HORÁRIOS OFICIAIS (${dealership.tradeName}):
-- Endereço: ${dealership.address}, ${dealership.city}/${dealership.state}
-- Horários: Seg-Sex ${dealership.hoursWeekdays} | Sábado ${dealership.hoursSaturday} | Domingo ${dealership.hoursSunday}`,
+${locationInfo.factsText}`,
     activeFilters: prevFilters,
     recentVehicleIds: resolvedFocus ? [resolvedFocus.id] : recentIds,
     focusedVehicleId: resolvedFocus ? resolvedFocus.id : focusedId,
@@ -992,7 +1301,7 @@ export function guardChatReply(
 
   // Never offer a "link for photos" during trade-in
   if (
-    plan.intent === 'trade_in' &&
+    (plan.intent === 'trade_in' || plan.intent === 'trade_in_and_visit') &&
     /\b(link\s+(?:para|das?|de)\s+(?:enviar\s+)?fotos?|mandar\s+o\s+link)\b/i.test(norm)
   ) {
     return plan.deterministicReply;
@@ -1000,7 +1309,9 @@ export function guardChatReply(
 
   // Never say "visita confirmada" or "agendamento confirmado"
   if (
-    (plan.intent === 'visit_request' || plan.intent === 'visit_inquiry') &&
+    (plan.intent === 'visit_request' ||
+      plan.intent === 'visit_inquiry' ||
+      plan.intent === 'trade_in_and_visit') &&
     /\b(visita\s+confirmada|agendamento\s+confirmado|hor[aá]rio\s+confirmado|agendei\s+sua\s+visita)\b/i.test(
       norm
     )

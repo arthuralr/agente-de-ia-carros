@@ -1,15 +1,19 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Download, PlusSquare, Share, Smartphone, X } from 'lucide-react';
 import { usePWAInstall } from '../../hooks/usePWAInstall';
 
 interface PWAInstallBannerProps {
   variant?: 'whatsapp' | 'storefront';
   appName?: string;
+  suppressed?: boolean;
+  onVisibilityChange?: (visible: boolean) => void;
 }
 
 export const PWAInstallBanner: React.FC<PWAInstallBannerProps> = ({
   variant = 'whatsapp',
   appName = 'Armazém do Carro',
+  suppressed = false,
+  onVisibilityChange,
 }) => {
   const {
     canPromptNative,
@@ -20,7 +24,13 @@ export const PWAInstallBanner: React.FC<PWAInstallBannerProps> = ({
   } = usePWAInstall();
   const [iosGuideOpen, setIosGuideOpen] = useState(false);
 
-  if (!canShowBanner) return null;
+  const isVisible = !suppressed && canShowBanner;
+
+  useEffect(() => {
+    onVisibilityChange?.(isVisible);
+  }, [isVisible, onVisibilityChange]);
+
+  if (!isVisible) return null;
 
   const isWhatsapp = variant === 'whatsapp';
 

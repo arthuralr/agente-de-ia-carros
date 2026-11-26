@@ -60,7 +60,16 @@ import {
   prepareChatAttachment,
   stripMarkdownForPreview,
 } from '../../utils/chatMedia';
-import { formatBrlCurrency, formatKmBr } from '../../utils/vehicleDomain';
+import {
+  analyzeVehicleDataQuality,
+  buildDealershipMapsUrl,
+  checkVehicleAgainstFilters,
+  formatBrlCurrency,
+  formatDealershipAddress,
+  formatDealershipHours,
+  formatKmBr,
+  getVehicleDisplayTitle,
+} from '../../utils/vehicleDomain';
 import { useVirtualConsultant } from '../../hooks/useVirtualConsultant';
 import { useWebPush } from '../../hooks/useWebPush';
 import { ChatMarkdown } from './ChatMarkdown';
@@ -130,14 +139,17 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const [handoffModalState, setHandoffModalState] = useState<{
     isOpen: boolean;
     purpose: HandoffPurpose;
+    focusedVehicle?: Vehicle | null;
     vehicleLabel?: string | null;
     contextSummary?: string | null;
   }>({
     isOpen: false,
     purpose: 'sales',
+    focusedVehicle: undefined,
     vehicleLabel: null,
     contextSummary: null,
   });
+  const [isPwaBannerVisible, setIsPwaBannerVisible] = useState(false);
   const [pushBannerDismissed, setPushBannerDismissed] = useState<boolean>(() => {
     try {
       return (
@@ -199,6 +211,8 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     canRetry,
     retryLastMessage,
     activeFilters,
+    recentVehicleIds,
+    focusedVehicleId,
     clearActiveFilters,
     compareVehicleIds,
     toggleCompareVehicle,
@@ -266,6 +280,22 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     storeWhatsappNumber?.trim() ||
     effectiveSettings.whatsapp;
 
+  const focusedVehicle = useMemo(() => {
+    if (!focusedVehicleId) return null;
+    return (
+      vehicles.find((v) => String(v.id) === String(focusedVehicleId)) || null
+    );
+  }, [focusedVehicleId, vehicles]);
+
+  const recentVehicles = useMemo(() => {
+    if (!recentVehicleIds || recentVehicleIds.length === 0) return [];
+    return recentVehicleIds
+      .map((id) => vehicles.find((v) => String(v.id) === String(id)) || null)
+      .filter((v): v is Vehicle => Boolean(v));
+  }, [recentVehicleIds, vehicles]);
+
+  const appOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+
   // Assemble direct wa.me handoff preview purely from captured session state (ZERO AI tokens)
   const handoffData = useMemo(
     () =>
@@ -276,14 +306,18 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
         leadPhone: customerWhatsapp,
         includeContactData: false,
         sessionId,
+        focusedVehicle,
+        baseUrl: appOrigin,
         messages,
         vehicles,
       }),
     [
+      appOrigin,
       customerName,
       customerWhatsapp,
       effectiveSettings.tradeName,
       effectiveStoreWhatsapp,
+      focusedVehicle,
       messages,
       sessionId,
       vehicles,
@@ -315,11 +349,13 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   const openHandoffPreview = (
     purpose: HandoffPurpose = 'sales',
     vehicleLabel?: string | null,
-    contextSummary?: string | null
+    contextSummary?: string | null,
+    explicitVehicle?: Vehicle | null
   ) => {
     setHandoffModalState({
       isOpen: true,
       purpose,
+      focusedVehicle: explicitVehicle,
       vehicleLabel: vehicleLabel ?? null,
       contextSummary: contextSummary ?? null,
     });
@@ -414,6 +450,29 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     }
     return chips;
   }, [activeFilters]);
+
+  const focusFilterCheck = useMemo(() => {
+    if (!focusedVehicle || activeFilterChips.length === 0) return null;
+    return checkVehicleAgainstFilters(focusedVehicle, activeFilters);
+  }, [activeFilterChips.length, activeFilters, focusedVehicle]);
+
+  const handleReturnToActiveSearch = () => {
+    const parts: string[] = [];
+    if (activeFilters.transmission === 'automatico') parts.push('automático');
+    if (activeFilters.transmission === 'manual') parts.push('manual');
+    if (activeFilters.maxPrice) parts.push(`até ${formatBrlCurrency(activeFilters.maxPrice)}`);
+    if (activeFilters.minPrice) parts.push(`a partir de ${formatBrlCurrency(activeFilters.minPrice)}`);
+    if (activeFilters.maxKm) parts.push(`até ${formatKmBr(activeFilters.maxKm)}`);
+    if (activeFilters.minYear) parts.push(`ano ${activeFilters.minYear} em diante`);
+    if (activeFilters.brand) parts.push(activeFilters.brand);
+    if (activeFilters.model) parts.push(activeFilters.model);
+    if (activeFilters.belowFipeOnly) parts.push('abaixo da FIPE');
+    const prompt =
+      parts.length > 0
+        ? `Quero voltar à busca anterior: ${parts.join(', ')}`
+        : 'Quais veículos estão disponíveis no estoque hoje?';
+    sendQuickPrompt(prompt);
+  };
 
   const sendRichMessageRef = useRef(sendRichMessage);
   useEffect(() => {
@@ -958,14 +1017,42 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
           <MapPin className="w-4 h-4 text-[#008069] shrink-0 mt-0.5" />
           <div>
             <p className="font-semibold text-[#111B21]">Showroom & Horários</p>
-            <p className="text-[11px] text-[#667781] mt-0.5">
-              {effectiveSettings.address} · {effectiveSettings.city}/
-              {effectiveSettings.state}
-            </p>
-            <p className="text-[11px] text-[#667781] mt-0.5">
-              Seg–Sex {effectiveSettings.hoursWeekdays} · Sáb{' '}
-              {effectiveSettings.hoursSaturday}
-            </p>
+            {(() => {
+              const formattedAddress = formatDealershipAddress(effectiveSettings);
+              const mapsUrl = buildDealershipMapsUrl(effectiveSettings);
+              const formattedHours = formatDealershipHours(effectiveSettings);
+              return (
+                <>
+                  {formattedAddress ? (
+                    <p className="text-[11px] text-[#667781] mt-0.5">
+                      {formattedAddress}
+                      {mapsUrl && (
+                        <>
+                          {' · '}
+                          <a
+                            href={mapsUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-[#008069] hover:underline font-medium"
+                          >
+                            Ver no mapa
+                          </a>
+                        </>
+                      )}
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-[#667781] mt-0.5">
+                      Confirme o endereço com nosso consultor.
+                    </p>
+                  )}
+                  <p className="text-[11px] text-[#667781] mt-0.5">
+                    {formattedHours.hasAny
+                      ? formattedHours.summaryLine
+                      : 'Confirme os horários de atendimento com nosso consultor.'}
+                  </p>
+                </>
+              );
+            })()}
           </div>
         </div>
       </div>
@@ -1159,14 +1246,17 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
             </div>
           </header>
 
-          {/* First-Access Installable PWA Banner */}
+          {/* Deferred Installable PWA Banner (never shown on initial empty open; mutually exclusive with Web Push prompt) */}
           <PWAInstallBanner
             variant="whatsapp"
             appName={effectiveSettings.tradeName}
+            suppressed={userMessageCount === 0}
+            onVisibilityChange={setIsPwaBannerVisible}
           />
 
-          {/* Subtle Visitor Web Push Opt-In Banner (deferred until user engages deeply, never blocking initial search) */}
+          {/* Subtle Visitor Web Push Opt-In Banner (deferred until user engages deeply AND never simultaneous with PWA install banner) */}
           {userMessageCount >= 3 &&
+            !isPwaBannerVisible &&
             !visitorPush.isSubscribed &&
             !pushBannerDismissed &&
             visitorPush.isSupported &&
@@ -1568,6 +1658,21 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                               `Quero simular financiamento do ${card.brand} ${card.model} ${card.year}`
                             )
                           }
+                          onConsult={(card) => {
+                            const matchedVehicle =
+                              vehicles.find(
+                                (v) => String(v.id) === String(card.id)
+                              ) || null;
+                            const cardTitle = getVehicleDisplayTitle(card);
+                            openHandoffPreview(
+                              'sales',
+                              matchedVehicle
+                                ? null
+                                : `${cardTitle} ${card.year} (Ref. #${card.id})`,
+                              `Tenho interesse no ${cardTitle} ${card.year}`,
+                              matchedVehicle
+                            );
+                          }}
                         />
                       )}
 
@@ -1710,8 +1815,22 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                               if (action.kind === 'attach_photos') {
                                 handleTriggerPhotoAttach();
                               } else if (action.kind === 'handoff') {
+                                const actionVehicle = action.vehicleId
+                                  ? vehicles.find(
+                                      (v) => String(v.id) === String(action.vehicleId)
+                                    ) || null
+                                  : msg.financingSummary?.vehicleId
+                                    ? vehicles.find(
+                                        (v) =>
+                                          String(v.id) ===
+                                          String(msg.financingSummary?.vehicleId)
+                                      ) || null
+                                    : undefined;
                                 openHandoffPreview(
-                                  msg.financingSummary ? 'financing' : 'sales'
+                                  msg.financingSummary ? 'financing' : 'sales',
+                                  null,
+                                  null,
+                                  actionVehicle
                                 );
                               } else if (
                                 action.kind === 'open_sheet' &&
@@ -1928,24 +2047,58 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
               </div>
             )}
 
-            {/* Active Filters Bar (preserved across turns with 1-click clear) */}
+            {/* Active Filters & Focused Vehicle Status Bar (clearly distinguishes out-of-filter focus) */}
             {!isRecording && activeFilterChips.length > 0 && (
-              <div className="px-3 sm:px-4 pt-2 flex items-center justify-between gap-2 text-xs">
-                <div className="flex items-center gap-1.5 overflow-x-auto min-w-0">
-                  <span className="text-[11px] font-semibold text-[#54656F] shrink-0">
-                    Filtros:
-                  </span>
-                  <span className="text-[11.5px] text-[#111B21] truncate">
-                    {activeFilterChips.join(' · ')}
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={clearActiveFilters}
-                  className="text-[11.5px] font-semibold text-[#075E54] hover:underline whitespace-nowrap shrink-0 px-1.5 py-1"
-                >
-                  Limpar filtros
-                </button>
+              <div className="px-3 sm:px-4 pt-2 space-y-1 text-xs">
+                {focusFilterCheck && !focusFilterCheck.matches && focusedVehicle ? (
+                  <div className="rounded-lg bg-[#FFF7E6] border border-amber-300/70 px-2.5 py-2 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+                    <div className="min-w-0 text-[11.5px] text-[#5C3D00] leading-snug">
+                      <span className="font-semibold">
+                        Em foco: {getVehicleDisplayTitle(focusedVehicle)} (
+                        {analyzeVehicleDataQuality(focusedVehicle).displayTransmission})
+                      </span>{' '}
+                      <span className="text-[#7A5200]">
+                        — fora da busca ({activeFilterChips.join(' · ')})
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        disabled={isSending}
+                        onClick={handleReturnToActiveSearch}
+                        className="text-[11.5px] font-semibold text-[#075E54] hover:underline whitespace-nowrap disabled:opacity-50"
+                      >
+                        Voltar à busca
+                      </button>
+                      <span aria-hidden="true" className="text-amber-400">·</span>
+                      <button
+                        type="button"
+                        onClick={clearActiveFilters}
+                        className="text-[11.5px] font-medium text-[#54656F] hover:underline whitespace-nowrap"
+                      >
+                        Limpar filtros
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 overflow-x-auto min-w-0">
+                      <span className="text-[11px] font-semibold text-[#54656F] shrink-0">
+                        Filtros:
+                      </span>
+                      <span className="text-[11.5px] text-[#111B21] truncate">
+                        {activeFilterChips.join(' · ')}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={clearActiveFilters}
+                      className="text-[11.5px] font-semibold text-[#075E54] hover:underline whitespace-nowrap shrink-0 px-1.5 py-1"
+                    >
+                      Limpar filtros
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -2272,11 +2425,22 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       <WhatsAppHandoffModal
         isOpen={handoffModalState.isOpen}
         onClose={() =>
-          setHandoffModalState((prev) => ({ ...prev, isOpen: false }))
+          setHandoffModalState((prev) => ({
+            ...prev,
+            isOpen: false,
+            focusedVehicle: undefined,
+          }))
         }
         settings={effectiveSettings}
         fallbackWhatsapp={storeWhatsappNumber}
         purpose={handoffModalState.purpose}
+        focusedVehicle={
+          handoffModalState.focusedVehicle !== undefined
+            ? handoffModalState.focusedVehicle
+            : focusedVehicle
+        }
+        recentVehicles={recentVehicles}
+        baseUrl={appOrigin}
         vehicleLabel={handoffModalState.vehicleLabel}
         contextSummary={handoffModalState.contextSummary}
         sessionId={sessionId}

@@ -146,7 +146,7 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
               {scheduledVisits.length}
             </span>
             <span className="text-xs text-zinc-400">
-              Showroom Moema
+              Showroom
             </span>
           </div>
           <p className="mt-2 text-xs text-zinc-500">

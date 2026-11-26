@@ -6,6 +6,7 @@ import {
   Check,
   GitCompareArrows,
   Info,
+  MessageCircle,
 } from 'lucide-react';
 import {
   VehicleCardData,
@@ -25,6 +26,7 @@ interface ChatVehicleCardsProps {
   onOpenSheet: (card: VehicleCardData) => void;
   onToggleCompare: (card: VehicleCardData) => void;
   onSimulate: (card: VehicleCardData) => void;
+  onConsult?: (card: VehicleCardData) => void;
 }
 
 export const ChatVehicleCards: React.FC<ChatVehicleCardsProps> = ({
@@ -33,6 +35,7 @@ export const ChatVehicleCards: React.FC<ChatVehicleCardsProps> = ({
   onOpenSheet,
   onToggleCompare,
   onSimulate,
+  onConsult,
 }) => {
   if (!cards || cards.length === 0) return null;
 
@@ -160,6 +163,17 @@ export const ChatVehicleCards: React.FC<ChatVehicleCardsProps> = ({
                     >
                       <Calculator className="w-3.5 h-3.5" />
                       <span>Simular</span>
+                    </button>
+                  )}
+
+                  {!isUnavailable && onConsult && (
+                    <button
+                      type="button"
+                      onClick={() => onConsult(card)}
+                      className="inline-flex items-center justify-center gap-1 px-3 py-2 min-h-[38px] rounded-lg border border-emerald-600/35 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                    >
+                      <MessageCircle className="w-3.5 h-3.5 text-emerald-700" />
+                      <span>WhatsApp</span>
                     </button>
                   )}
                 </div>

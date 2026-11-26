@@ -9,7 +9,12 @@ import {
   X,
 } from 'lucide-react';
 import { DealershipSettings } from '../../types';
-import { formatPhoneDisplay } from '../../utils/vehicleDomain';
+import {
+  buildDealershipMapsUrl,
+  formatDealershipAddress,
+  formatDealershipHours,
+  formatPhoneDisplay,
+} from '../../utils/vehicleDomain';
 import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 
 interface PublicFooterProps {
@@ -26,6 +31,10 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
   const [infoModal, setInfoModal] = useState<'address' | 'social' | null>(null);
   const [handoffOpen, setHandoffOpen] = useState(false);
   const activeSalesPhone = settings.salesWhatsapp || settings.whatsapp;
+
+  const formattedAddress = formatDealershipAddress(settings);
+  const mapsUrl = buildDealershipMapsUrl(settings);
+  const formattedHours = formatDealershipHours(settings);
 
   return (
     <footer className="border-t border-white/[0.08] bg-[#0B0B0E] mt-16">
@@ -56,8 +65,8 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
             </div>
 
             <p className="text-xs text-zinc-400 leading-relaxed">
-              {settings.address}, {settings.city} - {settings.state} · Atendimento:{' '}
-              {settings.hoursWeekdays} (Seg–Sex) e {settings.hoursSaturday} (Sáb).
+              {formattedAddress || 'Confirme o endereço com nosso consultor'}
+              {formattedHours.hasAny ? ` · ${formattedHours.summaryLine}` : ''}
             </p>
           </div>
 
@@ -177,35 +186,66 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
                 <>
                   <div className="space-y-1">
                     <p className="font-semibold text-white">{settings.tradeName}</p>
-                    <p className="text-xs text-zinc-300">{settings.address}</p>
-                    <p className="text-xs text-zinc-400">
-                      {settings.city} - {settings.state}
-                    </p>
+                    {formattedAddress ? (
+                      <p className="text-xs text-zinc-300">{formattedAddress}</p>
+                    ) : (
+                      <p className="text-xs text-zinc-400">
+                        Confirme o endereço com nosso consultor pelo WhatsApp.
+                      </p>
+                    )}
                   </div>
                   <div className="p-3.5 rounded-lg bg-[#09090B] border border-white/[0.08] text-xs text-zinc-300 space-y-1">
-                    <p>Segunda a Sexta: {settings.hoursWeekdays}</p>
-                    <p>Sábados: {settings.hoursSaturday}</p>
-                    <p>Domingos: {settings.hoursSunday}</p>
+                    {formattedHours.hasAny ? (
+                      <>
+                        {formattedHours.weekdays && (
+                          <p>Segunda a Sexta: {formattedHours.weekdays}</p>
+                        )}
+                        {formattedHours.saturday && (
+                          <p>Sábado: {formattedHours.saturday}</p>
+                        )}
+                        {formattedHours.sunday && (
+                          <p>Domingo: {formattedHours.sunday}</p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-zinc-400">
+                        Confirme os horários de atendimento com nosso consultor.
+                      </p>
+                    )}
                   </div>
                   <div className="flex items-center gap-3 pt-1">
-                    <a
-                      href={`https://maps.google.com/?q=${encodeURIComponent(
-                        `${settings.address}, ${settings.city} - ${settings.state}`
-                      )}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500"
-                    >
-                      <MapPin className="w-3.5 h-3.5" />
-                      <span>Abrir no Google Maps</span>
-                    </a>
-                    <a
-                      href={`tel:${settings.phone.replace(/\D/g, '')}`}
-                      className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium text-zinc-200 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08]"
-                    >
-                      <Phone className="w-3.5 h-3.5" />
-                      <span>Ligar</span>
-                    </a>
+                    {mapsUrl ? (
+                      <a
+                        href={mapsUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500"
+                      >
+                        <MapPin className="w-3.5 h-3.5" />
+                        <span>Abrir no Google Maps</span>
+                      </a>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setInfoModal(null);
+                          setHandoffOpen(true);
+                        }}
+                        className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500"
+                      >
+                        <MessageCircle className="w-3.5 h-3.5" />
+                        <span>Confirmar com consultor</span>
+                      </button>
+                    )}
+                    {settings.phone.replace(/\D/g, '').length >= 8 && (
+                      <a
+                        href={`tel:${settings.phone.replace(/\D/g, '')}`}
+                        className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium text-zinc-200 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08]"
+                      >
+                        <Phone className="w-3.5 h-3.5" />
+                        <span>Ligar</span>
+                      </a>
+                    )}
                   </div>
                 </>
               ) : (
@@ -223,15 +263,6 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
                     >
                       <span>Instagram Oficial</span>
                       <span className="font-mono text-zinc-400">@armazemdocarro</span>
-                    </a>
-                    <a
-                      href="https://tiktok.com"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="flex items-center justify-between p-3.5 rounded-lg bg-[#09090B] border border-white/[0.08] hover:border-red-600/40 text-xs text-white transition-colors"
-                    >
-                      <span>TikTok Showroom</span>
-                      <span className="font-mono text-zinc-400">@armazemdocarro.sp</span>
                     </a>
                     <button
                       type="button"

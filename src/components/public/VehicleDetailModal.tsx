@@ -380,6 +380,8 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
         onClose={() => setHandoffModalOpen(false)}
         settings={settings}
         purpose="sales"
+        focusedVehicle={vehicle}
+        baseUrl={typeof window !== 'undefined' ? window.location.origin : ''}
         vehicleLabel={`${vehicle.brand} ${vehicle.model} ${vehicle.year} (Ref. #${vehicle.id})`}
         contextSummary={`Tenho interesse no ${vehicle.brand} ${vehicle.model} ${vehicle.year}`}
       />
