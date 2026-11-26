@@ -7,17 +7,31 @@ export type AppViewMode =
   | 'login'
   | 'admin';
 
+export type StaffRole = 'vendedor' | 'assistente' | 'gestor' | 'administrador';
+
 export interface AdminUser {
   id: number;
   name: string;
   email: string;
   role: string;
+  roleCode: StaffRole;
   avatarUrl: string | null;
+  active?: boolean;
+  lastLoginAt?: string | null;
 }
 
 export type OperationMode = 'full' | 'agent_only';
 
 export type NavModule =
+  | 'hoje'
+  | 'atendimentos'
+  | 'estoque'
+  | 'agenda_trocas'
+  | 'divulgacao'
+  | 'documentos'
+  | 'gestao'
+  | 'configuracoes'
+  // Legacy aliases kept for full backwards compatibility
   | 'dashboard'
   | 'inventory'
   | 'crm'
@@ -210,6 +224,32 @@ export interface Lead {
   chatHistory: ChatMessage[];
 }
 
+export type SessionAutomationMode = 'ai_active' | 'human_active' | 'paused';
+export type SessionCommercialStage =
+  | 'Novo Lead'
+  | 'Em Atendimento'
+  | 'Proposta'
+  | 'Visita'
+  | 'Fechado'
+  | 'Perdido';
+
+export interface SessionNegotiationContext {
+  activeFilters?: VehicleSearchFilters | null;
+  focusedVehicleId?: string | null;
+  budgetMax?: number | null;
+  financingSummary?: VehicleFinancingSummary | null;
+  tradeInSummary?: {
+    brandModel?: string;
+    yearText?: string;
+    km?: number | null;
+    transmission?: string;
+    pendingItems?: string[];
+  } | null;
+  visitStatus?: 'consultada' | 'solicitada' | 'confirmada' | null;
+  nextAction?: string | null;
+  sourceCampaign?: string | null;
+}
+
 export interface ChatSessionSummary {
   id: number;
   sessionId: string;
@@ -221,12 +261,29 @@ export interface ChatSessionSummary {
   aiSummaryUpdatedAt?: string | null;
   whatsappHandoffAt?: string | null;
   handoffStatus?: string | null;
+  assignedUserId?: number | null;
+  assignedUserName?: string | null;
+  assignedAt?: string | null;
+  firstHumanReplyAt?: string | null;
+  automationMode?: SessionAutomationMode;
+  stage?: SessionCommercialStage;
+  lossReason?: string | null;
+  focusedVehicleId?: number | null;
+  context?: SessionNegotiationContext | null;
+  version?: number;
   createdAt: string;
   updatedAt: string;
   messageCount: number;
   lastMessage: string | null;
   lastSender: 'user' | 'assistant' | null;
 }
+
+export type MessageDeliveryChannel =
+  | 'ai_auto'
+  | 'human_chat'
+  | 'suggested_draft'
+  | 'whatsapp_manual_log'
+  | 'chat';
 
 export interface ChatAuditMessage {
   id: number;
@@ -244,6 +301,8 @@ export interface ChatAuditMessage {
   attachmentDownloadUrl?: string | null;
   senderLabel?: string | null;
   isHumanConsultant?: boolean;
+  authorUserId?: number | null;
+  deliveryChannel?: MessageDeliveryChannel | null;
   createdAt: string;
 }
 
@@ -323,3 +382,257 @@ export interface DealershipSettings {
   financingMonthlyRatePct?: number | null;
   logoUrl?: string;
 }
+
+// ============================================================================
+// CENTRAL DA REVENDA — WORKFLOW, AGENDA, TROCAS, DIVULGAÇÃO, DOCUMENTOS, GESTÃO
+// ============================================================================
+
+export interface StaffInviteRecord {
+  id: number;
+  name: string;
+  email: string;
+  roleCode: StaffRole;
+  invitedByName: string | null;
+  expiresAt: string;
+  acceptedAt: string | null;
+  createdAt: string;
+}
+
+export interface StaffTaskRecord {
+  id: number;
+  sessionId: string | null;
+  leadId: number | null;
+  vehicleId: number | null;
+  assignedUserId: number | null;
+  assignedUserName: string | null;
+  title: string;
+  notes: string | null;
+  dueAt: string | null;
+  status: 'pendente' | 'concluida' | 'cancelada';
+  createdByName: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
+export type VisitStatus =
+  | 'consultada'
+  | 'solicitada'
+  | 'confirmada'
+  | 'realizada'
+  | 'cancelada';
+
+export interface VisitRecord {
+  id: number;
+  sessionId: string | null;
+  leadId: number | null;
+  vehicleId: number | null;
+  vehicleLabel: string | null;
+  customerName: string | null;
+  customerPhone: string | null;
+  status: VisitStatus;
+  scheduledDate: string | null;
+  scheduledTime: string | null;
+  assignedUserId: number | null;
+  assignedUserName: string | null;
+  notes: string | null;
+  createdByName: string | null;
+  updatedByName: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TradeInStatus =
+  | 'aguardando_dados'
+  | 'aguardando_fotos'
+  | 'em_avaliacao'
+  | 'aprovada'
+  | 'recusada';
+
+export interface TradeInRecord {
+  id: number;
+  sessionId: string | null;
+  leadId: number | null;
+  targetVehicleId: number | null;
+  customerName: string | null;
+  customerPhone: string | null;
+  brandModel: string;
+  yearText: string | null;
+  versionText: string | null;
+  transmission: string | null;
+  km: number | null;
+  color: string | null;
+  plate: string | null;
+  conditionNotes: string | null;
+  photos: Array<{ url: string; name: string }>;
+  pendingItems: string[];
+  status: TradeInStatus;
+  approvedValue: number | null;
+  evaluatedByName: string | null;
+  evaluatedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type MarketingFormat = 'feed' | 'stories' | 'classificado' | 'carrossel';
+
+export interface MarketingDraftRecord {
+  id: number;
+  vehicleId: number;
+  format: MarketingFormat;
+  title: string;
+  caption: string;
+  selectedPhotoUrl: string | null;
+  selectedPhotos: string[];
+  templateConfig: Record<string, unknown>;
+  snapshotPrice: number;
+  snapshotStatus: string;
+  publicSheetUrl: string | null;
+  trackingSource: string | null;
+  createdByName: string | null;
+  updatedByName: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type DocumentTypeSlug =
+  | 'proposta_comercial'
+  | 'pre_avaliacao_troca'
+  | 'ficha_visita'
+  | 'termo_entrega'
+  | 'recibo'
+  | 'contrato';
+
+export interface DocumentFieldSchema {
+  key: string;
+  label: string;
+  type: 'text' | 'number' | 'currency' | 'date' | 'select' | 'boolean' | 'textarea';
+  required: boolean;
+  options?: string[];
+  source?: 'vehicle' | 'session' | 'lead' | 'financing' | 'trade_in' | 'dealership';
+  showWhen?: {
+    field: string;
+    equals: boolean | string;
+  };
+}
+
+export interface DocumentTemplateRecord {
+  id: number;
+  slug: string;
+  name: string;
+  docType: DocumentTypeSlug;
+  version: number;
+  status: 'ativo' | 'rascunho' | 'arquivado';
+  isExampleTemplate: boolean;
+  allowedRoles: StaffRole[];
+  fieldsSchema: DocumentFieldSchema[];
+  bodyTemplate: string;
+  createdByName: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface IssuedDocumentRecord {
+  id: number;
+  idempotencyKey: string | null;
+  templateId: number | null;
+  templateSlug: string;
+  templateName: string;
+  templateVersion: number;
+  docType: DocumentTypeSlug;
+  sessionId: string | null;
+  leadId: number | null;
+  vehicleId: number | null;
+  supersedesDocumentId: number | null;
+  issuedById: number | null;
+  issuedByName: string;
+  dealershipSnapshot: DealershipSettings;
+  vehicleSnapshot: Partial<Vehicle> | null;
+  values: Record<string, string | number | boolean | null>;
+  calculatedTotals: {
+    vehiclePrice: number;
+    downPayment: number;
+    tradeInValue: number;
+    principalBalance: number;
+    installments: number | null;
+    monthlyRatePct: number | null;
+    estimatedInstallment: number | null;
+    calculationType: string;
+    note: string;
+  } | null;
+  renderedText: string;
+  createdAt: string;
+}
+
+export interface TodayActionSummary {
+  awaitingReply: ChatSessionSummary[];
+  proposalsToFollowUp: Array<{
+    documentId: number;
+    sessionId: string | null;
+    vehicleId: number | null;
+    customerName: string;
+    vehicleTitle: string;
+    principalBalance: number;
+    createdAt: string;
+  }>;
+  visitsToday: VisitRecord[];
+  pendingTradeIns: TradeInRecord[];
+  pendingTasks: StaffTaskRecord[];
+  incompleteVehicles: Array<{
+    id: string;
+    title: string;
+    status: VehicleStatus;
+    issues: string[];
+  }>;
+}
+
+export interface ManagementMetrics {
+  avgFirstHumanReplyMinutes: number | null;
+  humanReplySampleSize: number;
+  queueByAssignee: Array<{
+    assigneeName: string;
+    assigneeId: number | null;
+    total: number;
+    awaitingReply: number;
+    sessions: Array<{ sessionId: string; leadName: string | null; stage: string }>;
+  }>;
+  funnel: {
+    interesse: number;
+    proposta: number;
+    visita: number;
+    venda: number;
+  };
+  lossReasons: Array<{ reason: string; count: number; sessionIds: string[] }>;
+  demandWithoutProgress: Array<{
+    vehicleId: string;
+    title: string;
+    status: string;
+    inquiries: number;
+    proposals: number;
+    visits: number;
+  }>;
+  reactivationQueue: Array<{
+    id: string;
+    reason: string;
+    sessionId: string | null;
+    customerName: string;
+    customerPhone: string | null;
+    vehicleId: string | null;
+    vehicleTitle: string;
+    draftMessage: string;
+    lastActivityAt: string;
+  }>;
+}
+
+export interface CopilotQueryResult {
+  answer: string;
+  mode: 'deterministic_query' | 'stock_alternatives' | 'draft_reply' | 'summary';
+  draftText?: string | null;
+  records: Array<{
+    type: 'session' | 'vehicle' | 'visit' | 'trade_in' | 'document';
+    id: string;
+    title: string;
+    subtitle: string;
+    actionLabel: string;
+  }>;
+}
+

@@ -5,11 +5,12 @@ import {
   BadgePercent,
   Check,
   Edit3,
+  FileText,
   Loader2,
+  Megaphone,
   Plus,
   RefreshCw,
   Search,
-  Sparkles,
   Trash2,
   Upload,
   X,
@@ -31,12 +32,17 @@ import { VehicleImage } from '../VehicleImage';
 
 interface InventoryModuleProps {
   vehicles: Vehicle[];
+  canEdit?: boolean;
+  canDelete?: boolean;
   onAddVehicle: (vehicle: Vehicle) => Promise<void>;
   onUpdateVehicle: (vehicle: Vehicle) => Promise<void>;
   onDeleteVehicle: (id: string) => Promise<void>;
   onGeneratePostForVehicle: (vehicleId: string) => void;
+  onGenerateDocumentForVehicle?: (vehicleId: string) => void;
   externalModalOpen: boolean;
   onCloseExternalModal: () => void;
+  preselectedEditVehicleId?: string | null;
+  onClearPreselectedEditVehicle?: () => void;
 }
 
 const COMMON_OPTIONALS = [
@@ -69,12 +75,17 @@ function getStatusTextClass(status: VehicleStatus): string {
 
 export const InventoryModule: React.FC<InventoryModuleProps> = ({
   vehicles,
+  canEdit = true,
+  canDelete = true,
   onAddVehicle,
   onUpdateVehicle,
   onDeleteVehicle,
   onGeneratePostForVehicle,
+  onGenerateDocumentForVehicle,
   externalModalOpen,
   onCloseExternalModal,
+  preselectedEditVehicleId,
+  onClearPreselectedEditVehicle,
 }) => {
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'Todos' | VehicleStatus>('Todos');
@@ -116,11 +127,24 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
   });
 
   useEffect(() => {
-    if (externalModalOpen) {
+    if (externalModalOpen && canEdit) {
       openCreateModal();
       onCloseExternalModal();
+    } else if (externalModalOpen) {
+      onCloseExternalModal();
     }
-  }, [externalModalOpen, onCloseExternalModal]);
+  }, [externalModalOpen, onCloseExternalModal, canEdit]);
+
+  useEffect(() => {
+    if (!preselectedEditVehicleId || !canEdit) return;
+    const found = vehicles.find(
+      (v) => String(v.id) === String(preselectedEditVehicleId)
+    );
+    if (found) {
+      openEditModal(found);
+      onClearPreselectedEditVehicle?.();
+    }
+  }, [preselectedEditVehicleId, vehicles, canEdit, onClearPreselectedEditVehicle]);
 
   const openCreateModal = () => {
     setEditingVehicle(null);
@@ -412,14 +436,16 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
           )}
         </div>
 
-        <button
-          type="button"
-          onClick={openCreateModal}
-          className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors whitespace-nowrap shrink-0"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Novo Veículo</span>
-        </button>
+        {canEdit && (
+          <button
+            type="button"
+            onClick={openCreateModal}
+            className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors whitespace-nowrap shrink-0"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Novo Veículo</span>
+          </button>
+        )}
       </div>
 
       {successNotice && (
@@ -448,14 +474,16 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
             <p className="text-xs text-zinc-500 mt-1">
               Ajuste a busca ou cadastre um novo veículo no inventário.
             </p>
-            <button
-              type="button"
-              onClick={openCreateModal}
-              className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Cadastrar Primeiro Veículo</span>
-            </button>
+            {canEdit && (
+              <button
+                type="button"
+                onClick={openCreateModal}
+                className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Cadastrar Primeiro Veículo</span>
+              </button>
+            )}
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -577,25 +605,31 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                     </td>
 
                     <td className="py-3.5 px-4 whitespace-nowrap">
-                      <select
-                        aria-label={`Status de ${vehicle.brand} ${vehicle.model}`}
-                        value={vehicle.status}
-                        onChange={(e) =>
-                          handleQuickStatusChange(
-                            vehicle,
-                            e.target.value as VehicleStatus
-                          )
-                        }
-                        className={`bg-[#09090B] border border-white/[0.1] hover:border-white/[0.2] rounded-lg px-2.5 py-1.5 text-xs font-medium focus:outline-none focus:border-red-600 cursor-pointer ${getStatusTextClass(
-                          vehicle.status
-                        )}`}
-                      >
-                        {STATUS_OPTIONS.map((st) => (
-                          <option key={st} value={st} className="bg-zinc-950 text-zinc-100">
-                            {st}
-                          </option>
-                        ))}
-                      </select>
+                      {canEdit ? (
+                        <select
+                          aria-label={`Status de ${vehicle.brand} ${vehicle.model}`}
+                          value={vehicle.status}
+                          onChange={(e) =>
+                            handleQuickStatusChange(
+                              vehicle,
+                              e.target.value as VehicleStatus
+                            )
+                          }
+                          className={`bg-[#09090B] border border-white/[0.1] hover:border-white/[0.2] rounded-lg px-2.5 py-1.5 text-xs font-medium focus:outline-none focus:border-red-600 cursor-pointer ${getStatusTextClass(
+                            vehicle.status
+                          )}`}
+                        >
+                          {STATUS_OPTIONS.map((st) => (
+                            <option key={st} value={st} className="bg-zinc-950 text-zinc-100">
+                              {st}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className={`text-xs font-medium ${getStatusTextClass(vehicle.status)}`}>
+                          {vehicle.status}
+                        </span>
+                      )}
                     </td>
 
                     <td className="py-3.5 px-5 text-right whitespace-nowrap">
@@ -603,27 +637,41 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                         <button
                           type="button"
                           onClick={() => onGeneratePostForVehicle(vehicle.id)}
-                          title="Gerar Post com IA"
+                          title="Gerar peça de divulgação"
                           className="p-2 rounded-lg text-zinc-400 hover:text-red-400 hover:bg-red-600/10 transition-colors"
                         >
-                          <Sparkles className="w-4 h-4" />
+                          <Megaphone className="w-4 h-4" />
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => openEditModal(vehicle)}
-                          title="Editar veículo"
-                          className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-white/[0.06] transition-colors"
-                        >
-                          <Edit3 className="w-4 h-4" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onDeleteVehicle(vehicle.id)}
-                          title="Excluir veículo"
-                          className="p-2 rounded-lg text-zinc-400 hover:text-red-400 hover:bg-red-600/10 transition-colors"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                        {onGenerateDocumentForVehicle && (
+                          <button
+                            type="button"
+                            onClick={() => onGenerateDocumentForVehicle(vehicle.id)}
+                            title="Emitir proposta / documento"
+                            className="p-2 rounded-lg text-zinc-400 hover:text-emerald-400 hover:bg-emerald-600/10 transition-colors"
+                          >
+                            <FileText className="w-4 h-4" />
+                          </button>
+                        )}
+                        {canEdit && (
+                          <button
+                            type="button"
+                            onClick={() => openEditModal(vehicle)}
+                            title="Editar veículo"
+                            className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-white/[0.06] transition-colors"
+                          >
+                            <Edit3 className="w-4 h-4" />
+                          </button>
+                        )}
+                        {canDelete && (
+                          <button
+                            type="button"
+                            onClick={() => onDeleteVehicle(vehicle.id)}
+                            title="Excluir veículo"
+                            className="p-2 rounded-lg text-zinc-400 hover:text-red-400 hover:bg-red-600/10 transition-colors"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>

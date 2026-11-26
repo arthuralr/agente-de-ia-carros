@@ -156,7 +156,7 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
               onClick={onOpenAdmin}
               className="text-zinc-400 hover:text-white transition-colors underline underline-offset-4 whitespace-nowrap"
             >
-              Painel Administrativo
+              Acesso da equipe
             </button>
           </div>
         </div>

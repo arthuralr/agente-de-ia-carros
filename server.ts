@@ -53,6 +53,16 @@ import {
   guardChatReply,
   planChatTurn,
 } from './src/utils/chatOrchestrator';
+import {
+  hasPermission,
+  normalizeStaffRole,
+  StaffPermission,
+} from './src/utils/rbac';
+import {
+  ensureCentralRevendaSchemaAndSeeds,
+  recordStaffAudit,
+} from './src/db/centralSchema';
+import { registerCentralRevendaRoutes } from './src/server/centralRoutes';
 import { DealershipSettings } from './src/types';
 
 if (fs.existsSync('.env.local')) {
@@ -839,7 +849,7 @@ interface GeminiUsageMetadataLike {
   totalTokenCount?: number | null;
 }
 
-type AiUsageFeature = 'chat_text' | 'chat_audio' | 'crm_summary' | 'social_post';
+type AiUsageFeature = 'chat_text' | 'chat_audio' | 'crm_summary' | 'social_post' | 'marketing_polish';
 
 /**
  * Persiste silenciosamente o consumo de tokens reportado pelo Gemini em ai_usage_logs.
@@ -1003,7 +1013,7 @@ async function resolveAuthenticatedAdmin(
   if (!payload) return null;
 
   const userRes = await pool.query<DbAdminUserRow>(
-    `SELECT id, name, email, role, avatar_url, active
+    `SELECT id, name, email, role, role_code, avatar_url, active
      FROM admin_users
      WHERE id = $1 AND active = true
      LIMIT 1`,
@@ -1018,7 +1028,9 @@ async function resolveAuthenticatedAdmin(
     name: row.name,
     email: row.email,
     role: row.role,
+    roleCode: normalizeStaffRole(row.role_code, row.role),
     avatarUrl: row.avatar_url,
+    active: Boolean(row.active),
   };
 }
 
@@ -1044,6 +1056,28 @@ async function requireAdminAuth(
   }
 }
 
+function requirePermission(permission: StaffPermission) {
+  return async (
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      void requireAdminAuth(req, res, () => resolve());
+    });
+    if (res.headersSent || !req.adminUser) return;
+    if (!hasPermission(req.adminUser.roleCode, permission)) {
+      res.status(403).json({
+        error: 'Permissão insuficiente para executar esta ação na Central da Revenda.',
+        requiredPermission: permission,
+        roleCode: req.adminUser.roleCode,
+      });
+      return;
+    }
+    next();
+  };
+}
+
 // ============================================================================
 // Authentication Routes (HttpOnly JWT Cookie + Neon PostgreSQL)
 // ============================================================================
@@ -1059,7 +1093,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const userRes = await pool.query<DbAdminUserRow>(
-      `SELECT id, name, email, password_hash, role, avatar_url, active
+      `SELECT id, name, email, password_hash, role, role_code, avatar_url, active
        FROM admin_users
        WHERE LOWER(email) = $1
        LIMIT 1`,
@@ -1083,7 +1117,9 @@ app.post('/api/auth/login', async (req, res) => {
       name: row.name,
       email: row.email,
       role: row.role,
+      roleCode: normalizeStaffRole(row.role_code, row.role),
       avatarUrl: row.avatar_url,
+      active: Boolean(row.active),
     };
 
     const token = signSessionToken(user);
@@ -1476,7 +1512,7 @@ app.get('/api/public/chat-session/:sessionId/updates', async (req, res) => {
   }
 });
 
-app.patch('/api/admin/settings/operation-mode', requireAdminAuth, async (req, res) => {
+app.patch('/api/admin/settings/operation-mode', requirePermission('settings:edit_dealership'), async (req, res) => {
   try {
     const requested =
       typeof req.body?.operationMode === 'string'
@@ -1509,7 +1545,7 @@ app.patch('/api/admin/settings/operation-mode', requireAdminAuth, async (req, re
 
 app.patch(
   '/api/admin/settings/store-whatsapp',
-  requireAdminAuth,
+  requirePermission('settings:edit_dealership'),
   async (req, res) => {
     try {
       const raw =
@@ -1562,7 +1598,7 @@ app.patch(
 
 app.patch(
   '/api/admin/settings/dealership',
-  requireAdminAuth,
+  requirePermission('settings:edit_dealership'),
   async (req, res) => {
     try {
       const payload = (req.body?.dealershipConfig || req.body || {}) as Partial<DealershipSettings>;
@@ -1928,66 +1964,101 @@ app.post('/api/chat/whatsapp-handoff', async (req, res) => {
   }
 });
 
-app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
+app.get('/api/admin/chat-sessions', requirePermission('sessions:view_own'), async (req: AuthenticatedRequest, res) => {
   try {
+    const user = req.adminUser!;
+    const canSeeAll = hasPermission(user.roleCode, 'sessions:view_all');
     const result = await pool.query<DbChatSessionRow>(
       `SELECT
          s.id,
          s.session_id,
          s.lead_name,
-          s.lead_phone,
-          s.origem,
-          s.tag,
-          s.ai_summary,
-          s.ai_summary_updated_at,
-          s.whatsapp_handoff_at,
-          s.handoff_status,
-          s.created_at,
-          s.updated_at,
-          COALESCE(m_agg.message_count, 0)::int AS message_count,
-          CASE
-            WHEN m_last.audio_url IS NOT NULL THEN
-              COALESCE(NULLIF(TRIM(m_last.transcription), ''), NULLIF(TRIM(m_last.content), ''), '[Mensagem de áudio]')
-            WHEN m_last.attachment_url IS NOT NULL THEN
-              COALESCE(NULLIF(TRIM(m_last.content), ''), CONCAT('[Anexo: ', COALESCE(m_last.attachment_name, 'arquivo'), ']'))
-            ELSE m_last.content
-          END AS last_message,
-          m_last.sender AS last_sender
-        FROM chat_sessions s
-        LEFT JOIN (
-          SELECT session_id, COUNT(*)::int AS message_count
-          FROM chat_messages
-          GROUP BY session_id
-        ) m_agg ON m_agg.session_id = s.session_id
-        LEFT JOIN LATERAL (
-          SELECT content, sender, audio_url, transcription, attachment_url, attachment_name
-          FROM chat_messages
-          WHERE session_id = s.session_id
-          ORDER BY id DESC
-          LIMIT 1
-        ) m_last ON true
-        ORDER BY s.updated_at DESC, s.id DESC
-        LIMIT 200`
+         s.lead_phone,
+         s.origem,
+         s.tag,
+         s.ai_summary,
+         s.ai_summary_updated_at,
+         s.whatsapp_handoff_at,
+         s.handoff_status,
+         s.assigned_user_id,
+         s.assigned_user_name,
+         s.assigned_at,
+         s.first_human_reply_at,
+         s.automation_mode,
+         s.stage,
+         s.loss_reason,
+         s.focused_vehicle_id,
+         s.context_json,
+         s.version,
+         s.created_at,
+         s.updated_at,
+         COALESCE(m_agg.message_count, 0)::int AS message_count,
+         CASE
+           WHEN m_last.audio_url IS NOT NULL THEN
+             COALESCE(NULLIF(TRIM(m_last.transcription), ''), NULLIF(TRIM(m_last.content), ''), '[Mensagem de áudio]')
+           WHEN m_last.attachment_url IS NOT NULL THEN
+             COALESCE(NULLIF(TRIM(m_last.content), ''), CONCAT('[Anexo: ', COALESCE(m_last.attachment_name, 'arquivo'), ']'))
+           ELSE m_last.content
+         END AS last_message,
+         m_last.sender AS last_sender
+       FROM chat_sessions s
+       LEFT JOIN (
+         SELECT session_id, COUNT(*)::int AS message_count
+         FROM chat_messages
+         GROUP BY session_id
+       ) m_agg ON m_agg.session_id = s.session_id
+       LEFT JOIN LATERAL (
+         SELECT content, sender, audio_url, transcription, attachment_url, attachment_name
+         FROM chat_messages
+         WHERE session_id = s.session_id
+         ORDER BY id DESC
+         LIMIT 1
+       ) m_last ON true
+       WHERE ($1::boolean = true OR s.assigned_user_id IS NULL OR s.assigned_user_id = $2)
+       ORDER BY s.updated_at DESC, s.id DESC
+       LIMIT 200`,
+      [canSeeAll, user.id]
     );
 
+    res.setHeader('Cache-Control', 'no-store');
     res.json(
-      result.rows.map((row) => ({
-        id: row.id,
-        sessionId: row.session_id,
-        leadName: row.lead_name,
-        leadPhone: row.lead_phone,
-        origem: row.origem,
-        tag: row.tag ?? null,
-        aiSummary: row.ai_summary ?? null,
-        aiSummaryUpdatedAt: row.ai_summary_updated_at ?? null,
-        whatsappHandoffAt: row.whatsapp_handoff_at ?? null,
-        handoffStatus: row.handoff_status ?? null,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        messageCount: Number(row.message_count) || 0,
-        lastMessage: row.last_message ?? null,
-        lastSender: row.last_sender ?? null,
-      }))
+      result.rows.map((row) => {
+        let parsedCtx = null;
+        if (row.context_json) {
+          try {
+            parsedCtx = JSON.parse(row.context_json);
+          } catch {
+            parsedCtx = null;
+          }
+        }
+        return {
+          id: row.id,
+          sessionId: row.session_id,
+          leadName: row.lead_name,
+          leadPhone: row.lead_phone,
+          origem: row.origem,
+          tag: row.tag ?? null,
+          aiSummary: row.ai_summary ?? null,
+          aiSummaryUpdatedAt: row.ai_summary_updated_at ?? null,
+          whatsappHandoffAt: row.whatsapp_handoff_at ?? null,
+          handoffStatus: row.handoff_status ?? null,
+          assignedUserId: row.assigned_user_id ? Number(row.assigned_user_id) : null,
+          assignedUserName: row.assigned_user_name ?? null,
+          assignedAt: row.assigned_at ?? null,
+          firstHumanReplyAt: row.first_human_reply_at ?? null,
+          automationMode: row.automation_mode || 'ai_active',
+          stage: row.stage || 'Novo Lead',
+          lossReason: row.loss_reason ?? null,
+          focusedVehicleId: row.focused_vehicle_id ? Number(row.focused_vehicle_id) : null,
+          context: parsedCtx,
+          version: Number(row.version) || 1,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+          messageCount: Number(row.message_count) || 0,
+          lastMessage: row.last_message ?? null,
+          lastSender: row.last_sender ?? null,
+        };
+      })
     );
   } catch (err: unknown) {
     const message =
@@ -2000,8 +2071,8 @@ app.get('/api/admin/chat-sessions', requireAdminAuth, async (_req, res) => {
 
 app.get(
   '/api/admin/chat-sessions/:sessionId/messages',
-  requireAdminAuth,
-  async (req, res) => {
+  requirePermission('sessions:view_own'),
+  async (req: AuthenticatedRequest, res) => {
     const sessionId = sanitizeSessionId(req.params.sessionId);
     if (!sessionId) {
       res.status(400).json({ error: 'Identificador de sessão inválido.' });
@@ -2016,6 +2087,19 @@ app.get(
 
       if (sessionRes.rowCount === 0) {
         res.status(404).json({ error: 'Sessão de conversa não encontrada.' });
+        return;
+      }
+
+      const s = sessionRes.rows[0];
+      const user = req.adminUser!;
+      if (
+        !hasPermission(user.roleCode, 'sessions:view_all') &&
+        s.assigned_user_id &&
+        Number(s.assigned_user_id) !== user.id
+      ) {
+        res.status(403).json({
+          error: 'Esta conversa está atribuída a outro vendedor.',
+        });
         return;
       }
 
@@ -2035,6 +2119,8 @@ app.get(
            attachment_mime,
            sender_label,
            is_human_consultant,
+           author_user_id,
+           delivery_channel,
            created_at
          FROM chat_messages
          WHERE session_id = $1
@@ -2042,7 +2128,16 @@ app.get(
         [sessionId]
       );
 
-      const s = sessionRes.rows[0];
+      let parsedCtx = null;
+      if (s.context_json) {
+        try {
+          parsedCtx = JSON.parse(s.context_json);
+        } catch {
+          parsedCtx = null;
+        }
+      }
+
+      res.setHeader('Cache-Control', 'no-store');
       res.json({
         session: {
           id: s.id,
@@ -2055,6 +2150,16 @@ app.get(
           aiSummaryUpdatedAt: s.ai_summary_updated_at ?? null,
           whatsappHandoffAt: s.whatsapp_handoff_at ?? null,
           handoffStatus: s.handoff_status ?? null,
+          assignedUserId: s.assigned_user_id ? Number(s.assigned_user_id) : null,
+          assignedUserName: s.assigned_user_name ?? null,
+          assignedAt: s.assigned_at ?? null,
+          firstHumanReplyAt: s.first_human_reply_at ?? null,
+          automationMode: s.automation_mode || 'ai_active',
+          stage: s.stage || 'Novo Lead',
+          lossReason: s.loss_reason ?? null,
+          focusedVehicleId: s.focused_vehicle_id ? Number(s.focused_vehicle_id) : null,
+          context: parsedCtx,
+          version: Number(s.version) || 1,
           createdAt: s.created_at,
           updatedAt: s.updated_at,
         },
@@ -2076,6 +2181,10 @@ app.get(
             : null,
           senderLabel: m.sender_label ?? null,
           isHumanConsultant: Boolean(m.is_human_consultant),
+          authorUserId: m.author_user_id ? Number(m.author_user_id) : null,
+          deliveryChannel:
+            m.delivery_channel ||
+            (m.is_human_consultant ? 'human_chat' : m.sender === 'assistant' ? 'ai_auto' : 'chat'),
           createdAt: m.created_at,
         })),
       });
@@ -2091,7 +2200,7 @@ app.get(
 
 app.post(
   '/api/admin/chat-sessions/:sessionId/consultant-message',
-  requireAdminAuth,
+  requirePermission('sessions:reply'),
   async (req: AuthenticatedRequest, res) => {
     const sessionId = sanitizeSessionId(req.params.sessionId);
     if (!sessionId) {
@@ -2106,21 +2215,44 @@ app.post(
       return;
     }
 
+    const deliveryChannel =
+      req.body?.deliveryChannel === 'whatsapp_manual_log'
+        ? 'whatsapp_manual_log'
+        : 'human_chat';
+
     const safeMessage = rawText.slice(0, 2000);
     const customLabel =
       typeof req.body?.senderLabel === 'string' && req.body.senderLabel.trim()
         ? req.body.senderLabel.trim().slice(0, 80)
         : req.adminUser?.name
-          ? `Consultor ${req.adminUser.name.split(' ')[0]}`
+          ? deliveryChannel === 'whatsapp_manual_log'
+            ? `WhatsApp · ${req.adminUser.name.split(' ')[0]}`
+            : `Consultor ${req.adminUser.name.split(' ')[0]}`
           : 'Consultor da Loja';
 
     try {
-      const sessionRes = await pool.query<{ session_id: string }>(
-        'SELECT session_id FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+      const sessionRes = await pool.query<{
+        session_id: string;
+        assigned_user_id: number | null;
+      }>(
+        'SELECT session_id, assigned_user_id FROM chat_sessions WHERE session_id = $1 LIMIT 1',
         [sessionId]
       );
       if (sessionRes.rowCount === 0) {
         res.status(404).json({ error: 'Sessão de conversa não encontrada.' });
+        return;
+      }
+
+      const user = req.adminUser!;
+      const existingAssignee = sessionRes.rows[0].assigned_user_id;
+      if (
+        existingAssignee &&
+        Number(existingAssignee) !== user.id &&
+        !hasPermission(user.roleCode, 'sessions:assign_others')
+      ) {
+        res.status(403).json({
+          error: 'Apenas o responsável ou gestor pode responder nesta conversa.',
+        });
         return;
       }
 
@@ -2130,27 +2262,49 @@ app.post(
            sender,
            content,
            sender_label,
-           is_human_consultant
+           is_human_consultant,
+           author_user_id,
+           delivery_channel
          )
-         VALUES ($1, 'assistant', $2, $3, true)
-         RETURNING id, session_id, sender, content, sender_label, is_human_consultant, created_at`,
-        [sessionId, safeMessage, customLabel]
+         VALUES ($1, 'assistant', $2, $3, true, $4, $5)
+         RETURNING id, session_id, sender, content, sender_label, is_human_consultant, author_user_id, delivery_channel, created_at`,
+        [sessionId, safeMessage, customLabel, user.id, deliveryChannel]
       );
 
       await pool.query(
-        'UPDATE chat_sessions SET updated_at = NOW() WHERE session_id = $1',
-        [sessionId]
+        `UPDATE chat_sessions
+         SET updated_at = NOW(),
+             first_human_reply_at = COALESCE(first_human_reply_at, NOW()),
+             assigned_user_id = COALESCE(assigned_user_id, $2),
+             assigned_user_name = COALESCE(assigned_user_name, $3),
+             assigned_at = COALESCE(assigned_at, NOW()),
+             automation_mode = 'human_active',
+             stage = CASE WHEN COALESCE(stage, 'Novo Lead') = 'Novo Lead' THEN 'Em Atendimento' ELSE stage END
+         WHERE session_id = $1`,
+        [sessionId, user.id, user.name]
       );
 
       const m = insertRes.rows[0];
-
-      // Trigger targeted Web Push exclusively to the visitor subscribed to this session_id
-      triggerVisitorSessionPushInBackground(sessionId, {
-        title: `${m.sender_label ?? customLabel} respondeu`,
-        body: safeMessage.slice(0, 140),
-        url: '/chat',
-        tag: `visitor-msg-${sessionId}`,
+      await recordStaffAudit({
+        user,
+        action:
+          deliveryChannel === 'whatsapp_manual_log'
+            ? 'whatsapp_manual_followup_logged'
+            : 'human_chat_reply_sent',
+        entityType: 'chat_session',
+        entityId: sessionId,
+        details: { messageId: m.id, deliveryChannel },
       });
+
+      if (deliveryChannel === 'human_chat') {
+        // Trigger targeted Web Push exclusively to the visitor subscribed to this session_id
+        triggerVisitorSessionPushInBackground(sessionId, {
+          title: `${m.sender_label ?? customLabel} respondeu`,
+          body: safeMessage.slice(0, 140),
+          url: '/chat',
+          tag: `visitor-msg-${sessionId}`,
+        });
+      }
 
       res.status(201).json({
         id: m.id,
@@ -2159,6 +2313,8 @@ app.post(
         content: m.content,
         senderLabel: m.sender_label ?? customLabel,
         isHumanConsultant: true,
+        authorUserId: user.id,
+        deliveryChannel,
         createdAt: m.created_at,
       });
     } catch (err: unknown) {
@@ -3193,7 +3349,7 @@ app.get('/api/fipe/:codigoFipe', async (req, res) => {
   await handleFipeLookupRequest(req.params.codigoFipe || '', req.query.ano, res);
 });
 
-app.get('/api/vehicles', requireAdminAuth, async (req, res) => {
+app.get('/api/vehicles', requirePermission('inventory:view'), async (req, res) => {
   try {
     const statusFilter =
       typeof req.query.status === 'string' ? req.query.status.trim() : '';
@@ -3216,7 +3372,7 @@ app.get('/api/vehicles', requireAdminAuth, async (req, res) => {
   }
 });
 
-app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
+app.post('/api/vehicles', requirePermission('inventory:edit'), async (req, res) => {
   try {
     const {
       brand,
@@ -3298,7 +3454,7 @@ app.post('/api/vehicles', requireAdminAuth, async (req, res) => {
   }
 });
 
-app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
+app.patch('/api/vehicles/:id', requirePermission('inventory:edit'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'ID de veículo inválido.' });
@@ -3404,7 +3560,7 @@ app.patch('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/vehicles/:id', requireAdminAuth, async (req, res) => {
+app.delete('/api/vehicles/:id', requirePermission('inventory:delete'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'ID de veículo inválido.' });
@@ -3544,7 +3700,7 @@ app.patch('/api/leads/:id', requireAdminAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/leads/:id', requireAdminAuth, async (req, res) => {
+app.delete('/api/leads/:id', requirePermission('sessions:delete_lgpd'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'ID de lead inválido.' });
@@ -4332,6 +4488,117 @@ app.post('/api/ai/chat', async (req, res) => {
       fichaUrl: turnPlan.fichaUrl,
     };
 
+    // Persist structured commercial context on chat_sessions for Central da Revenda & check human takeover
+    let sessionHumanActive: { active: boolean; assigneeName: string | null } = {
+      active: false,
+      assigneeName: null,
+    };
+    if (auditSessionId) {
+      try {
+        const focusedNumeric =
+          turnPlan.focusedVehicleId && /^\d+$/.test(String(turnPlan.focusedVehicleId))
+            ? Number(turnPlan.focusedVehicleId)
+            : null;
+        const sessStateRes = await pool.query<{
+          automation_mode: string | null;
+          assigned_user_name: string | null;
+          context_json: string | null;
+          lead_name: string | null;
+          lead_phone: string | null;
+        }>(
+          'SELECT automation_mode, assigned_user_name, context_json, lead_name, lead_phone FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+          [auditSessionId]
+        );
+        const curSess = sessStateRes.rows[0];
+        if (curSess?.automation_mode === 'human_active') {
+          sessionHumanActive = {
+            active: true,
+            assigneeName: curSess.assigned_user_name || null,
+          };
+        }
+        let prevCtx: Record<string, unknown> = {};
+        if (curSess?.context_json) {
+          try {
+            prevCtx = JSON.parse(curSess.context_json) as Record<string, unknown>;
+          } catch {
+            prevCtx = {};
+          }
+        }
+        const nextCtx = {
+          ...prevCtx,
+          activeFilters: turnPlan.activeFilters ?? prevCtx.activeFilters ?? null,
+          focusedVehicleId: turnPlan.focusedVehicleId ?? prevCtx.focusedVehicleId ?? null,
+          financingSummary: turnPlan.financingSummary ?? prevCtx.financingSummary ?? null,
+          visitStatus: turnPlan.isVisitInquiryOnly
+            ? prevCtx.visitStatus || 'consultada'
+            : prevCtx.visitStatus ?? null,
+          sourceCampaign: auditOrigin !== '/chat' ? auditOrigin : prevCtx.sourceCampaign ?? null,
+        };
+        await pool.query(
+          `UPDATE chat_sessions
+           SET focused_vehicle_id = COALESCE($2, focused_vehicle_id),
+               context_json = $3,
+               updated_at = NOW()
+           WHERE session_id = $1`,
+          [auditSessionId, focusedNumeric, JSON.stringify(nextCtx)]
+        );
+
+        // Auto-register trade-in lead in Central's trade_ins table if user mentions trade-in vehicle
+        if (turnPlan.promptAttachPhotos && latestClientUtterance.length >= 6) {
+          const existingTradeRes = await pool.query(
+            'SELECT id FROM trade_ins WHERE session_id = $1 LIMIT 1',
+            [auditSessionId]
+          );
+          if (existingTradeRes.rowCount === 0) {
+            await pool.query(
+              `INSERT INTO trade_ins (
+                 session_id, target_vehicle_id, customer_name, customer_phone,
+                 brand_model, condition_notes, status, pending_items_json
+               )
+               VALUES ($1, $2, $3, $4, $5, $6, 'aguardando_fotos', $7)`,
+              [
+                auditSessionId,
+                focusedNumeric,
+                resolvedVisitorName || curSess?.lead_name || null,
+                curSess?.lead_phone || null,
+                latestClientUtterance.slice(0, 140),
+                latestClientUtterance.slice(0, 500),
+                JSON.stringify(['Fotos externas e internas', 'Confirmação de pendências/documentação']),
+              ]
+            );
+          }
+        }
+      } catch (ctxErr) {
+        console.warn('[ChatContext] Falha ao sincronizar contexto na Central:', ctxErr);
+      }
+    }
+
+    // If a human consultant has taken over this conversation, do NOT send a competing AI message
+    if (sessionHumanActive.active) {
+      const takeoverNotice = sessionHumanActive.assigneeName
+        ? `Mensagem recebida! ${sessionHumanActive.assigneeName} já está acompanhando seu atendimento pessoalmente e responderá por aqui em breve.`
+        : 'Mensagem recebida! Nosso consultor humano já assumiu seu atendimento e responderá em breve.';
+      if (!wantsStream) {
+        res.json({
+          ...structuredMeta,
+          reply: takeoverNotice,
+          humanActive: true,
+          suppressHandoff: false,
+        });
+        return;
+      }
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+      res.write(`data: ${JSON.stringify({ type: 'meta', humanActive: true, ...structuredMeta })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'chunk', text: takeoverNotice })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done', reply: takeoverNotice })}\n\n`);
+      res.end();
+      return;
+    }
+
     // Fast deterministic path for exact-precision flows (visit inquiry, financing math, direct ficha, FIPE, 0-match alternatives, ambiguity)
     if (turnPlan.useDeterministicDirectly && !clientFipeLookupContext) {
       const finalReply = turnPlan.deterministicReply;
@@ -4754,6 +5021,33 @@ app.get('/api/internal/ai-usage', async (req, res) => {
   }
 });
 
+registerCentralRevendaRoutes(app, {
+  requireAdminAuth,
+  getPersistedDealershipConfig,
+  polishMarketingCaptionWithAi: async ({ vehicle, baseCaption, tone, format }) => {
+    const apiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!apiKey) return null;
+    try {
+      const ai = getGeminiClient();
+      const prompt = `Reescreva esta legenda de divulgação para ${format} em tom ${tone}, mantendo EXCLUSIVAMENTE os fatos confirmados abaixo (NUNCA invente preço, câmbio, ano, km, FIPE ou endereço).\n\nVeículo: ${vehicle.brand} ${vehicle.model} ${vehicle.year}\nLegenda base:\n${baseCaption}\n\nRetorne apenas o texto final da legenda pronta para copiar.`;
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+      });
+      if (response.usageMetadata) {
+        void recordAiUsageLog({
+          feature: 'marketing_polish',
+          model: 'gemini-2.5-flash',
+          usageMetadata: response.usageMetadata,
+        });
+      }
+      return response.text?.trim() || null;
+    } catch {
+      return null;
+    }
+  },
+});
+
 let dbInitPromise: Promise<void> | null = null;
 
 export function ensureDatabaseInitialized(): Promise<void> {
@@ -4771,6 +5065,12 @@ export function ensureDatabaseInitialized(): Promise<void> {
       } catch (err) {
         failed = true;
         console.error('[DB] Falha ao verificar/semear admin_users no Neon:', err);
+      }
+      try {
+        await ensureCentralRevendaSchemaAndSeeds();
+      } catch (err) {
+        failed = true;
+        console.error('[DB] Falha ao verificar tabelas da Central da Revenda no Neon:', err);
       }
       if (!failed) {
         console.log('[DB] Neon PostgreSQL conectado e tabelas verificadas.');

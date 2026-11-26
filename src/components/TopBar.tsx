@@ -20,6 +20,7 @@ import { useWebPush } from '../hooks/useWebPush';
 interface TopBarProps {
   activeModule: NavModule;
   operationMode?: OperationMode;
+  canCreateVehicle?: boolean;
   onOpenMobileMenu: () => void;
   onQuickNewVehicle: () => void;
   onOpenPublicCatalog: () => void;
@@ -29,33 +30,66 @@ interface TopBarProps {
 }
 
 const MODULE_META: Record<NavModule, { title: string; subtitle: string }> = {
+  hoje: {
+    title: 'Hoje',
+    subtitle: 'Central da Revenda · Pendências acionáveis e copiloto interno',
+  },
+  atendimentos: {
+    title: 'Atendimentos',
+    subtitle: 'Fila unificada · Conversas, assunção humana, contexto e funil comercial',
+  },
+  estoque: {
+    title: 'Estoque',
+    subtitle: 'Inventário oficial · Precificação, FIPE e alertas cadastrais em tempo real',
+  },
+  agenda_trocas: {
+    title: 'Agenda e Trocas',
+    subtitle: 'Visitas ao showroom e pré-avaliação de veículos usados na troca',
+  },
+  divulgacao: {
+    title: 'Divulgação',
+    subtitle: 'Peças visuais, classificados e links rastreados direto do estoque',
+  },
+  documentos: {
+    title: 'Documentos',
+    subtitle: 'Emissão guiada em PDF, snapshots imutáveis e biblioteca versionada',
+  },
+  gestao: {
+    title: 'Gestão',
+    subtitle: 'Indicadores operacionais reais, carga da equipe e reativação',
+  },
+  configuracoes: {
+    title: 'Configurações',
+    subtitle: 'Dados oficiais da revenda, canais WhatsApp e controle de equipe',
+  },
+  // Legacy aliases
   dashboard: {
-    title: 'Visão Geral',
-    subtitle: 'Painel executivo · Resumo operacional do showroom',
+    title: 'Hoje',
+    subtitle: 'Central da Revenda · Pendências acionáveis e copiloto interno',
   },
   inventory: {
-    title: 'Gestão de Estoque',
+    title: 'Estoque',
     subtitle: 'Inventário de veículos · Precificação e status em tempo real',
   },
   crm: {
-    title: 'CRM de Atendimento & Leads',
+    title: 'Atendimentos',
     subtitle: 'Funil comercial · Captura via Chat IA e histórico de conversas',
   },
   chat_audit: {
-    title: 'Conversas & Atendimentos IA',
-    subtitle: 'Auditoria em tempo real · Histórico gravado no Neon e transição para WhatsApp',
+    title: 'Atendimentos',
+    subtitle: 'Fila em tempo real · Histórico gravado no Neon e assunção humana',
   },
   contracts: {
-    title: 'Gerador de Contratos & Documentos',
-    subtitle: 'Emissão jurídica · Compra e venda, ATPV-e, vistoria e garantia CDC',
+    title: 'Documentos',
+    subtitle: 'Emissão de propostas, fichas e contratos com histórico preservado',
   },
   social_ai: {
-    title: 'Gerador de Posts para Redes Sociais',
-    subtitle: 'Copywriting automotivo com IA · Instagram, Reels e TikTok Shop',
+    title: 'Divulgação',
+    subtitle: 'Peças prontas para Feed, Stories, Classificados e Carrossel',
   },
   settings: {
-    title: 'Configurações da Revenda',
-    subtitle: 'Parâmetros institucionais · Modo de operação, horários e regras do sistema',
+    title: 'Configurações',
+    subtitle: 'Parâmetros institucionais · Modo de operação, horários e equipe',
   },
 };
 
@@ -101,6 +135,7 @@ function formatRelativePt(iso: string): string {
 export const TopBar: React.FC<TopBarProps> = ({
   activeModule,
   operationMode = 'full',
+  canCreateVehicle = true,
   onOpenMobileMenu,
   onQuickNewVehicle,
   onOpenPublicCatalog,
@@ -108,7 +143,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onOpenChatSession,
   onOpenCrmLead,
 }) => {
-  const meta = MODULE_META[activeModule];
+  const meta = MODULE_META[activeModule] || MODULE_META.hoje;
 
   const [notifications, setNotifications] = useState<AdminNotificationItem[]>(
     []
@@ -457,14 +492,16 @@ export const TopBar: React.FC<TopBarProps> = ({
           </span>
         </button>
 
-        <button
-          type="button"
-          onClick={onQuickNewVehicle}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors whitespace-nowrap shrink-0"
-        >
-          <Plus className="w-3.5 h-3.5" />
-          <span>Novo Veículo</span>
-        </button>
+        {canCreateVehicle && (
+          <button
+            type="button"
+            onClick={onQuickNewVehicle}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors whitespace-nowrap shrink-0"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>Novo Veículo</span>
+          </button>
+        )}
       </div>
 
       {adminPush.statusMessage && (

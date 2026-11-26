@@ -56,6 +56,16 @@ export interface DbChatSessionRow {
   ai_summary_updated_at?: Date | null;
   whatsapp_handoff_at?: Date | null;
   handoff_status?: string | null;
+  assigned_user_id?: number | null;
+  assigned_user_name?: string | null;
+  assigned_at?: Date | null;
+  first_human_reply_at?: Date | null;
+  automation_mode?: string | null;
+  stage?: string | null;
+  loss_reason?: string | null;
+  focused_vehicle_id?: number | null;
+  context_json?: string | null;
+  version?: number | null;
   created_at: Date;
   updated_at: Date;
   message_count?: number;
@@ -78,6 +88,8 @@ export interface DbChatMessageRow {
   attachment_mime?: string | null;
   sender_label?: string | null;
   is_human_consultant?: boolean | null;
+  author_user_id?: number | null;
+  delivery_channel?: string | null;
   created_at: Date;
 }
 

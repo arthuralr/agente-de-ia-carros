@@ -39,7 +39,7 @@ interface VehicleSheetPageProps {
   settings: DealershipSettings;
   storeWhatsappNumber?: string;
   onBackToCatalog: () => void;
-  onOpenChatWithVehicle: (vehicle: Vehicle) => void;
+  onOpenChatWithVehicle: (vehicle: Vehicle, trackingSource?: string | null) => void;
 }
 
 export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
@@ -499,7 +499,13 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
                 {available && (
                   <button
                     type="button"
-                    onClick={() => onOpenChatWithVehicle(vehicle)}
+                    onClick={() => {
+                      const sourceParam =
+                        typeof window !== 'undefined'
+                          ? new URLSearchParams(window.location.search).get('origem')
+                          : null;
+                      onOpenChatWithVehicle(vehicle, sourceParam);
+                    }}
                     className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[46px] rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-100 text-sm font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-500"
                   >
                     <Sparkles className="w-4 h-4 text-red-400" />

@@ -1,15 +1,27 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
   Check,
+  Copy,
   LayoutGrid,
   Loader2,
   MessageCircle,
   RotateCcw,
   Save,
+  Shield,
+  UserPlus,
+  Users,
 } from 'lucide-react';
-import { DealershipSettings, OperationMode } from '../../types';
+import {
+  AdminUser,
+  DealershipSettings,
+  OperationMode,
+  StaffInviteRecord,
+  StaffRole,
+} from '../../types';
+import { adminFetch } from '../../utils/authSession';
+import { STAFF_ROLE_META } from '../../utils/rbac';
 import { normalizeStoreWhatsAppNumber } from '../../utils/whatsappHandoff';
 import {
   DEFAULT_DEALERSHIP_CONFIG,
@@ -17,21 +29,26 @@ import {
 } from '../../utils/vehicleDomain';
 
 interface SettingsModuleProps {
+  currentUser?: AdminUser | null;
   settings: DealershipSettings;
   operationMode: OperationMode;
   storeWhatsappNumber: string;
   onChangeOperationMode: (mode: OperationMode) => Promise<void>;
   onSaveStoreWhatsappNumber: (nextNumber: string) => Promise<void>;
   onSaveSettings: (next: DealershipSettings) => Promise<void> | void;
+  onUnauthorized?: () => void;
 }
 
 export const SettingsModule: React.FC<SettingsModuleProps> = ({
+  currentUser,
   settings,
   operationMode,
   storeWhatsappNumber,
   onChangeOperationMode,
   onSaveSettings,
+  onUnauthorized,
 }) => {
+  const [settingsTab, setSettingsTab] = useState<'revenda' | 'equipe'>('revenda');
   const [form, setForm] = useState<DealershipSettings>(settings);
   const [selectedMode, setSelectedMode] = useState<OperationMode>(operationMode);
   const [savingMode, setSavingMode] = useState(false);
@@ -40,6 +57,157 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState(false);
+
+  // Team & RBAC management state (administrador)
+  const [teamUsers, setTeamUsers] = useState<AdminUser[]>([]);
+  const [teamInvites, setTeamInvites] = useState<StaffInviteRecord[]>([]);
+  const [loadingTeam, setLoadingTeam] = useState(false);
+  const [teamError, setTeamError] = useState<string | null>(null);
+  const [teamNotice, setTeamNotice] = useState<string | null>(null);
+  const [newMemberName, setNewMemberName] = useState('');
+  const [newMemberEmail, setNewMemberEmail] = useState('');
+  const [newMemberRole, setNewMemberRole] = useState<StaffRole>('vendedor');
+  const [newMemberPassword, setNewMemberPassword] = useState('');
+  const [creatingMember, setCreatingMember] = useState(false);
+  const [generatedInviteUrl, setGeneratedInviteUrl] = useState<string | null>(
+    null
+  );
+  const [copiedInvite, setCopiedInvite] = useState(false);
+
+  const loadTeam = useCallback(async () => {
+    setLoadingTeam(true);
+    setTeamError(null);
+    try {
+      const res = await adminFetch('/api/admin/team');
+      if (res.status === 401) {
+        onUnauthorized?.();
+        return;
+      }
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(err.error || 'Falha ao carregar equipe.');
+      }
+      const data = (await res.json()) as {
+        users?: AdminUser[];
+        invites?: StaffInviteRecord[];
+      };
+      setTeamUsers(Array.isArray(data.users) ? data.users : []);
+      setTeamInvites(Array.isArray(data.invites) ? data.invites : []);
+    } catch (err) {
+      setTeamError(err instanceof Error ? err.message : 'Erro ao listar equipe.');
+    } finally {
+      setLoadingTeam(false);
+    }
+  }, [onUnauthorized]);
+
+  useEffect(() => {
+    if (settingsTab === 'equipe') {
+      void loadTeam();
+    }
+  }, [settingsTab, loadTeam]);
+
+  const handleCreateUserDirectly = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newMemberName.trim() || !newMemberEmail.trim() || newMemberPassword.length < 8) {
+      setTeamError('Informe nome, e-mail e senha com pelo menos 8 caracteres.');
+      return;
+    }
+    setCreatingMember(true);
+    setTeamError(null);
+    setTeamNotice(null);
+    try {
+      const res = await adminFetch('/api/admin/team/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newMemberName.trim(),
+          email: newMemberEmail.trim(),
+          roleCode: newMemberRole,
+          password: newMemberPassword,
+        }),
+      });
+      if (res.status === 401) {
+        onUnauthorized?.();
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Erro ao criar conta.');
+      setNewMemberName('');
+      setNewMemberEmail('');
+      setNewMemberPassword('');
+      setTeamNotice('Conta criada com sucesso e pronta para acesso na Central.');
+      await loadTeam();
+    } catch (err) {
+      setTeamError(err instanceof Error ? err.message : 'Erro ao criar usuário.');
+    } finally {
+      setCreatingMember(false);
+    }
+  };
+
+  const handleGenerateInvite = async () => {
+    if (!newMemberName.trim() || !newMemberEmail.trim()) {
+      setTeamError('Informe nome e e-mail para gerar o link de convite.');
+      return;
+    }
+    setCreatingMember(true);
+    setTeamError(null);
+    setTeamNotice(null);
+    try {
+      const res = await adminFetch('/api/admin/team/invites', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newMemberName.trim(),
+          email: newMemberEmail.trim(),
+          roleCode: newMemberRole,
+        }),
+      });
+      if (res.status === 401) {
+        onUnauthorized?.();
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as {
+        invitePath?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.invitePath) {
+        throw new Error(data.error || 'Erro ao gerar convite.');
+      }
+      const origin = typeof window !== 'undefined' ? window.location.origin : '';
+      setGeneratedInviteUrl(`${origin}${data.invitePath}`);
+      setTeamNotice('Convite gerado com validade de 7 dias.');
+      setNewMemberName('');
+      setNewMemberEmail('');
+      await loadTeam();
+    } catch (err) {
+      setTeamError(err instanceof Error ? err.message : 'Erro ao gerar convite.');
+    } finally {
+      setCreatingMember(false);
+    }
+  };
+
+  const handleUpdateUserRoleOrActive = async (
+    userId: number,
+    patch: { roleCode?: StaffRole; active?: boolean }
+  ) => {
+    setTeamError(null);
+    try {
+      const res = await adminFetch(`/api/admin/team/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      if (res.status === 401) {
+        onUnauthorized?.();
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Erro ao atualizar perfil.');
+      await loadTeam();
+    } catch (err) {
+      setTeamError(err instanceof Error ? err.message : 'Erro ao atualizar usuário.');
+    }
+  };
 
   useEffect(() => {
     setSelectedMode(operationMode);
@@ -166,7 +334,280 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   };
 
   return (
-    <form onSubmit={(e) => void handleSubmit(e)} className="max-w-4xl space-y-6">
+    <div className="max-w-4xl space-y-6">
+      {/* Sub-navigation between Dealership Settings & Team RBAC */}
+      <div className="inline-flex items-center gap-1 p-1 bg-[#111114] border border-white/[0.08] rounded-lg">
+        <button
+          type="button"
+          onClick={() => setSettingsTab('revenda')}
+          className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md text-xs font-medium transition-colors ${
+            settingsTab === 'revenda'
+              ? 'bg-zinc-800 text-white'
+              : 'text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          <Shield className="w-3.5 h-3.5" />
+          <span>Dados da Revenda & Canais</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setSettingsTab('equipe')}
+          className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md text-xs font-medium transition-colors ${
+            settingsTab === 'equipe'
+              ? 'bg-zinc-800 text-white'
+              : 'text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          <Users className="w-3.5 h-3.5" />
+          <span>Equipe & Permissões</span>
+        </button>
+      </div>
+
+      {settingsTab === 'equipe' ? (
+        <div className="space-y-6">
+          {teamError && (
+            <div className="p-3.5 rounded-lg bg-red-950/50 border border-red-600/40 flex items-center gap-2 text-xs text-red-200">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              <span>{teamError}</span>
+            </div>
+          )}
+          {teamNotice && (
+            <div className="p-3.5 rounded-lg bg-emerald-950/50 border border-emerald-500/35 flex items-center gap-2 text-xs text-emerald-200">
+              <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>{teamNotice}</span>
+            </div>
+          )}
+
+          {generatedInviteUrl && (
+            <div className="p-4 rounded-xl bg-[#111114] border border-emerald-500/35 space-y-2">
+              <p className="text-xs font-semibold text-emerald-300">
+                Link de convite gerado (envie ao colaborador para definir a senha):
+              </p>
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                <input
+                  readOnly
+                  type="text"
+                  value={generatedInviteUrl}
+                  className="flex-1 px-3 py-2 bg-[#09090B] border border-white/[0.1] rounded-lg text-xs font-mono text-zinc-200"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(generatedInviteUrl);
+                    setCopiedInvite(true);
+                    window.setTimeout(() => setCopiedInvite(false), 2000);
+                  }}
+                  className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500"
+                >
+                  {copiedInvite ? (
+                    <Check className="w-3.5 h-3.5" />
+                  ) : (
+                    <Copy className="w-3.5 h-3.5" />
+                  )}
+                  <span>{copiedInvite ? 'Copiado' : 'Copiar link'}</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Create User or Generate Invite */}
+          <form
+            onSubmit={(e) => void handleCreateUserDirectly(e)}
+            className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-4"
+          >
+            <div>
+              <h2 className="font-display text-base font-semibold text-white flex items-center gap-2">
+                <UserPlus className="w-4 h-4 text-red-500" />
+                <span>Adicionar Integrante da Equipe</span>
+              </h2>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Crie uma conta individual com senha inicial ou gere um link de convite. As permissões são validadas no servidor.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">
+                  Nome completo *
+                </label>
+                <input
+                  required
+                  type="text"
+                  value={newMemberName}
+                  onChange={(e) => setNewMemberName(e.target.value)}
+                  placeholder="Ex.: Mariana Silva"
+                  className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] rounded-lg text-sm text-white focus:outline-none focus:border-red-600"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">
+                  E-mail corporativo *
+                </label>
+                <input
+                  required
+                  type="email"
+                  value={newMemberEmail}
+                  onChange={(e) => setNewMemberEmail(e.target.value)}
+                  placeholder="colaborador@revenda.com.br"
+                  className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] rounded-lg text-sm text-white focus:outline-none focus:border-red-600"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">
+                  Perfil de acesso *
+                </label>
+                <select
+                  value={newMemberRole}
+                  onChange={(e) => setNewMemberRole(e.target.value as StaffRole)}
+                  className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] rounded-lg text-sm text-white focus:outline-none focus:border-red-600"
+                >
+                  {(Object.keys(STAFF_ROLE_META) as StaffRole[]).map((code) => (
+                    <option key={code} value={code} className="bg-zinc-950">
+                      {STAFF_ROLE_META[code].label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  {STAFF_ROLE_META[newMemberRole].description}
+                </p>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">
+                  Senha inicial (opcional se gerar convite)
+                </label>
+                <input
+                  type="password"
+                  value={newMemberPassword}
+                  onChange={(e) => setNewMemberPassword(e.target.value)}
+                  placeholder="Mínimo 8 caracteres"
+                  className="w-full px-3.5 py-2 bg-[#09090B] border border-white/[0.1] rounded-lg text-sm text-white focus:outline-none focus:border-red-600"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                disabled={creatingMember}
+                onClick={() => void handleGenerateInvite()}
+                className="px-4 py-2 rounded-lg text-xs font-medium text-zinc-200 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.1] disabled:opacity-50"
+              >
+                Gerar Link de Convite
+              </button>
+              <button
+                type="submit"
+                disabled={creatingMember}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-500 disabled:opacity-50"
+              >
+                {creatingMember && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>Criar Conta Agora</span>
+              </button>
+            </div>
+          </form>
+
+          {/* Users List */}
+          <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-4">
+            <h3 className="text-sm font-semibold text-white">
+              Contas Cadastradas ({teamUsers.length})
+            </h3>
+            {loadingTeam ? (
+              <div className="py-6 flex justify-center">
+                <Loader2 className="w-5 h-5 animate-spin text-zinc-500" />
+              </div>
+            ) : (
+              <div className="divide-y divide-white/[0.06]">
+                {teamUsers.map((u) => {
+                  const isSelf = currentUser?.id === u.id;
+                  return (
+                    <div
+                      key={u.id}
+                      className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <p className="font-semibold text-white">
+                          {u.name}{' '}
+                          {isSelf && (
+                            <span className="text-[10px] font-normal text-zinc-400">
+                              (você)
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-zinc-400 font-mono text-[11px] truncate">
+                          {u.email}
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          disabled={isSelf}
+                          value={u.roleCode}
+                          onChange={(e) =>
+                            void handleUpdateUserRoleOrActive(u.id, {
+                              roleCode: e.target.value as StaffRole,
+                            })
+                          }
+                          className="px-2.5 py-1.5 bg-[#09090B] border border-white/[0.1] rounded-lg text-xs text-zinc-200 disabled:opacity-50"
+                        >
+                          {(Object.keys(STAFF_ROLE_META) as StaffRole[]).map(
+                            (code) => (
+                              <option key={code} value={code} className="bg-zinc-950">
+                                {STAFF_ROLE_META[code].label}
+                              </option>
+                            )
+                          )}
+                        </select>
+                        {!isSelf && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleUpdateUserRoleOrActive(u.id, {
+                                active: u.active === false,
+                              })
+                            }
+                            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border ${
+                              u.active === false
+                                ? 'text-emerald-300 border-emerald-500/30 bg-emerald-600/10'
+                                : 'text-zinc-400 border-white/[0.1] bg-white/[0.04] hover:text-red-300'
+                            }`}
+                          >
+                            {u.active === false ? 'Reativar' : 'Desativar'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {teamInvites.length > 0 && (
+              <div className="pt-4 border-t border-white/[0.06] space-y-2">
+                <p className="text-xs font-medium text-zinc-400">
+                  Convites recentes ({teamInvites.length})
+                </p>
+                {teamInvites.slice(0, 6).map((inv) => (
+                  <div
+                    key={inv.id}
+                    className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-400"
+                  >
+                    <span>
+                      <strong className="text-zinc-200">{inv.name}</strong> ({inv.email}) ·{' '}
+                      {STAFF_ROLE_META[inv.roleCode]?.shortLabel}
+                    </span>
+                    <span
+                      className={
+                        inv.acceptedAt ? 'text-emerald-400' : 'text-amber-400'
+                      }
+                    >
+                      {inv.acceptedAt ? 'Aceito' : 'Pendente'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <form onSubmit={(e) => void handleSubmit(e)} className="space-y-6">
       {/* Dual Operation Mode (Persisted in Neon PostgreSQL) */}
       <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-6 space-y-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -713,6 +1154,8 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
           </button>
         </div>
       </div>
-    </form>
+        </form>
+      )}
+    </div>
   );
 };

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeft,
@@ -8,6 +8,7 @@ import {
   Lock,
   Mail,
   ShieldCheck,
+  UserCheck,
 } from 'lucide-react';
 import { AdminUser } from '../../types';
 import { setAdminSessionToken } from '../../utils/authSession';
@@ -25,22 +26,83 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
   onLoginSuccess,
   onBackToCatalog,
 }) => {
+  const initialInviteToken = useMemo(() => {
+    if (typeof window === 'undefined') return '';
+    return new URLSearchParams(window.location.search).get('convite')?.trim() || '';
+  }, []);
+
+  const [mode, setMode] = useState<'login' | 'invite'>(
+    initialInviteToken ? 'invite' : 'login'
+  );
+  const [inviteToken, setInviteToken] = useState(initialInviteToken);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setErrorMsg(null);
+
+    if (mode === 'invite') {
+      if (!inviteToken.trim()) {
+        setErrorMsg('Informe o código de convite recebido do administrador.');
+        return;
+      }
+      if (password.length < 8) {
+        setErrorMsg('Defina uma senha com pelo menos 8 caracteres.');
+        return;
+      }
+      if (password !== confirmPassword) {
+        setErrorMsg('As senhas digitadas não coincidem.');
+        return;
+      }
+      setIsSubmitting(true);
+      try {
+        const res = await fetch('/api/auth/accept-invite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            token: inviteToken.trim(),
+            password,
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          authenticated?: boolean;
+          user?: AdminUser;
+          token?: string;
+          error?: string;
+        };
+        if (!res.ok || !data.authenticated || !data.user) {
+          throw new Error(
+            data.error || 'Não foi possível ativar sua conta com este convite.'
+          );
+        }
+        if (data.token) {
+          setAdminSessionToken(data.token);
+        }
+        onLoginSuccess(data.user);
+      } catch (err: unknown) {
+        setErrorMsg(
+          err instanceof Error
+            ? err.message
+            : 'Erro ao aceitar convite no servidor.'
+        );
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+
     if (!email.trim() || !password) {
-      setErrorMsg('Preencha o e-mail corporativo e a senha para acessar o painel.');
+      setErrorMsg('Preencha o e-mail corporativo e a senha para acessar a Central.');
       return;
     }
 
     setIsSubmitting(true);
-    setErrorMsg(null);
-
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
@@ -80,12 +142,6 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
     }
   };
 
-  const handleFillDemoCredentials = () => {
-    setEmail('ricardo@armazemdocarro.com.br');
-    setPassword('Armazem@2026');
-    setErrorMsg(null);
-  };
-
   return (
     <div className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col justify-between">
       {/* Top Bar */}
@@ -122,7 +178,7 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
           className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium text-zinc-300 bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-colors whitespace-nowrap shrink-0"
         >
           <ArrowLeft className="w-3.5 h-3.5 text-zinc-400" />
-          <span>Voltar à Vitrine Pública</span>
+          <span>Voltar à área pública</span>
         </button>
       </header>
 
@@ -130,17 +186,20 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
       <main className="flex-1 flex items-center justify-center px-5 py-12">
         <div className="w-full max-w-[440px]">
           <div className="bg-[#111114] border border-white/[0.08] rounded-xl p-8">
-            <div className="mb-7">
+            <div className="mb-6">
               <div className="flex items-center gap-2 text-xs font-medium text-red-500 mb-2">
                 <Lock className="w-3.5 h-3.5" />
-                <span>Acesso Restrito · Painel Administrativo</span>
+                <span>Acesso da Equipe · Central da Revenda</span>
               </div>
               <h1 className="font-display text-2xl font-semibold text-white tracking-tight">
-                Entrar na Gestão Interna
+                {mode === 'invite'
+                  ? 'Ativar Conta por Convite'
+                  : 'Entrar na Central da Revenda'}
               </h1>
               <p className="text-sm text-zinc-400 mt-1.5 leading-relaxed">
-                Autentique-se para gerenciar estoque, CRM de leads, contratos e
-                gerador de posts com IA.
+                {mode === 'invite'
+                  ? 'Defina sua senha individual para acessar atendimentos, estoque, divulgação e documentos conforme seu perfil.'
+                  : 'Use sua conta individual de vendedor, assistente, gestor ou administrador.'}
               </p>
             </div>
 
@@ -166,41 +225,64 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
             )}
 
             <form onSubmit={handleSubmit} className="space-y-4">
-              <div>
-                <label
-                  htmlFor="admin-email"
-                  className="block text-xs font-medium text-zinc-300 mb-1.5"
-                >
-                  E-mail Corporativo
-                </label>
-                <div className="relative">
-                  <Mail className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                  <input
-                    id="admin-email"
-                    type="email"
-                    autoComplete="email"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="gerente@armazemdocarro.com.br"
-                    className="w-full pl-10 pr-4 py-2.5 rounded-lg bg-[#09090B] border border-white/[0.1] text-sm text-white placeholder:text-zinc-600 focus:outline-none focus:border-red-600 focus:ring-1 focus:ring-red-600 transition-colors"
-                  />
+              {mode === 'invite' ? (
+                <div>
+                  <label
+                    htmlFor="invite-token"
+                    className="block text-xs font-medium text-zinc-300 mb-1.5"
+                  >
+                    Token do Convite
+                  </label>
+                  <div className="relative">
+                    <UserCheck className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      id="invite-token"
+                      type="text"
+                      required
+                      value={inviteToken}
+                      onChange={(e) => setInviteToken(e.target.value)}
+                      placeholder="Cole o token recebido do administrador"
+                      className="w-full pl-10 pr-4 py-2.5 rounded-lg bg-[#09090B] border border-white/[0.1] text-sm font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-red-600"
+                    />
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div>
+                  <label
+                    htmlFor="admin-email"
+                    className="block text-xs font-medium text-zinc-300 mb-1.5"
+                  >
+                    E-mail Corporativo
+                  </label>
+                  <div className="relative">
+                    <Mail className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      id="admin-email"
+                      type="email"
+                      autoComplete="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="nome@revenda.com.br"
+                      className="w-full pl-10 pr-4 py-2.5 rounded-lg bg-[#09090B] border border-white/[0.1] text-sm text-white placeholder:text-zinc-600 focus:outline-none focus:border-red-600 focus:ring-1 focus:ring-red-600 transition-colors"
+                    />
+                  </div>
+                </div>
+              )}
 
               <div>
                 <label
                   htmlFor="admin-password"
                   className="block text-xs font-medium text-zinc-300 mb-1.5"
                 >
-                  Senha de Acesso
+                  {mode === 'invite' ? 'Definir Senha (mín. 8 caracteres)' : 'Senha de Acesso'}
                 </label>
                 <div className="relative">
                   <Lock className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     id="admin-password"
                     type={showPassword ? 'text' : 'password'}
-                    autoComplete="current-password"
+                    autoComplete={mode === 'invite' ? 'new-password' : 'current-password'}
                     required
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
@@ -222,6 +304,27 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
                 </div>
               </div>
 
+              {mode === 'invite' && (
+                <div>
+                  <label
+                    htmlFor="confirm-password"
+                    className="block text-xs font-medium text-zinc-300 mb-1.5"
+                  >
+                    Confirmar Senha
+                  </label>
+                  <input
+                    id="confirm-password"
+                    type={showPassword ? 'text' : 'password'}
+                    autoComplete="new-password"
+                    required
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    placeholder="Repita a senha"
+                    className="w-full px-3.5 py-2.5 rounded-lg bg-[#09090B] border border-white/[0.1] text-sm text-white placeholder:text-zinc-600 focus:outline-none focus:border-red-600"
+                  />
+                </div>
+              )}
+
               <button
                 type="submit"
                 disabled={isSubmitting}
@@ -233,34 +336,38 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
                     <span>Validando acesso...</span>
                   </>
                 ) : (
-                  <span>Entrar no Painel</span>
+                  <span>
+                    {mode === 'invite'
+                      ? 'Ativar Conta e Entrar'
+                      : 'Entrar na Central'}
+                  </span>
                 )}
               </button>
             </form>
 
-            <div className="mt-6 pt-5 border-t border-white/[0.08] flex flex-col gap-2.5">
-              <div className="flex items-center justify-between gap-2 text-xs text-zinc-400">
-                <span>Operador padrão cadastrado no Neon</span>
-                <button
-                  type="button"
-                  onClick={handleFillDemoCredentials}
-                  className="text-red-400 hover:text-red-300 font-medium transition-colors whitespace-nowrap"
-                >
-                  Preencher acesso
-                </button>
-              </div>
-              <div className="text-xs font-mono text-zinc-500 flex flex-wrap items-center gap-x-3 gap-y-1">
-                <span>ricardo@armazemdocarro.com.br</span>
-                <span aria-hidden="true">·</span>
-                <span>Armazem@2026</span>
-              </div>
+            <div className="mt-6 pt-5 border-t border-white/[0.08] flex items-center justify-between gap-2 text-xs text-zinc-400">
+              <span>
+                {mode === 'invite'
+                  ? 'Já possui conta ativa?'
+                  : 'Recebeu um convite do administrador?'}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setErrorMsg(null);
+                  setMode((prev) => (prev === 'login' ? 'invite' : 'login'));
+                }}
+                className="text-red-400 hover:text-red-300 font-medium transition-colors whitespace-nowrap"
+              >
+                {mode === 'invite' ? 'Fazer login' : 'Aceitar convite'}
+              </button>
             </div>
           </div>
         </div>
       </main>
 
       <footer className="py-5 px-6 text-center text-xs text-zinc-500 border-t border-white/[0.06]">
-        {dealershipName} · Sessão protegida por cookie HttpOnly e token JWT
+        {dealershipName} · Sessão protegida por cookie HttpOnly e controle de perfis no servidor
       </footer>
     </div>
   );

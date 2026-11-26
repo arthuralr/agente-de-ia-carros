@@ -1,17 +1,19 @@
 import React from 'react';
 import {
-  LayoutDashboard,
+  BarChart3,
+  CalendarClock,
   CarFront,
-  Users,
-  MessageSquareText,
-  FileSignature,
-  Sparkles,
-  Settings,
+  FileText,
+  Home,
   LogOut,
+  Megaphone,
+  MessageSquareText,
+  Settings,
   X,
 } from 'lucide-react';
 import { AdminUser, NavModule } from '../types';
 import { MANAGER_AVATAR_URL } from '../data/mockData';
+import { canAccessModule, STAFF_ROLE_META } from '../utils/rbac';
 
 interface SidebarProps {
   activeModule: NavModule;
@@ -32,6 +34,7 @@ interface NavItem {
   label: string;
   icon: React.FC<{ className?: string }>;
   count?: number;
+  aliases?: NavModule[];
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -44,15 +47,49 @@ export const Sidebar: React.FC<SidebarProps> = ({
   mobileOpen,
   onCloseMobile,
 }) => {
-  const navItems: NavItem[] = [
-    { id: 'dashboard', label: 'Visão Geral', icon: LayoutDashboard },
-    { id: 'inventory', label: 'Gestão de Estoque', icon: CarFront, count: counts.availableVehicles },
-    { id: 'crm', label: 'CRM & Leads', icon: Users, count: counts.newLeads },
-    { id: 'chat_audit', label: 'Conversas IA', icon: MessageSquareText },
-    { id: 'contracts', label: 'Contratos & Docs', icon: FileSignature },
-    { id: 'social_ai', label: 'Posts com IA', icon: Sparkles },
-    { id: 'settings', label: 'Configurações', icon: Settings },
+  const roleCode = adminUser?.roleCode || 'administrador';
+
+  const allNavItems: NavItem[] = [
+    { id: 'hoje', label: 'Hoje', icon: Home, aliases: ['dashboard'] },
+    {
+      id: 'atendimentos',
+      label: 'Atendimentos',
+      icon: MessageSquareText,
+      count: counts.newLeads,
+      aliases: ['chat_audit', 'crm'],
+    },
+    {
+      id: 'estoque',
+      label: 'Estoque',
+      icon: CarFront,
+      count: counts.availableVehicles,
+      aliases: ['inventory'],
+    },
+    { id: 'agenda_trocas', label: 'Agenda e Trocas', icon: CalendarClock },
+    {
+      id: 'divulgacao',
+      label: 'Divulgação',
+      icon: Megaphone,
+      aliases: ['social_ai'],
+    },
+    {
+      id: 'documentos',
+      label: 'Documentos',
+      icon: FileText,
+      aliases: ['contracts'],
+    },
+    { id: 'gestao', label: 'Gestão', icon: BarChart3 },
+    {
+      id: 'configuracoes',
+      label: 'Configurações',
+      icon: Settings,
+      aliases: ['settings'],
+    },
   ];
+
+  const navItems = allNavItems.filter((item) =>
+    canAccessModule(roleCode, item.id)
+  );
 
   const handleNavClick = (id: NavModule) => {
     onSelectModule(id);
@@ -78,8 +115,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="h-16 px-5 flex items-center justify-between border-b border-white/[0.08]">
             <button
               type="button"
-              onClick={() => handleNavClick('dashboard')}
-              className="flex items-center gap-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600 rounded-md"
+              onClick={() => handleNavClick('hoje')}
+              className="flex items-center gap-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600 rounded-md min-w-0"
             >
               <div className="w-8 h-8 rounded-lg bg-red-600 flex items-center justify-center shrink-0">
                 <svg
@@ -97,9 +134,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   <circle cx="16.5" cy="16" r="1.5" fill="currentColor" />
                 </svg>
               </div>
-              <span className="font-display font-semibold text-base tracking-tight text-white whitespace-nowrap">
-                {dealershipName}
-              </span>
+              <div className="min-w-0">
+                <span className="font-display font-semibold text-sm tracking-tight text-white block truncate">
+                  {dealershipName}
+                </span>
+                <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-500 block">
+                  Central da Revenda
+                </span>
+              </div>
             </button>
 
             <button
@@ -112,11 +154,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </button>
           </div>
 
-          {/* Primary Navigation */}
-          <nav className="px-3 py-5 space-y-1" aria-label="Menu principal">
+          {/* Primary Navigation (Filtered by Role) */}
+          <nav className="px-3 py-5 space-y-1" aria-label="Menu da Central da Revenda">
             {navItems.map((item) => {
               const Icon = item.icon;
-              const isActive = activeModule === item.id;
+              const isActive =
+                activeModule === item.id ||
+                Boolean(item.aliases?.includes(activeModule));
               return (
                 <button
                   key={item.id}
@@ -156,16 +200,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="flex items-center gap-3 mb-3">
             <img
               src={adminUser?.avatarUrl || MANAGER_AVATAR_URL}
-              alt={adminUser?.name || 'Gerente Comercial'}
+              alt={adminUser?.name || 'Equipe'}
               referrerPolicy="no-referrer"
               className="w-9 h-9 rounded-lg object-cover border border-white/10 shrink-0"
             />
             <div className="min-w-0 flex-1">
               <p className="text-sm font-medium text-zinc-100 truncate">
-                {adminUser?.name || 'Ricardo Almeida'}
+                {adminUser?.name || 'Equipe'}
               </p>
               <p className="text-xs text-zinc-500 truncate">
-                {adminUser?.role || 'Gerente Comercial'}
+                {STAFF_ROLE_META[roleCode]?.label || adminUser?.role || 'Equipe'}
               </p>
             </div>
           </div>
@@ -176,7 +220,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-zinc-300 bg-white/[0.04] hover:bg-red-600/15 hover:text-red-300 border border-white/[0.07] hover:border-red-600/30 transition-colors whitespace-nowrap"
           >
             <LogOut className="w-3.5 h-3.5 shrink-0" />
-            <span>Sair do Painel</span>
+            <span>Sair da Central</span>
           </button>
         </div>
       </aside>

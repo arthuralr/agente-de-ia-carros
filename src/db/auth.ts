@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import type { Request } from 'express';
 import jwt from 'jsonwebtoken';
 import { pool } from './pool';
+import type { StaffRole } from '../types';
+import { normalizeStaffRole } from '../utils/rbac';
 
 export interface DbAdminUserRow {
   id: number;
@@ -9,6 +11,7 @@ export interface DbAdminUserRow {
   email: string;
   password_hash: string;
   role: string;
+  role_code?: string | null;
   avatar_url: string | null;
   active: boolean;
   last_login_at: Date | null;
@@ -20,7 +23,10 @@ export interface PublicAdminUser {
   name: string;
   email: string;
   role: string;
+  roleCode: StaffRole;
   avatarUrl: string | null;
+  active?: boolean;
+  lastLoginAt?: string | null;
 }
 
 export interface SessionJwtPayload {
@@ -28,6 +34,7 @@ export interface SessionJwtPayload {
   email: string;
   name: string;
   role: string;
+  roleCode?: StaffRole;
   iat?: number;
   exp?: number;
 }
@@ -65,12 +72,14 @@ export function verifyPassword(password: string, storedHash: string): boolean {
 }
 
 export function signSessionToken(user: PublicAdminUser): string {
+  const resolvedRoleCode = normalizeStaffRole(user.roleCode, user.role);
   return jwt.sign(
     {
       sub: user.id,
       email: user.email,
       name: user.name,
       role: user.role,
+      roleCode: resolvedRoleCode,
     },
     getJwtSecret(),
     {

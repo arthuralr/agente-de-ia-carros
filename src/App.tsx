@@ -23,12 +23,16 @@ import {
 } from './db/mappers';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
-import { DashboardModule } from './components/modules/DashboardModule';
+import { TodayModule } from './components/modules/TodayModule';
+import { AtendimentosModule } from './components/modules/AtendimentosModule';
 import { InventoryModule } from './components/modules/InventoryModule';
-import { CrmModule } from './components/modules/CrmModule';
-import { ChatAuditModule } from './components/modules/ChatAuditModule';
-import { ContractsModule } from './components/modules/ContractsModule';
-import { SocialAiModule } from './components/modules/SocialAiModule';
+import { AgendaTrocasModule } from './components/modules/AgendaTrocasModule';
+import { DivulgacaoModule } from './components/modules/DivulgacaoModule';
+import {
+  DocumentosModule,
+  DocumentPreselectState,
+} from './components/modules/DocumentosModule';
+import { GestaoModule } from './components/modules/GestaoModule';
 import { SettingsModule } from './components/modules/SettingsModule';
 import { PublicCatalogPage } from './components/public/PublicCatalogPage';
 import { PublicHomePage } from './components/public/PublicHomePage';
@@ -42,20 +46,54 @@ import { AdminLoginPage } from './components/auth/AdminLoginPage';
 import { adminFetch, clearAdminSessionToken } from './utils/authSession';
 import { normalizeStoreWhatsAppNumber } from './utils/whatsappHandoff';
 import {
+  canAccessModule,
+  getDefaultModuleForRole,
+  hasPermission,
+} from './utils/rbac';
+import {
   buildVehicleSheetPath,
   DEFAULT_DEALERSHIP_CONFIG,
   mergeDealershipConfig,
 } from './utils/vehicleDomain';
 
 const MODULE_PATH_MAP: Record<NavModule, string> = {
-  dashboard: '/admin/visao-geral',
-  inventory: '/admin/estoque',
-  crm: '/admin/crm',
-  chat_audit: '/admin/conversas',
-  contracts: '/admin/contratos',
-  social_ai: '/admin/ia',
-  settings: '/admin/configuracoes',
+  hoje: '/revenda/hoje',
+  atendimentos: '/revenda/atendimentos',
+  estoque: '/revenda/estoque',
+  agenda_trocas: '/revenda/agenda-trocas',
+  divulgacao: '/revenda/divulgacao',
+  documentos: '/revenda/documentos',
+  gestao: '/revenda/gestao',
+  configuracoes: '/revenda/configuracoes',
+  // Legacy path aliases preserved
+  dashboard: '/revenda/hoje',
+  inventory: '/revenda/estoque',
+  crm: '/revenda/atendimentos',
+  chat_audit: '/revenda/atendimentos',
+  contracts: '/revenda/documentos',
+  social_ai: '/revenda/divulgacao',
+  settings: '/revenda/configuracoes',
 };
+
+function normalizeToCanonicalModule(mod: NavModule): NavModule {
+  switch (mod) {
+    case 'dashboard':
+      return 'hoje';
+    case 'inventory':
+      return 'estoque';
+    case 'crm':
+    case 'chat_audit':
+      return 'atendimentos';
+    case 'contracts':
+      return 'documentos';
+    case 'social_ai':
+      return 'divulgacao';
+    case 'settings':
+      return 'configuracoes';
+    default:
+      return mod;
+  }
+}
 
 function parseRouteFromPathname(pathname: string): {
   viewMode: AppViewMode;
@@ -68,40 +106,59 @@ function parseRouteFromPathname(pathname: string): {
   if (vehicleMatch?.[1]) {
     return {
       viewMode: 'vehicle_detail',
-      module: 'inventory',
+      module: 'hoje',
       vehicleId: decodeURIComponent(vehicleMatch[1]),
     };
   }
   if (clean === '/inicio' || clean === '/home') {
-    return { viewMode: 'home', module: 'inventory', vehicleId: null };
+    return { viewMode: 'home', module: 'hoje', vehicleId: null };
   }
   if (clean === '/chat' || clean === '/atendimento') {
-    return { viewMode: 'chat', module: 'inventory', vehicleId: null };
+    return { viewMode: 'chat', module: 'hoje', vehicleId: null };
   }
   if (clean === '/privacidade' || clean === '/politica-de-privacidade') {
-    return { viewMode: 'privacy', module: 'inventory', vehicleId: null };
+    return { viewMode: 'privacy', module: 'hoje', vehicleId: null };
   }
   if (clean === '/login') {
-    return { viewMode: 'login', module: 'inventory', vehicleId: null };
+    return { viewMode: 'login', module: 'hoje', vehicleId: null };
   }
-  if (clean === '/admin' || clean.startsWith('/admin/')) {
-    const sub = clean.slice('/admin'.length);
-    if (sub === '/visao-geral' || sub === '/dashboard') {
-      return { viewMode: 'admin', module: 'dashboard', vehicleId: null };
+  if (
+    clean === '/revenda' ||
+    clean.startsWith('/revenda/') ||
+    clean === '/admin' ||
+    clean.startsWith('/admin/')
+  ) {
+    const sub = clean.startsWith('/revenda')
+      ? clean.slice('/revenda'.length)
+      : clean.slice('/admin'.length);
+    if (!sub || sub === '/hoje' || sub === '/visao-geral' || sub === '/dashboard') {
+      return { viewMode: 'admin', module: 'hoje', vehicleId: null };
     }
-    if (sub === '/crm') return { viewMode: 'admin', module: 'crm', vehicleId: null };
-    if (sub === '/conversas' || sub === '/chat-audit') {
-      return { viewMode: 'admin', module: 'chat_audit', vehicleId: null };
+    if (sub === '/atendimentos' || sub === '/crm' || sub === '/conversas' || sub === '/chat-audit') {
+      return { viewMode: 'admin', module: 'atendimentos', vehicleId: null };
     }
-    if (sub === '/contratos') return { viewMode: 'admin', module: 'contracts', vehicleId: null };
-    if (sub === '/ia' || sub === '/posts-ia') {
-      return { viewMode: 'admin', module: 'social_ai', vehicleId: null };
+    if (sub === '/estoque') {
+      return { viewMode: 'admin', module: 'estoque', vehicleId: null };
     }
-    if (sub === '/configuracoes') return { viewMode: 'admin', module: 'settings', vehicleId: null };
-    return { viewMode: 'admin', module: 'inventory', vehicleId: null };
+    if (sub === '/agenda-trocas' || sub === '/agenda' || sub === '/trocas') {
+      return { viewMode: 'admin', module: 'agenda_trocas', vehicleId: null };
+    }
+    if (sub === '/divulgacao' || sub === '/ia' || sub === '/posts-ia') {
+      return { viewMode: 'admin', module: 'divulgacao', vehicleId: null };
+    }
+    if (sub === '/documentos' || sub === '/contratos') {
+      return { viewMode: 'admin', module: 'documentos', vehicleId: null };
+    }
+    if (sub === '/gestao') {
+      return { viewMode: 'admin', module: 'gestao', vehicleId: null };
+    }
+    if (sub === '/configuracoes') {
+      return { viewMode: 'admin', module: 'configuracoes', vehicleId: null };
+    }
+    return { viewMode: 'admin', module: 'hoje', vehicleId: null };
   }
 
-  return { viewMode: 'catalog', module: 'inventory', vehicleId: null };
+  return { viewMode: 'catalog', module: 'hoje', vehicleId: null };
 }
 
 function getPathForView(
@@ -116,7 +173,7 @@ function getPathForView(
   if (viewMode === 'chat') return '/chat';
   if (viewMode === 'privacy') return '/privacidade';
   if (viewMode === 'login') return '/login';
-  if (viewMode === 'admin') return MODULE_PATH_MAP[module] || '/admin/estoque';
+  if (viewMode === 'admin') return MODULE_PATH_MAP[module] || '/revenda/hoje';
   return '/';
 }
 
@@ -174,10 +231,11 @@ export default function App() {
   // Admin cross-module navigation state
   const [triggerNewVehicleModal, setTriggerNewVehicleModal] = useState(false);
   const [preselectedLeadId, setPreselectedLeadId] = useState<string | null>(null);
-  const [contractPreselect, setContractPreselect] = useState<{
-    leadId: string | null;
-    vehicleId: string | null;
-  }>({ leadId: null, vehicleId: null });
+  const [preselectedEditVehicleId, setPreselectedEditVehicleId] = useState<
+    string | null
+  >(null);
+  const [documentPreselect, setDocumentPreselect] =
+    useState<DocumentPreselectState | null>(null);
   const [socialPreselectVehicleId, setSocialPreselectVehicleId] = useState<
     string | null
   >(null);
@@ -381,14 +439,14 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  // Route Protection Middleware (Frontend Guard)
+  // Route Protection Middleware (Frontend Guard + RBAC)
   useEffect(() => {
     if (authChecking) return;
 
     if (viewMode === 'admin' && !authUser) {
       setPendingAdminModule(activeModule);
       setLoginRedirectNotice(
-        'Acesso restrito. Autentique-se para abrir o Painel Administrativo.'
+        'Acesso restrito. Autentique-se para abrir a Central da Revenda.'
       );
       navigateTo('login', undefined, true);
       return;
@@ -396,7 +454,21 @@ export default function App() {
 
     if (viewMode === 'login' && authUser) {
       setLoginRedirectNotice(null);
-      navigateTo('admin', pendingAdminModule, true);
+      const target = canAccessModule(authUser.roleCode, pendingAdminModule)
+        ? normalizeToCanonicalModule(pendingAdminModule)
+        : getDefaultModuleForRole(authUser.roleCode);
+      navigateTo('admin', target, true);
+      return;
+    }
+
+    if (viewMode === 'admin' && authUser) {
+      const canonical = normalizeToCanonicalModule(activeModule);
+      if (!canAccessModule(authUser.roleCode, canonical)) {
+        const fallback = getDefaultModuleForRole(authUser.roleCode);
+        navigateTo('admin', fallback, true);
+      } else if (canonical !== activeModule) {
+        navigateTo('admin', canonical, true);
+      }
     }
   }, [
     activeModule,
@@ -818,12 +890,17 @@ export default function App() {
   };
 
   const handleQuickNewVehicle = () => {
-    navigateTo('admin', 'inventory');
+    navigateTo('admin', 'estoque');
     setTriggerNewVehicleModal(true);
   };
 
   const handleSelectAdminModule = (module: NavModule) => {
-    navigateTo('admin', module);
+    const canonical = normalizeToCanonicalModule(module);
+    if (authUser && !canAccessModule(authUser.roleCode, canonical)) {
+      navigateTo('admin', getDefaultModuleForRole(authUser.roleCode));
+      return;
+    }
+    navigateTo('admin', canonical);
   };
 
   const openVehicleInterestChat = (vehicle: Vehicle) => {
@@ -959,9 +1036,16 @@ export default function App() {
           void hydratePublicVehicles();
           navigateTo(operationMode === 'agent_only' ? 'chat' : 'catalog');
         }}
-        onOpenChatWithVehicle={(veh) => {
+        onOpenChatWithVehicle={(veh, trackingSource) => {
           setChatVehicle(veh);
-          navigateTo('chat');
+          if (typeof window !== 'undefined') {
+            const qs = new URLSearchParams();
+            qs.set('veiculo', String(veh.id));
+            if (trackingSource) qs.set('origem', trackingSource);
+            window.history.pushState(null, '', `/chat?${qs.toString()}`);
+          }
+          setActiveVehicleId(null);
+          setViewMode('chat');
         }}
       />
     );
@@ -979,14 +1063,17 @@ export default function App() {
         settings={settings}
         storeWhatsappNumber={storeWhatsappNumber}
         showBackToCatalog={operationMode === 'full'}
+        initialVehicle={chatVehicle}
         onCaptureLead={handleCapturePublicLead}
         onSyncLeadChat={handleSyncPublicLeadChat}
         onOpenCatalog={() => {
+          setChatVehicle(null);
           void hydratePublicVehicles();
           navigateTo('catalog');
         }}
         onOpenVehicleSheet={openVehicleSheet}
         onOpenPrivacy={() => navigateTo('privacy')}
+        onOpenStaffArea={handleOpenAdminEntry}
       />
     );
   }
@@ -1076,11 +1163,15 @@ export default function App() {
     );
   }
 
-  // 4. Protected Admin Panel View (only reachable with verified Neon JWT session)
+  // 4. Protected Central da Revenda View (only reachable with verified Neon JWT session)
+  const canonicalActive = normalizeToCanonicalModule(activeModule);
+  const canEditInventory = hasPermission(authUser.roleCode, 'inventory:edit');
+  const canDeleteInventory = hasPermission(authUser.roleCode, 'inventory:delete');
+
   return (
     <div className="min-h-screen bg-[#09090B] text-zinc-100 flex">
       <Sidebar
-        activeModule={activeModule}
+        activeModule={canonicalActive}
         onSelectModule={handleSelectAdminModule}
         dealershipName={settings.tradeName}
         adminUser={authUser}
@@ -1096,8 +1187,9 @@ export default function App() {
 
       <div className="flex-1 min-w-0 flex flex-col min-h-screen">
         <TopBar
-          activeModule={activeModule}
+          activeModule={canonicalActive}
           operationMode={operationMode}
+          canCreateVehicle={canEditInventory}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           onQuickNewVehicle={handleQuickNewVehicle}
           onOpenPublicCatalog={() => {
@@ -1107,133 +1199,158 @@ export default function App() {
           onUnauthorized={() => handleUnauthorizedSession()}
           onOpenChatSession={(sessionId) => {
             setPreselectedChatSessionId(sessionId);
-            handleSelectAdminModule('chat_audit');
+            handleSelectAdminModule('atendimentos');
           }}
           onOpenCrmLead={(leadId) => {
             if (leadId) setPreselectedLeadId(leadId);
-            handleSelectAdminModule('crm');
+            handleSelectAdminModule('atendimentos');
           }}
         />
 
-        <main className="flex-1 p-5 sm:p-6 lg:p-8 max-w-[1440px] w-full mx-auto">
-          {activeModule === 'dashboard' && (
-            <DashboardModule
-              vehicles={vehicles}
-              leads={leads}
-              activities={activities}
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-[1440px] w-full mx-auto">
+          {canonicalActive === 'hoje' && (
+            <TodayModule
+              currentUser={authUser}
+              onUnauthorized={() => handleUnauthorizedSession()}
               onNavigate={handleSelectAdminModule}
-              onSelectLead={(leadId) => {
-                setPreselectedLeadId(leadId);
-                handleSelectAdminModule('crm');
+              onOpenSession={(sessionId) => {
+                setPreselectedChatSessionId(sessionId);
+                handleSelectAdminModule('atendimentos');
+              }}
+              onOpenVehicleEdit={(vehicleId) => {
+                setPreselectedEditVehicleId(vehicleId);
+                handleSelectAdminModule('estoque');
+              }}
+              onOpenDocumentId={(documentId) => {
+                setDocumentPreselect({ documentId });
+                handleSelectAdminModule('documentos');
               }}
             />
           )}
 
-          {activeModule === 'inventory' && (
-            <InventoryModule
+          {canonicalActive === 'atendimentos' && (
+            <AtendimentosModule
+              currentUser={authUser}
               vehicles={vehicles}
-              onAddVehicle={handleAddVehicle}
-              onUpdateVehicle={handleUpdateVehicle}
-              onDeleteVehicle={handleDeleteVehicle}
-              onGeneratePostForVehicle={(vehicleId) => {
-                setSocialPreselectVehicleId(vehicleId);
-                handleSelectAdminModule('social_ai');
-              }}
-              externalModalOpen={triggerNewVehicleModal}
-              onCloseExternalModal={() => setTriggerNewVehicleModal(false)}
-            />
-          )}
-
-          {activeModule === 'crm' && (
-            <CrmModule
               leads={leads}
-              vehicles={vehicles}
-              aiAssistantName={settings.aiAssistantName}
+              settings={settings}
+              preselectedSessionId={preselectedChatSessionId}
+              onClearPreselectedSession={() => setPreselectedChatSessionId(null)}
+              onUnauthorized={() => handleUnauthorizedSession()}
+              onOpenDocumentForSession={(params) => {
+                setDocumentPreselect(params);
+                handleSelectAdminModule('documentos');
+              }}
+              onOpenMarketingForVehicle={(vehicleId) => {
+                setSocialPreselectVehicleId(vehicleId);
+                handleSelectAdminModule('divulgacao');
+              }}
+              onOpenVehicleSheet={openVehicleSheet}
+              onOpenVehicleEdit={(vehicleId) => {
+                setPreselectedEditVehicleId(vehicleId);
+                handleSelectAdminModule('estoque');
+              }}
               onUpdateLead={handleUpdateLead}
               onAddLead={handleAddLeadAdmin}
               onDeleteLead={handleDeleteLead}
               onRefreshLeads={refreshLeadsFromDb}
-              onGenerateContractForLead={(leadId, vehicleId) => {
-                setContractPreselect({ leadId, vehicleId });
-                handleSelectAdminModule('contracts');
-              }}
               preselectedLeadId={preselectedLeadId}
               onClearPreselectedLead={() => setPreselectedLeadId(null)}
             />
           )}
 
-          {activeModule === 'chat_audit' && (
-            <ChatAuditModule
-              settings={settings}
-              onUnauthorized={() => handleUnauthorizedSession()}
-              preselectedSessionId={preselectedChatSessionId}
-              onClearPreselectedSession={() => setPreselectedChatSessionId(null)}
-              onLeadSyncedFromChat={(syncedLead, action) => {
-                setLeads((prev) => {
-                  const exists = prev.some((l) => l.id === syncedLead.id);
-                  if (exists) {
-                    return prev.map((l) =>
-                      l.id === syncedLead.id ? syncedLead : l
-                    );
-                  }
-                  return [syncedLead, ...prev];
-                });
-                pushActivity(
-                  action === 'created'
-                    ? 'Card criado automaticamente no CRM'
-                    : 'Card atualizado automaticamente no CRM',
-                  `${syncedLead.name}${syncedLead.tag ? ` · ${syncedLead.tag}` : ''}`,
-                  'crm'
-                );
-              }}
-              onOpenCrm={(leadId) => {
-                if (leadId) {
-                  setPreselectedLeadId(leadId);
-                }
-                handleSelectAdminModule('crm');
-              }}
-            />
-          )}
-
-          {activeModule === 'contracts' && (
-            <ContractsModule
-              leads={leads}
+          {canonicalActive === 'estoque' && (
+            <InventoryModule
               vehicles={vehicles}
-              settings={settings}
-              preselectedLeadId={contractPreselect.leadId}
-              preselectedVehicleId={contractPreselect.vehicleId}
-              onClearPreselection={() =>
-                setContractPreselect({ leadId: null, vehicleId: null })
-              }
-              onContractCreated={(record) => {
-                pushActivity(
-                  'Contrato registrado no histórico',
-                  `${record.clientName} · ${record.vehicleLabel}`,
-                  'contrato'
-                );
+              canEdit={canEditInventory}
+              canDelete={canDeleteInventory}
+              onAddVehicle={handleAddVehicle}
+              onUpdateVehicle={handleUpdateVehicle}
+              onDeleteVehicle={handleDeleteVehicle}
+              onGeneratePostForVehicle={(vehicleId) => {
+                setSocialPreselectVehicleId(vehicleId);
+                handleSelectAdminModule('divulgacao');
               }}
-              onUnauthorized={() => handleUnauthorizedSession()}
+              onGenerateDocumentForVehicle={(vehicleId) => {
+                setDocumentPreselect({ vehicleId });
+                handleSelectAdminModule('documentos');
+              }}
+              externalModalOpen={triggerNewVehicleModal}
+              onCloseExternalModal={() => setTriggerNewVehicleModal(false)}
+              preselectedEditVehicleId={preselectedEditVehicleId}
+              onClearPreselectedEditVehicle={() =>
+                setPreselectedEditVehicleId(null)
+              }
             />
           )}
 
-          {activeModule === 'social_ai' && (
-            <SocialAiModule
+          {canonicalActive === 'agenda_trocas' && (
+            <AgendaTrocasModule
+              currentUser={authUser}
+              vehicles={vehicles}
+              onUnauthorized={() => handleUnauthorizedSession()}
+              onOpenSession={(sessionId) => {
+                setPreselectedChatSessionId(sessionId);
+                handleSelectAdminModule('atendimentos');
+              }}
+            />
+          )}
+
+          {canonicalActive === 'divulgacao' && (
+            <DivulgacaoModule
+              currentUser={authUser}
               vehicles={vehicles}
               settings={settings}
               preselectedVehicleId={socialPreselectVehicleId}
               onClearPreselection={() => setSocialPreselectVehicleId(null)}
               onUnauthorized={() => handleUnauthorizedSession()}
+              onOpenVehicleSheet={openVehicleSheet}
             />
           )}
 
-          {activeModule === 'settings' && (
+          {canonicalActive === 'documentos' && (
+            <DocumentosModule
+              currentUser={authUser}
+              vehicles={vehicles}
+              leads={leads}
+              settings={settings}
+              preselect={documentPreselect}
+              onClearPreselect={() => setDocumentPreselect(null)}
+              onUnauthorized={() => handleUnauthorizedSession()}
+              onDocumentIssued={(doc) => {
+                pushActivity(
+                  'Documento emitido na Central',
+                  `${doc.templateName} #${String(doc.id).padStart(5, '0')}`,
+                  'contrato'
+                );
+              }}
+            />
+          )}
+
+          {canonicalActive === 'gestao' && (
+            <GestaoModule
+              onUnauthorized={() => handleUnauthorizedSession()}
+              onOpenSession={(sessionId) => {
+                setPreselectedChatSessionId(sessionId);
+                handleSelectAdminModule('atendimentos');
+              }}
+              onOpenVehicleEdit={(vehicleId) => {
+                setPreselectedEditVehicleId(vehicleId);
+                handleSelectAdminModule('estoque');
+              }}
+            />
+          )}
+
+          {canonicalActive === 'configuracoes' && (
             <SettingsModule
+              currentUser={authUser}
               settings={settings}
               operationMode={operationMode}
               storeWhatsappNumber={storeWhatsappNumber}
               onChangeOperationMode={handleUpdateOperationMode}
               onSaveStoreWhatsappNumber={handleUpdateStoreWhatsappNumber}
               onSaveSettings={handleSaveCentralizedDealershipSettings}
+              onUnauthorized={() => handleUnauthorizedSession()}
             />
           )}
         </main>

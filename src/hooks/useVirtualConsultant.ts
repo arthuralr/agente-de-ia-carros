@@ -705,13 +705,17 @@ export function useVirtualConsultant({
 
         if (!contentType.includes('text/event-stream') || !response.body) {
           const data = (await response.json()) as StructuredMetaPayload & {
-            reply: string;
+            reply?: string;
+            humanActive?: boolean;
           };
           applyStructuredMeta(data);
+          if (data.humanActive && !data.reply?.trim()) {
+            return;
+          }
           const aiMsg: ChatMessage = {
             id: aiMsgId,
             sender: 'ia',
-            text: data.reply,
+            text: data.reply || '',
             timestamp: aiTimestamp,
             ...capturedMeta,
           };
@@ -1128,7 +1132,7 @@ export function useVirtualConsultant({
 
   // Lightweight polling for live Consultant Messages & Store Broadcasts on /chat
   useEffect(() => {
-    if (!active || !persistStorageKey || targetVehicle) return;
+    if (!active || !persistStorageKey) return;
 
     let cancelled = false;
     const pollUpdates = async () => {

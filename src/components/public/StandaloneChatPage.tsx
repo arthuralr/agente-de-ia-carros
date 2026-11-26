@@ -86,11 +86,13 @@ interface StandaloneChatPageProps {
   settings: DealershipSettings;
   storeWhatsappNumber?: string;
   showBackToCatalog?: boolean;
+  initialVehicle?: Vehicle | null;
   onCaptureLead: (lead: Lead) => Promise<Lead>;
   onSyncLeadChat?: (leadId: string, chatHistory: ChatMessage[]) => Promise<void>;
   onOpenCatalog: () => void;
   onOpenVehicleSheet?: (vehicleId: string) => void;
   onOpenPrivacy?: () => void;
+  onOpenStaffArea?: () => void;
 }
 
 export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
@@ -98,11 +100,13 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
   settings,
   storeWhatsappNumber,
   showBackToCatalog = true,
+  initialVehicle = null,
   onCaptureLead,
   onSyncLeadChat,
   onOpenCatalog,
   onOpenVehicleSheet,
   onOpenPrivacy,
+  onOpenStaffArea,
 }) => {
   // Permite personalização leve via query string (ex.: ?loja=Parceiro) para uso B2B em links externos
   const effectiveSettings = useMemo(() => {
@@ -115,6 +119,26 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
       tradeName: partnerStore,
     };
   }, [settings]);
+
+  const urlSearchMeta = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return { vehicleId: null as string | null, origem: '/chat' };
+    }
+    const params = new URLSearchParams(window.location.search);
+    const vehicleId = params.get('veiculo')?.trim() || null;
+    const rawOrigem = params.get('origem')?.trim() || '';
+    const origem = rawOrigem ? `/chat (${rawOrigem})` : '/chat';
+    return { vehicleId, origem };
+  }, []);
+
+  const resolvedInitialVehicle = useMemo(() => {
+    if (initialVehicle) return initialVehicle;
+    if (!urlSearchMeta.vehicleId) return null;
+    return (
+      vehicles.find((v) => String(v.id) === String(urlSearchMeta.vehicleId)) ||
+      null
+    );
+  }, [initialVehicle, urlSearchMeta.vehicleId, vehicles]);
 
   const persistStorageKey = useMemo(() => {
     if (typeof window === 'undefined') return 'armazem_chat_v1_default';
@@ -237,12 +261,12 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
     resetConversation,
   } = useVirtualConsultant({
     active: true,
-    targetVehicle: null,
+    targetVehicle: resolvedInitialVehicle,
     vehicles,
     settings: effectiveSettings,
-    originLabel: '/chat',
+    originLabel: urlSearchMeta.origem,
     leadSourceLabel: 'Chat IA do Site',
-    leadNote: 'Lead capturado pela página dedicada (/chat) estilo WhatsApp.',
+    leadNote: `Lead capturado pela página dedicada (${urlSearchMeta.origem}) estilo WhatsApp.`,
     persistStorageKey,
     onCaptureLead,
     onSyncLeadChat,
@@ -1235,11 +1259,25 @@ export const StandaloneChatPage: React.FC<StandaloneChatPageProps> = ({
                         setHeaderMenuOpen(false);
                         setConfirmClearOpen(true);
                       }}
-                      className="w-full min-h-[42px] px-3.5 py-2 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors"
+                      className="w-full min-h-[42px] px-3.5 py-2 text-left text-xs font-medium text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors border-b border-[#E9EDEF]"
                     >
                       <RotateCcw className="w-4 h-4 text-[#54656F] shrink-0" />
                       <span>Nova conversa / Limpar histórico</span>
                     </button>
+
+                    {onOpenStaffArea && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setHeaderMenuOpen(false);
+                          onOpenStaffArea();
+                        }}
+                        className="w-full min-h-[40px] px-3.5 py-2 text-left text-[11px] font-medium text-[#54656F] hover:text-[#111B21] hover:bg-[#F0F2F5] flex items-center gap-2.5 transition-colors"
+                      >
+                        <Headset className="w-3.5 h-3.5 text-[#667781] shrink-0" />
+                        <span>Acesso da equipe</span>
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
