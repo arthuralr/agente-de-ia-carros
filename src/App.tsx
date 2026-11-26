@@ -57,6 +57,7 @@ import {
   mergeDealershipConfig,
   resolvePublicStorefrontLinks,
 } from './utils/vehicleDomain';
+import { applyClientRouteSeo, buildRouteSeoPayload } from './utils/seo';
 
 const MODULE_PATH_MAP: Record<NavModule, string> = {
   hoje: '/revenda/hoje',
@@ -283,6 +284,25 @@ export default function App() {
     },
     [navigateTo]
   );
+
+  // Sync dynamic <title>, meta description, robots (noindex on /login & /revenda/*), canonical & JSON-LD per route
+  useEffect(() => {
+    const activeVehicle =
+      viewMode === 'vehicle_detail' && activeVehicleId
+        ? vehicles.find((v) => String(v.id) === String(activeVehicleId)) || null
+        : null;
+    const origin =
+      typeof window !== 'undefined' ? window.location.origin : '';
+    const seoPayload = buildRouteSeoPayload({
+      viewMode,
+      activeModule,
+      settings,
+      origin,
+      vehicle: activeVehicle,
+      vehicles,
+    });
+    applyClientRouteSeo(seoPayload);
+  }, [viewMode, activeModule, settings, vehicles, activeVehicleId]);
 
   const handleUnauthorizedSession = useCallback(
     (notice = 'Sua sessão administrativa expirou ou requer autenticação.') => {

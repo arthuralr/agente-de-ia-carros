@@ -18,8 +18,10 @@ import {
 } from '../utils/rbac';
 import {
   analyzeVehicleDataQuality,
+  buildConsolidatedHandoffSummary,
   computeFipeMetrics,
   formatDealershipAddress,
+  getVehicleDisplayTitle,
 } from '../utils/vehicleDomain';
 import {
   buildPdfBytesFromIssuedDocument,
@@ -883,37 +885,57 @@ export function registerCentralRevendaRoutes(
             }
             return {
               id: v.id,
-              title: `${v.brand} ${v.model} (${v.year})`.trim(),
+              title: `${getVehicleDisplayTitle(v)} (${v.year})`.trim(),
               status: v.status,
               issues,
             };
           })
           .filter((item) => item.issues.length > 0);
 
+        const vehicleById = new Map(vehicles.map((v) => [String(v.id), v]));
+
         const summary: TodayActionSummary = {
-          awaitingReply: sessionsRes.rows.map((r) => ({
-            id: Number(r.id),
-            sessionId: String(r.session_id),
-            leadName: r.lead_name ? String(r.lead_name) : null,
-            leadPhone: r.lead_phone ? String(r.lead_phone) : null,
-            origem: String(r.origem || '/chat'),
-            tag: r.tag ? String(r.tag) : null,
-            assignedUserId: r.assigned_user_id ? Number(r.assigned_user_id) : null,
-            assignedUserName: r.assigned_user_name ? String(r.assigned_user_name) : null,
-            automationMode: (r.automation_mode || 'ai_active') as SessionAutomationMode,
-            stage: (r.stage || 'Novo Lead') as SessionCommercialStage,
-            focusedVehicleId: r.focused_vehicle_id ? Number(r.focused_vehicle_id) : null,
-            context: safeJsonParse<SessionNegotiationContext | null>(
+          awaitingReply: sessionsRes.rows.map((r) => {
+            const parsedCtx = safeJsonParse<SessionNegotiationContext | null>(
               typeof r.context_json === 'string' ? r.context_json : null,
               null
-            ),
-            version: Number(r.version) || 1,
-            createdAt: String(r.created_at),
-            updatedAt: String(r.updated_at),
-            messageCount: Number(r.message_count) || 0,
-            lastMessage: r.last_message ? String(r.last_message) : null,
-            lastSender: (r.last_sender || null) as 'user' | 'assistant' | null,
-          })),
+            );
+            const focusedIdStr = r.focused_vehicle_id
+              ? String(r.focused_vehicle_id)
+              : parsedCtx?.focusedVehicleId
+                ? String(parsedCtx.focusedVehicleId)
+                : null;
+            const focusedVeh = focusedIdStr ? vehicleById.get(focusedIdStr) || null : null;
+            const handoffSummary =
+              parsedCtx?.handoffSummary ||
+              buildConsolidatedHandoffSummary({
+                focusedVehicle: focusedVeh,
+                financingSummary: parsedCtx?.financingSummary ?? null,
+                tradeInSummary: parsedCtx?.tradeInSummary ?? null,
+              });
+
+            return {
+              id: Number(r.id),
+              sessionId: String(r.session_id),
+              leadName: r.lead_name ? String(r.lead_name) : null,
+              leadPhone: r.lead_phone ? String(r.lead_phone) : null,
+              origem: String(r.origem || '/chat'),
+              tag: r.tag ? String(r.tag) : null,
+              handoffSummary,
+              assignedUserId: r.assigned_user_id ? Number(r.assigned_user_id) : null,
+              assignedUserName: r.assigned_user_name ? String(r.assigned_user_name) : null,
+              automationMode: (r.automation_mode || 'ai_active') as SessionAutomationMode,
+              stage: (r.stage || 'Novo Lead') as SessionCommercialStage,
+              focusedVehicleId: r.focused_vehicle_id ? Number(r.focused_vehicle_id) : null,
+              context: parsedCtx,
+              version: Number(r.version) || 1,
+              createdAt: String(r.created_at),
+              updatedAt: String(r.updated_at),
+              messageCount: Number(r.message_count) || 0,
+              lastMessage: r.last_message ? String(r.last_message) : null,
+              lastSender: (r.last_sender || null) as 'user' | 'assistant' | null,
+            };
+          }),
           proposalsToFollowUp: proposalsRes.rows.map((p) => {
             const vals = safeJsonParse<Record<string, unknown>>(p.values_json, {});
             const totals = safeJsonParse<{ principalBalance?: number }>(

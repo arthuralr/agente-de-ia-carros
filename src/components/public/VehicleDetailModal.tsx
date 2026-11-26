@@ -19,6 +19,7 @@ import {
   analyzeVehicleDataQuality,
   computeFipeMetrics,
   formatBrlCurrency,
+  getVehicleDisplayTitle,
 } from '../../utils/vehicleDomain';
 import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 
@@ -101,6 +102,8 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
     setActivePhotoIndex((prev) => (prev === photos.length - 1 ? 0 : prev + 1));
   };
 
+  const displayTitle = getVehicleDisplayTitle(vehicle);
+
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
       <div className="bg-[#111114] border border-white/[0.1] rounded-xl w-full max-w-5xl max-h-[92vh] flex flex-col overflow-hidden">
@@ -111,7 +114,11 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
               {category} · {vehicle.year} · {vehicle.status}
             </p>
             <h2 className="font-display text-lg font-semibold text-white truncate">
-              {vehicle.brand} {vehicle.model} {vehicle.version}
+              {displayTitle}
+              {vehicle.version &&
+              !displayTitle.toLowerCase().includes(vehicle.version.trim().toLowerCase())
+                ? ` ${vehicle.version}`
+                : ''}
             </h2>
           </div>
 
@@ -133,7 +140,8 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
               <div className="relative aspect-[4/3] w-full rounded-xl overflow-hidden bg-zinc-950 border border-white/[0.08]">
                 <VehicleImage
                   src={photos[activePhotoIndex]}
-                  alt={`${vehicle.brand} ${vehicle.model} — foto ${activePhotoIndex + 1}`}
+                  alt={`${displayTitle} ${vehicle.year} — foto ${activePhotoIndex + 1}`}
+                  priority
                 />
 
                 {photos.length > 1 && (
@@ -306,7 +314,7 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
                   <div className="py-2.5 flex justify-between gap-4">
                     <dt className="text-zinc-400">Marca / Modelo</dt>
                     <dd className="text-zinc-100 font-medium text-right">
-                      {vehicle.brand} {vehicle.model}
+                      {displayTitle}
                     </dd>
                   </div>
                   <div className="py-2.5 flex justify-between gap-4">
@@ -382,8 +390,8 @@ export const VehicleDetailModal: React.FC<VehicleDetailModalProps> = ({
         purpose="sales"
         focusedVehicle={vehicle}
         baseUrl={typeof window !== 'undefined' ? window.location.origin : ''}
-        vehicleLabel={`${vehicle.brand} ${vehicle.model} ${vehicle.year} (Ref. #${vehicle.id})`}
-        contextSummary={`Tenho interesse no ${vehicle.brand} ${vehicle.model} ${vehicle.year}`}
+        vehicleLabel={`${displayTitle} ${vehicle.year} (Ref. #${vehicle.id})`}
+        contextSummary={`Tenho interesse no ${displayTitle} ${vehicle.year}`}
       />
     </div>
   );

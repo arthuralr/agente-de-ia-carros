@@ -12,6 +12,7 @@ import {
 import { DealershipSettings } from '../../types';
 import {
   buildDealershipMapsUrl,
+  buildDealershipPoliciesSummary,
   formatDealershipAddress,
   formatDealershipHours,
   formatPhoneDisplay,
@@ -37,6 +38,7 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
   const formattedAddress = formatDealershipAddress(settings);
   const mapsUrl = buildDealershipMapsUrl(settings);
   const formattedHours = formatDealershipHours(settings);
+  const policies = buildDealershipPoliciesSummary(settings);
   const storefront = resolvePublicStorefrontLinks(settings);
 
   return (
@@ -70,6 +72,9 @@ export const PublicFooter: React.FC<PublicFooterProps> = ({
             <p className="text-xs text-zinc-400 leading-relaxed">
               {formattedAddress || 'Confirme o endereço com nosso consultor'}
               {formattedHours.hasAny ? ` · ${formattedHours.summaryLine}` : ''}
+            </p>
+            <p className="text-[11px] text-zinc-500 leading-relaxed">
+              {policies.visitPolicyLine} {policies.tradeInPolicyLine}
             </p>
           </div>
 

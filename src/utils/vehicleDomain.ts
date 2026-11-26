@@ -1,6 +1,7 @@
 import {
   ChatMessage,
   DealershipSettings,
+  TradeInSessionState,
   Vehicle,
   VehicleCardData,
   VehicleComparisonData,
@@ -219,20 +220,45 @@ export function getVehicleDisplayTitle(vehicle: Pick<Vehicle, 'brand' | 'model' 
   const model = (vehicle.model || '').trim();
   const normBrand = normalizeTextForMatch(brand);
   const normModel = normalizeTextForMatch(model);
+
+  const cleanLeadingSeparator = (raw: string): string =>
+    raw.replace(/^[\s\-–—:|/]+/, '').replace(/\s{2,}/g, ' ').trim();
+
+  let combined = '';
   if (normBrand && normModel.startsWith(normBrand)) {
-    return model;
-  }
-  // Avoid stuttering like "Volkswagen Gol Gol - 1.0..." or "Renault Mégane Megane Grand Tour..."
-  const brandWords = brand.split(/\s+/).filter(Boolean);
-  const modelWords = model.split(/\s+/).filter(Boolean);
-  if (brandWords.length > 0 && modelWords.length > 0) {
-    const lastBrandWord = normalizeTextForMatch(brandWords[brandWords.length - 1]);
-    const firstModelWord = normalizeTextForMatch(modelWords[0]);
-    if (lastBrandWord && lastBrandWord === firstModelWord) {
-      return `${brand} ${modelWords.slice(1).join(' ')}`.trim();
+    combined = model;
+  } else {
+    // Avoid stuttering like "Volkswagen Gol Gol - 1.0..." or "Renault Mégane Megane Grand Tour..."
+    const brandWords = brand.split(/\s+/).filter(Boolean);
+    const modelWords = model.split(/\s+/).filter(Boolean);
+    if (brandWords.length > 0 && modelWords.length > 0) {
+      const lastBrandWord = normalizeTextForMatch(brandWords[brandWords.length - 1]);
+      const firstModelWord = normalizeTextForMatch(modelWords[0]);
+      if (lastBrandWord && lastBrandWord === firstModelWord) {
+        const rest = cleanLeadingSeparator(modelWords.slice(1).join(' '));
+        combined = rest ? `${brand} ${rest}` : brand;
+      } else {
+        combined = `${brand} ${cleanLeadingSeparator(model)}`.trim();
+      }
+    } else {
+      combined = `${brand} ${model}`.trim();
     }
   }
-  return `${brand} ${model}`.trim();
+
+  // Collapse adjacent duplicate words (accent/case-insensitive), keeping first spelling
+  const tokens = combined.split(/\s+/).filter(Boolean);
+  const deduped: string[] = [];
+  for (const tok of tokens) {
+    const prev = deduped[deduped.length - 1];
+    const normTok = normalizeTextForMatch(tok);
+    const normPrev = prev ? normalizeTextForMatch(prev) : '';
+    if (normTok && normPrev && normTok === normPrev) {
+      continue;
+    }
+    deduped.push(tok);
+  }
+
+  return deduped.join(' ').replace(/\s+[-–—]\s+[-–—]\s+/g, ' - ').trim();
 }
 
 export function extractModelYear(yearStr: string | null | undefined): number | null {
@@ -1318,9 +1344,222 @@ export function extractTradeInInfo(userMessages: string[]): TradeInExtractedInfo
   };
 }
 
+export interface TradeInMergeConflict {
+  field: 'modelo' | 'ano/modelo' | 'câmbio' | 'quilometragem';
+  existingValue: string;
+  newValue: string;
+}
+
+export interface TradeInMergeResult {
+  state: TradeInSessionState;
+  conflicts: TradeInMergeConflict[];
+  wasExplicitCorrection: boolean;
+  missingFields: string[];
+}
+
+const EXPLICIT_CORRECTION_RE =
+  /\b(na verdade|corrigindo|desculpa|errei|digitei errado|outro carro|outro veiculo|troquei de ideia|nao e|nao eh|era um|mudei para|atualiza|atualizar para)\b/i;
+
+/**
+ * Protects confirmed trade-in session data from silent overwrite.
+ * - Merges new non-conflicting fields into the existing confirmed trade-in state.
+ * - If a new message brings a conflicting model/year/transmission/km without explicit correction intent,
+ *   keeps the confirmed values intact and returns `conflicts` so the assistant asks for explicit confirmation.
+ */
+export function mergeTradeInSessionState(
+  existing: TradeInSessionState | null | undefined,
+  extracted: TradeInExtractedInfo,
+  latestMessage: string
+): TradeInMergeResult {
+  const normLatest = normalizeTextForMatch(latestMessage);
+  const wasExplicitCorrection = EXPLICIT_CORRECTION_RE.test(normLatest);
+  const conflicts: TradeInMergeConflict[] = [];
+
+  const prev: TradeInSessionState = existing ? { ...existing } : {};
+  const next: TradeInSessionState = {
+    brandModel: prev.brandModel ?? null,
+    version: prev.version ?? null,
+    yearText: prev.yearText ?? null,
+    engine: prev.engine ?? null,
+    transmission: prev.transmission ?? null,
+    km: prev.km ?? null,
+    kmText: prev.kmText ?? (prev.km ? formatKmBr(prev.km) : null),
+    photosCount: typeof prev.photosCount === 'number' ? prev.photosCount : 0,
+    pendingItems: Array.isArray(prev.pendingItems) ? [...prev.pendingItems] : [],
+    confirmedAt: prev.confirmedAt ?? null,
+    pendingConflict: null,
+  };
+
+  const applyField = (
+    field: TradeInMergeConflict['field'],
+    existingVal: string | null | undefined,
+    incomingVal: string | null | undefined,
+    assign: (val: string) => void
+  ) => {
+    const cleanIncoming = (incomingVal || '').trim();
+    if (!cleanIncoming) return;
+    const cleanExisting = (existingVal || '').trim();
+    if (!cleanExisting) {
+      assign(cleanIncoming);
+      return;
+    }
+    if (normalizeTextForMatch(cleanExisting) === normalizeTextForMatch(cleanIncoming)) {
+      return;
+    }
+    if (wasExplicitCorrection) {
+      assign(cleanIncoming);
+    } else {
+      conflicts.push({
+        field,
+        existingValue: cleanExisting,
+        newValue: cleanIncoming,
+      });
+    }
+  };
+
+  applyField('modelo', next.brandModel, extracted.model, (v) => {
+    next.brandModel = v;
+  });
+  applyField('ano/modelo', next.yearText, extracted.year, (v) => {
+    next.yearText = v;
+  });
+  applyField('câmbio', next.transmission, extracted.transmission, (v) => {
+    next.transmission = v;
+  });
+
+  if (extracted.km) {
+    const parsedKmNum = parsePtBrNumericAmount(extracted.km.replace(/[^\d.,]/g, ''));
+    applyField('quilometragem', next.kmText, extracted.km, (v) => {
+      next.kmText = v;
+      if (parsedKmNum) next.km = parsedKmNum;
+    });
+  }
+
+  // Non-destructive enrichment for version & engine (only overwrite on explicit correction)
+  if (extracted.version && (!next.version || wasExplicitCorrection)) {
+    next.version = extracted.version;
+  }
+  if (extracted.engine && (!next.engine || wasExplicitCorrection)) {
+    next.engine = extracted.engine;
+  }
+
+  const missingFields: string[] = [];
+  if (!next.brandModel) missingFields.push('modelo');
+  if (!next.version) missingFields.push('versão exata');
+  if (!next.yearText) missingFields.push('ano/modelo');
+  if (!next.kmText) missingFields.push('quilometragem');
+  if (!next.transmission) missingFields.push('câmbio');
+
+  next.pendingItems = missingFields;
+  if (conflicts.length > 0) {
+    next.pendingConflict = conflicts[0];
+  }
+  if (
+    !next.confirmedAt &&
+    (next.brandModel || next.yearText || next.kmText || next.transmission || next.version || next.engine)
+  ) {
+    next.confirmedAt = new Date().toISOString();
+  }
+
+  return {
+    state: next,
+    conflicts,
+    wasExplicitCorrection,
+    missingFields,
+  };
+}
+
+export function formatTradeInSummaryLine(
+  tradeIn: TradeInSessionState | null | undefined
+): string | null {
+  if (!tradeIn) return null;
+  const parts: string[] = [];
+  if (tradeIn.brandModel) parts.push(tradeIn.brandModel);
+  if (tradeIn.version) parts.push(tradeIn.version);
+  if (tradeIn.yearText) parts.push(tradeIn.yearText);
+  if (tradeIn.engine) parts.push(tradeIn.engine);
+  if (tradeIn.transmission) parts.push(tradeIn.transmission);
+  if (tradeIn.kmText) parts.push(tradeIn.kmText);
+  else if (tradeIn.km && tradeIn.km > 0) parts.push(formatKmBr(tradeIn.km));
+
+  if (parts.length === 0 && !tradeIn.photosCount) return null;
+  const base = parts.length > 0 ? parts.join(' · ') : 'Veículo na troca em coleta';
+  const photoSuffix =
+    tradeIn.photosCount && tradeIn.photosCount > 0
+      ? ` (${tradeIn.photosCount} ${tradeIn.photosCount === 1 ? 'foto anexada' : 'fotos anexadas'})`
+      : '';
+  return `${base}${photoSuffix}`;
+}
+
+/**
+ * Builds an objective consolidated commercial handoff summary for both
+ * WhatsApp handoff and Central da Revenda ("Aguardando retorno" queue).
+ * Strictly separates interest vehicle, financing simulation, and trade-in vehicle.
+ */
+export function buildConsolidatedHandoffSummary(params: {
+  focusedVehicle?: Pick<Vehicle, 'id' | 'brand' | 'model' | 'version' | 'year' | 'price' | 'priceConfirmed'> | null;
+  financingSummary?: VehicleFinancingSummary | null;
+  tradeInSummary?: TradeInSessionState | null;
+}): string | null {
+  const segments: string[] = [];
+
+  if (params.focusedVehicle) {
+    const v = params.focusedVehicle;
+    const pricePart =
+      v.priceConfirmed === false || v.price <= 0
+        ? 'preço a confirmar'
+        : formatBrlCurrency(v.price);
+    segments.push(`Interesse: ${getVehicleDisplayTitle(v)} ${v.year} (${pricePart})`);
+  } else if (params.financingSummary?.vehicleTitle) {
+    segments.push(`Interesse: ${params.financingSummary.vehicleTitle}`);
+  }
+
+  if (params.financingSummary) {
+    const fin = params.financingSummary;
+    const termPart = fin.months ? ` · ${fin.months}x` : '';
+    const instPart = fin.estimatedInstallment
+      ? ` (~${formatBrlCurrency(fin.estimatedInstallment)}/mês ilustrativo)`
+      : '';
+    segments.push(
+      `Financiamento: entrada ${formatBrlCurrency(fin.downPayment)} · saldo ${formatBrlCurrency(fin.principalBalance)}${termPart}${instPart}`
+    );
+  }
+
+  const tradeInLine = formatTradeInSummaryLine(params.tradeInSummary);
+  if (tradeInLine) {
+    segments.push(`Troca: ${tradeInLine}`);
+  }
+
+  return segments.length > 0 ? segments.join(' | ') : null;
+}
+
+/**
+ * Single source of truth for dealership visit, test-drive, trade-in, financing, and warranty rules.
+ */
+export function buildDealershipPoliciesSummary(
+  settings?: Partial<DealershipSettings> | null
+): {
+  warrantyLine: string;
+  visitPolicyLine: string;
+  tradeInPolicyLine: string;
+  financingPolicyLine: string;
+} {
+  const warrantyDays = settings?.warrantyDays && settings.warrantyDays > 0 ? settings.warrantyDays : 90;
+  const warrantyKm = settings?.warrantyKm && settings.warrantyKm > 0 ? settings.warrantyKm : 5000;
+  return {
+    warrantyLine: `Garantia legal de ${warrantyDays} dias ou ${formatKmBr(warrantyKm)} (CDC) e procedência conferida.`,
+    visitPolicyLine:
+      'Visitas e test-drive mediante solicitação e confirmação de horário com um consultor da loja.',
+    tradeInPolicyLine:
+      'Aceitamos veículo usado na troca com pré-avaliação mediante envio de dados (modelo, versão, ano, km, câmbio) e fotos, sujeita a vistoria presencial.',
+    financingPolicyLine:
+      'Financiamento bancário sujeito à análise de crédito, entrada e condições da instituição financeira.',
+  };
+}
+
 /**
  * Classifies visit-related messages cleanly into:
- * - 'inquiry_only': exploratory questions about address/hours or explicit "não agende"
+ * - 'inquiry_only': exploratory questions about address/hours/policies or explicit "não agende"
  * - 'request_visit': user explicitly asks to schedule/request a visit
  * - 'none': unrelated
  */
@@ -1338,11 +1577,11 @@ export function analyzeVisitIntent(message: string): VisitIntentClassification {
   }
 
   const asksInfo =
-    /\b(horario|horarios|funciona|abre|aberto|fecha|sabado|domingo|segunda|endereco|onde fica|localizacao|como chegar)\b/i.test(
+    /\b(horario|horarios|funciona|funcionamento|abre|aberto|fecha|sabado|domingo|segunda|endereco|onde fica|onde voces ficam|localizacao|como chegar|como funciona visita|test[\s-]?drive|regras de visita|garantia|procedencia)\b/i.test(
       norm
     );
   const requestsSchedule =
-    /\b(quero agendar|agendar visita|marcar visita|agendar test|quero visitar|posso ir hoje|posso passar amanha|reservar horario|solicitar visita)\b/i.test(
+    /\b(quero agendar|agendar visita|marcar visita|agendar test|marcar test|quero visitar|posso ir hoje|posso passar amanha|reservar horario|solicitar visita)\b/i.test(
       norm
     );
 

@@ -5,12 +5,14 @@ interface VehicleImageProps {
   src: string;
   alt: string;
   className?: string;
+  priority?: boolean;
 }
 
 export const VehicleImage: React.FC<VehicleImageProps> = ({
   src,
   alt,
   className = 'w-full h-full object-cover',
+  priority = false,
 }) => {
   const [hasError, setHasError] = useState(false);
 
@@ -32,6 +34,8 @@ export const VehicleImage: React.FC<VehicleImageProps> = ({
     <img
       src={src}
       alt={alt}
+      loading={priority ? 'eager' : 'lazy'}
+      decoding="async"
       referrerPolicy="no-referrer"
       onError={() => setHasError(true)}
       className={className}

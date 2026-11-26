@@ -2,6 +2,7 @@ import {
   ChatSuggestedAction,
   DealershipSettings,
   ExternalSourceHealthStatus,
+  TradeInSessionState,
   Vehicle,
   VehicleCardData,
   VehicleComparisonData,
@@ -11,7 +12,9 @@ import {
 import {
   analyzeVehicleDataQuality,
   analyzeVisitIntent,
+  buildConsolidatedHandoffSummary,
   buildDealershipMapsUrl,
+  buildDealershipPoliciesSummary,
   buildVehicleComparison,
   checkVehicleAgainstFilters,
   computeFinancingSummary,
@@ -23,9 +26,11 @@ import {
   formatDealershipAddress,
   formatDealershipHours,
   formatKmBr,
+  formatTradeInSummaryLine,
   getVehicleDisplayTitle,
   hasAnyActiveFilter,
   isVehicleAvailable,
+  mergeTradeInSessionState,
   normalizeTextForMatch,
   parseFiltersDeterministically,
   parseFinancingParams,
@@ -47,6 +52,8 @@ export interface ChatTurnContextInput {
   recentVehicleIds?: string[];
   focusedVehicleId?: string | null;
   compareVehicleIds?: string[];
+  confirmedTradeIn?: TradeInSessionState | null;
+  financingSummary?: VehicleFinancingSummary | null;
   baseUrl?: string | null;
 }
 
@@ -71,6 +78,8 @@ export interface ChatTurnPlan {
   vehicleCards: VehicleCardData[];
   comparison: VehicleComparisonData | null;
   financingSummary: VehicleFinancingSummary | null;
+  tradeInSummary?: TradeInSessionState | null;
+  handoffSummary?: string | null;
   promptAttachPhotos: boolean;
   suggestedActions: ChatSuggestedAction[];
   isVisitInquiryOnly: boolean;
@@ -134,11 +143,14 @@ function buildOfficialLocationAndHours(
     }
   }
 
+  const policies = buildDealershipPoliciesSummary(dealership);
+
   const factsText = configUnavailable
     ? 'CONFIGURAÇÃO DA LOJA TEMPORARIAMENTE INDISPONÍVEL (NÃO INVENTE ENDEREÇO NEM HORÁRIO).'
     : [
         `Endereço oficial (${dealership.tradeName}): ${addressLine || 'NÃO CADASTRADO (diga para confirmar com o consultor; NUNCA invente endereço)'}`,
         `Horários oficiais: ${hours.inlineSummary || 'NÃO CADASTRADOS (diga para confirmar com o consultor)'}`,
+        `Regras oficiais: ${policies.visitPolicyLine} ${policies.tradeInPolicyLine} ${policies.warrantyLine}`,
       ].join('\n');
 
   return {
@@ -347,10 +359,44 @@ export function planChatTurn(params: {
     dealershipConfigUnavailable
   );
 
+  const confirmedTradeIn: TradeInSessionState | null =
+    chatContext?.confirmedTradeIn || null;
+  const prevFinancingSummary: VehicleFinancingSummary | null =
+    chatContext?.financingSummary || null;
+
+  const focusedVehicleFromContext = focusedId
+    ? allVehicles.find((v) => v.id === focusedId) || null
+    : selectedVehicle || null;
+
+  const computePlanHandoffSummary = (overrides?: {
+    focusedVehicleId?: string | null;
+    financingSummary?: VehicleFinancingSummary | null;
+    tradeInSummary?: TradeInSessionState | null;
+  }) => {
+    const fId =
+      overrides?.focusedVehicleId !== undefined
+        ? overrides.focusedVehicleId
+        : focusedId;
+    const fVeh = fId ? allVehicles.find((v) => v.id === fId) || null : null;
+    const fin =
+      overrides?.financingSummary !== undefined
+        ? overrides.financingSummary
+        : prevFinancingSummary;
+    const tr =
+      overrides?.tradeInSummary !== undefined
+        ? overrides.tradeInSummary
+        : confirmedTradeIn;
+    return buildConsolidatedHandoffSummary({
+      focusedVehicle: fVeh,
+      financingSummary: fin,
+      tradeInSummary: tr,
+    });
+  };
+
   // Detect independent compatible intents upfront so multi-intent messages cover ALL requests
   const visitIntent = analyzeVisitIntent(latestUserUtterance);
   const isTradeInTurn =
-    /\b(troca|usado na troca|dar na troca|avaliar meu|meu carro|tenho um|enviar fotos|mandar fotos|fotos do carro|onde envio as fotos)\b/i.test(
+    /\b(troca|usado na troca|dar na troca|avaliar meu|meu carro|tenho um|enviar fotos|mandar fotos|fotos do carro|onde envio as fotos|na verdade meu carro|corrigindo meu carro)\b/i.test(
       normMsg
     ) && !/\b(comparar)\b/i.test(normMsg);
 
@@ -364,27 +410,52 @@ export function planChatTurn(params: {
     );
   });
 
+  const resolveProtectedTradeIn = () => {
+    // If we already have confirmed trade-in state in this session, extract ONLY from the latest utterance
+    // and run conflict-protected merge so we never silently overwrite confirmed details.
+    if (
+      confirmedTradeIn &&
+      (confirmedTradeIn.brandModel ||
+        confirmedTradeIn.yearText ||
+        confirmedTradeIn.kmText ||
+        confirmedTradeIn.transmission)
+    ) {
+      const latestExtracted = extractTradeInInfo([latestUserUtterance]);
+      return mergeTradeInSessionState(
+        confirmedTradeIn,
+        latestExtracted,
+        latestUserUtterance
+      );
+    }
+    const initialExtracted = extractTradeInInfo(tradeInHistoryTexts);
+    return mergeTradeInSessionState(
+      confirmedTradeIn,
+      initialExtracted,
+      latestUserUtterance
+    );
+  };
+
   // -------------------------------------------------------------------------
   // 1A. COMBINED MULTI-INTENT: TRADE-IN + VISIT / ADDRESS / HOURS
   // -------------------------------------------------------------------------
   if (isTradeInTurn && visitIntent !== 'none') {
-    const tradeInfo = extractTradeInInfo(tradeInHistoryTexts);
-    const knownParts: string[] = [];
-    if (tradeInfo.model) knownParts.push(tradeInfo.model);
-    if (tradeInfo.version) knownParts.push(tradeInfo.version);
-    if (tradeInfo.year) knownParts.push(tradeInfo.year);
-    if (tradeInfo.engine) knownParts.push(tradeInfo.engine);
-    if (tradeInfo.transmission) knownParts.push(tradeInfo.transmission);
-    if (tradeInfo.km) knownParts.push(tradeInfo.km);
+    const mergedTrade = resolveProtectedTradeIn();
+    const formattedTradeLine = formatTradeInSummaryLine(mergedTrade.state);
 
-    const knownSummary =
-      knownParts.length > 0
-        ? `Anotei os dados do seu usado: **${knownParts.join(' · ')}**.`
-        : 'Vamos reunir os dados do seu usado para a **pré-avaliação do consultor**.';
+    const conflictBlock =
+      mergedTrade.conflicts.length > 0
+        ? `\n- **Confirmação necessária:** já temos registrado o seu usado como **${formattedTradeLine}**. Você mencionou ${mergedTrade.conflicts
+            .map((c) => `${c.field} **${c.newValue}** (em vez de ${c.existingValue})`)
+            .join(', ')}. Mantemos os dados já anotados ou prefere atualizar?`
+        : '';
+
+    const knownSummary = formattedTradeLine
+      ? `Mantive os dados do seu usado: **${formattedTradeLine}**.`
+      : 'Vamos reunir os dados do seu usado para a **pré-avaliação do consultor**.';
 
     const missingLine =
-      tradeInfo.missingFields.length > 0
-        ? `Para completar a pré-avaliação, informe apenas o que faltou: **${tradeInfo.missingFields.join(', ')}** (além de eventuais detalhes estéticos/mecânicos ou sinistro).`
+      mergedTrade.missingFields.length > 0
+        ? `Para completar a pré-avaliação, informe apenas o que faltou: **${mergedTrade.missingFields.join(', ')}** (além de eventuais detalhes estéticos/mecânicos ou sinistro).`
         : 'Os dados principais já estão anotados — basta enviar as fotos para a pré-avaliação humana.';
 
     const visitFooter =
@@ -394,7 +465,7 @@ export function planChatTurn(params: {
 
     const deterministicReply =
       `**1. Pré-avaliação na troca e envio de fotos**\n` +
-      `- ${knownSummary}\n` +
+      `- ${knownSummary}${conflictBlock}\n` +
       `- ${missingLine}\n` +
       `- **Onde enviar as fotos:** use o botão **Anexar fotos** logo abaixo (ou o ícone de clipe no campo de mensagem) para mandar frente, traseira, laterais, interior e painel com a quilometragem.\n\n` +
       `**2. Endereço e horários da loja**\n` +
@@ -405,13 +476,15 @@ export function planChatTurn(params: {
       intent: 'trade_in_and_visit',
       useDeterministicDirectly: true,
       deterministicReply,
-      verifiedFactsPrompt: `PEDIDO COMBINADO (TROCA + LOCALIZAÇÃO/HORÁRIO):\n- Usado informado: ${knownParts.join(', ') || 'nenhum'}\n- Faltando: ${tradeInfo.missingFields.join(', ') || 'nada obrigatório'}\n${locationInfo.factsText}\n- Visita: ${visitIntent === 'inquiry_only' ? 'APENAS CONSULTA — NÃO AGENDAR' : 'SOLICITAÇÃO DE VISITA'}`,
+      verifiedFactsPrompt: `PEDIDO COMBINADO (TROCA + LOCALIZAÇÃO/HORÁRIO):\n- Usado informado: ${formattedTradeLine || 'nenhum'}\n- Faltando: ${mergedTrade.missingFields.join(', ') || 'nada obrigatório'}\n${locationInfo.factsText}\n- Visita: ${visitIntent === 'inquiry_only' ? 'APENAS CONSULTA — NÃO AGENDAR' : 'SOLICITAÇÃO DE VISITA'}`,
       activeFilters: prevFilters,
       recentVehicleIds: recentIds,
       focusedVehicleId: focusedId,
       vehicleCards: [],
       comparison: null,
       financingSummary: null,
+      tradeInSummary: mergedTrade.state,
+      handoffSummary: computePlanHandoffSummary({ tradeInSummary: mergedTrade.state }),
       promptAttachPhotos: true,
       suggestedActions: [
         {
@@ -439,12 +512,20 @@ export function planChatTurn(params: {
   // 1B. VISIT INQUIRY VS VISIT REQUEST (Never schedule on exploratory question!)
   // -------------------------------------------------------------------------
   if (visitIntent === 'inquiry_only') {
+    const policies = buildDealershipPoliciesSummary(dealership);
+    const asksPolicy = /\b(test[\s-]?drive|como funciona|regras|garantia|procedencia)\b/i.test(
+      normMsg
+    );
+    const policyLines = asksPolicy
+      ? `\n- **Visitas e test-drive:** ${policies.visitPolicyLine}\n- **Garantia e procedência:** ${policies.warrantyLine}`
+      : '';
+
     const headerLine = dealershipConfigUnavailable
       ? 'Não consegui consultar o endereço e os horários atualizados agora:'
       : `Confira as informações oficiais da **${dealership.tradeName}**:`;
 
     const deterministicReply =
-      `${headerLine}\n${locationInfo.markdownLines.join('\n')}\n\n` +
+      `${headerLine}\n${locationInfo.markdownLines.join('\n')}${policyLines}\n\n` +
       `Sem problema — **nenhum agendamento foi criado**. Se quiser consultar algum carro do estoque ou tirar outra dúvida, é só mandar por aqui.`;
 
     const actions: ChatSuggestedAction[] = [];
@@ -467,6 +548,8 @@ export function planChatTurn(params: {
       vehicleCards: [],
       comparison: null,
       financingSummary: null,
+      tradeInSummary: confirmedTradeIn,
+      handoffSummary: computePlanHandoffSummary(),
       promptAttachPhotos: false,
       suggestedActions: actions,
       isVisitInquiryOnly: true,
@@ -525,39 +608,87 @@ export function planChatTurn(params: {
   }
 
   // -------------------------------------------------------------------------
-  // 2. TRADE-IN (USADO NA TROCA) — Reuse details, never offer "photo link"
+  // 2. TRADE-IN (USADO NA TROCA) — Conflict-protected session state
   // -------------------------------------------------------------------------
   if (isTradeInTurn) {
-    const tradeInfo = extractTradeInInfo(tradeInHistoryTexts);
-    const knownParts: string[] = [];
-    if (tradeInfo.model) knownParts.push(tradeInfo.model);
-    if (tradeInfo.version) knownParts.push(tradeInfo.version);
-    if (tradeInfo.year) knownParts.push(tradeInfo.year);
-    if (tradeInfo.engine) knownParts.push(tradeInfo.engine);
-    if (tradeInfo.transmission) knownParts.push(tradeInfo.transmission);
-    if (tradeInfo.km) knownParts.push(tradeInfo.km);
+    const mergedTrade = resolveProtectedTradeIn();
+    const formattedTradeLine = formatTradeInSummaryLine(mergedTrade.state);
 
-    const knownSummary =
-      knownParts.length > 0
-        ? `Já anotei os dados do seu carro: **${knownParts.join(' · ')}**.`
-        : 'Vamos coletar os dados do seu veículo para a **pré-avaliação do consultor**.';
+    // If a conflicting spec was detected without explicit correction phrasing,
+    // DO NOT overwrite confirmed trade-in state — ask explicitly for confirmation!
+    if (mergedTrade.conflicts.length > 0) {
+      const conflictList = mergedTrade.conflicts
+        .map(
+          (c) =>
+            `- **${c.field}:** registrado como **${c.existingValue}**, mas você mencionou **${c.newValue}**`
+        )
+        .join('\n');
+
+      const deterministicReply =
+        `Mantive os dados já confirmados do seu carro na troca (**${formattedTradeLine}**) para não sobrescrever seu atendimento.\n\n` +
+        `Notei uma diferença na sua última mensagem:\n${conflictList}\n\n` +
+        `Você quer **manter** o carro já anotado ou **atualizar** essas informações? (Se quiser atualizar, basta responder por exemplo: *"Na verdade, pode atualizar para..."*.)`;
+
+      return {
+        intent: 'trade_in',
+        useDeterministicDirectly: true,
+        deterministicReply,
+        verifiedFactsPrompt: `CONFLITO DE DADOS NA TROCA (NÃO SOBRESCREVER SEM CONFIRMAÇÃO): Dados mantidos: ${formattedTradeLine}.`,
+        activeFilters: prevFilters,
+        recentVehicleIds: recentIds,
+        focusedVehicleId: focusedId,
+        vehicleCards: [],
+        comparison: null,
+        financingSummary: null,
+        tradeInSummary: mergedTrade.state,
+        handoffSummary: computePlanHandoffSummary({ tradeInSummary: mergedTrade.state }),
+        promptAttachPhotos: false,
+        suggestedActions: [
+          {
+            id: 'act-keep-tradein',
+            label: 'Manter carro já anotado',
+            kind: 'prompt',
+            promptText: 'Pode manter os dados do meu usado já anotados',
+          },
+          {
+            id: 'act-attach-photos',
+            label: 'Anexar fotos',
+            kind: 'attach_photos',
+          },
+        ],
+        isVisitInquiryOnly: false,
+        suppressHandoff: true,
+        fichaUrl: null,
+      };
+    }
+
+    const knownSummary = formattedTradeLine
+      ? mergedTrade.wasExplicitCorrection
+        ? `Atualizei os dados do seu carro na troca conforme solicitado: **${formattedTradeLine}**.`
+        : `Já anotei os dados do seu carro na troca: **${formattedTradeLine}**.`
+      : 'Vamos coletar os dados do seu veículo para a **pré-avaliação do consultor**.';
+
+    const interestNote = focusedVehicleFromContext
+      ? `\n_(Seu interesse principal continua no **${getVehicleDisplayTitle(focusedVehicleFromContext)} ${focusedVehicleFromContext.year}**.)_`
+      : '';
 
     const missingLine =
-      tradeInfo.missingFields.length > 0
-        ? `Para completar a pré-avaliação, informe apenas o que faltou: **${tradeInfo.missingFields.join(', ')}** (e se há algum detalhe estético/mecânico ou sinistro).`
+      mergedTrade.missingFields.length > 0
+        ? `Para completar a pré-avaliação, informe apenas o que faltou: **${mergedTrade.missingFields.join(', ')}** (e se há algum detalhe estético/mecânico ou sinistro).`
         : 'Com esses dados completos, falta apenas anexar as fotos para a pré-avaliação do consultor.';
 
-    const deterministicReply = `${knownSummary}\n\n${missingLine}\n\nUse o botão **Anexar fotos** abaixo para enviar direto por aqui: **frente, traseira, laterais, interior e foto do painel mostrando a quilometragem**. Nossa equipe humana fará a pré-avaliação com base nessas informações.`;
+    const deterministicReply = `${knownSummary}${interestNote}\n\n${missingLine}\n\nUse o botão **Anexar fotos** abaixo para enviar direto por aqui: **frente, traseira, laterais, interior e foto do painel mostrando a quilometragem**. Nossa equipe humana fará a pré-avaliação com base nessas informações.`;
 
     return {
       intent: 'trade_in',
-      useDeterministicDirectly: false,
+      useDeterministicDirectly: mergedTrade.wasExplicitCorrection,
       deterministicReply,
       verifiedFactsPrompt: `COLETA DE TROCA PARA PRÉ-AVALIAÇÃO HUMANA:
-- Dados já informados pelo cliente (REAPROVEITE E NÃO PEÇA DE NOVO): ${knownParts.length > 0 ? knownParts.join(', ') : 'Nenhum detalhe ainda'}
-- Campos que ainda faltam pedir: ${tradeInfo.missingFields.length > 0 ? tradeInfo.missingFields.join(', ') : 'Nenhum campo obrigatório faltando'}
+- Dados confirmados do usado na troca (REAPROVEITE E NUNCA MISTURE COM O VEÍCULO DE INTERESSE): ${formattedTradeLine || 'Nenhum detalhe ainda'}
+- Veículo de interesse em foco na loja: ${focusedVehicleFromContext ? `${getVehicleDisplayTitle(focusedVehicleFromContext)} ${focusedVehicleFromContext.year}` : 'Ainda não selecionado'}
+- Campos que ainda faltam pedir do usado na troca: ${mergedTrade.missingFields.length > 0 ? mergedTrade.missingFields.join(', ') : 'Nenhum campo obrigatório faltando'}
 - REGRAS OBRIGATÓRIAS:
-  1. NÃO peça novamente dados já listados acima.
+  1. NÃO peça novamente dados já listados acima e NUNCA sobrescreva dados confirmados do usado na troca.
   2. NUNCA diga que vai enviar um "link para fotos" ou "link de upload". Oriente o cliente a usar o botão **"Anexar fotos"** disponível aqui no chat.
   3. Oriente quais fotos ajudam na avaliação (frente, traseira, laterais, interior e painel com km).
   4. Deixe claro que trata-se de coleta para **pré-avaliação pelo consultor humano** (não dê valor final fechado de compra).`,
@@ -567,6 +698,8 @@ export function planChatTurn(params: {
       vehicleCards: [],
       comparison: null,
       financingSummary: null,
+      tradeInSummary: mergedTrade.state,
+      handoffSummary: computePlanHandoffSummary({ tradeInSummary: mergedTrade.state }),
       promptAttachPhotos: true,
       suggestedActions: [
         {
@@ -860,6 +993,11 @@ ${formatVehicleFactLine(targetVehicle, origin, dealership)}
         vehicleCards: cards,
         comparison: null,
         financingSummary: summary,
+        tradeInSummary: confirmedTradeIn,
+        handoffSummary: computePlanHandoffSummary({
+          focusedVehicleId: targetVehicle.id,
+          financingSummary: summary,
+        }),
         promptAttachPhotos: false,
         suggestedActions: baseActions,
         isVisitInquiryOnly: false,
@@ -1422,11 +1560,15 @@ ${nearLines.join('\n') || 'Nenhuma alternativa próxima.'}`,
     ? resolveVehicleSheetLink(resolvedFocus, origin, dealership)
     : null;
 
+  const tradeInContextNote = formatTradeInSummaryLine(confirmedTradeIn)
+    ? `Veículo do cliente na troca (MANTENHA SEPARADO do veículo de interesse da loja): ${formatTradeInSummaryLine(confirmedTradeIn)}\n`
+    : '';
+
   return {
     intent: 'general',
     useDeterministicDirectly: externalUnavailable,
     deterministicReply: fallbackReply,
-    verifiedFactsPrompt: `${externalContextNote}${focusFact}${activeFilterNote}ESTOQUE REAL DISPONÍVEL (${available.length} veículos):
+    verifiedFactsPrompt: `${externalContextNote}${focusFact}${tradeInContextNote}${activeFilterNote}ESTOQUE REAL DISPONÍVEL (${available.length} veículos):
 ${stockLines || 'Nenhum veículo disponível no momento.'}
 ${locationInfo.factsText}`,
     activeFilters: prevFilters,
@@ -1435,6 +1577,10 @@ ${locationInfo.factsText}`,
     vehicleCards: resolvedFocus ? [toVehicleCardData(resolvedFocus, origin, null, dealership)] : [],
     comparison: null,
     financingSummary: null,
+    tradeInSummary: confirmedTradeIn,
+    handoffSummary: computePlanHandoffSummary({
+      focusedVehicleId: resolvedFocus ? resolvedFocus.id : focusedId,
+    }),
     promptAttachPhotos: false,
     suggestedActions: resolvedFocus
       ? buildContextualActions([toVehicleCardData(resolvedFocus, origin, null, dealership)])
@@ -1463,11 +1609,13 @@ ${locationInfo.factsText}`,
  * Post-validates a Gemini-drafted reply against strict business rules.
  * If the LLM violates a hard safety/truthfulness constraint (e.g. invents an installment
  * when no rate is configured, mentions "link das fotos" in trade-in, confirms a visit,
- * or omits required ficha link), returns the verified deterministic reply instead.
+ * contradicts configured dealership address/hours, or invents FIPE values when none exist),
+ * returns the verified deterministic reply instead.
  */
 export function guardChatReply(
   llmReply: string,
-  plan: ChatTurnPlan
+  plan: ChatTurnPlan,
+  dealership?: Partial<DealershipSettings> | null
 ): string {
   const clean = (llmReply || '').trim();
   if (!clean) return plan.deterministicReply;
@@ -1499,6 +1647,38 @@ export function guardChatReply(
     plan.financingSummary &&
     !plan.financingSummary.estimatedInstallment &&
     /r\$\s*\d[\d.,]*\s*(?:por\s+m[eê]s|\/m[eê]s|mensais|parcela)/i.test(norm)
+  ) {
+    return plan.deterministicReply;
+  }
+
+  // Never claim there is no registered address/hours when official dealership config HAS them
+  if (dealership) {
+    const officialAddr = formatDealershipAddress(dealership);
+    if (
+      officialAddr &&
+      /\b(nao\s+(?:ha|temos|possuimos|consta)\s+endereco|endereco\s+nao\s+(?:cadastrado|informado|disponivel))\b/i.test(
+        norm
+      )
+    ) {
+      return plan.deterministicReply;
+    }
+    const officialHours = formatDealershipHours(dealership);
+    if (
+      officialHours.hasAny &&
+      /\b(nao\s+(?:ha|temos|possuimos|consta)\s+horarios?|horarios?\s+nao\s+(?:cadastrados?|informados?))\b/i.test(
+        norm
+      )
+    ) {
+      return plan.deterministicReply;
+    }
+  }
+
+  // Never fabricate a FIPE price or "abaixo da FIPE" claim when shown vehicles have NO FIPE price
+  if (
+    plan.vehicleCards.length > 0 &&
+    plan.vehicleCards.every((c) => !c.fipePrice || c.fipePrice <= 0) &&
+    (/\bfipe\b[^.\n]{0,30}r\$\s*\d/i.test(norm) ||
+      /\babaixo\s+da\s+(?:tabela\s+)?fipe\b/i.test(norm))
   ) {
     return plan.deterministicReply;
   }

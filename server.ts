@@ -42,15 +42,23 @@ import {
   triggerVisitorSessionPushInBackground,
   upsertPushSubscription,
 } from './src/utils/webPushServer';
-import { mapDbVehicleToFrontend } from './src/db/mappers';
+import { ApiVehicleRow, mapDbVehicleToFrontend } from './src/db/mappers';
 import {
+  buildConsolidatedHandoffSummary,
+  buildVehicleSheetPath,
   DEFAULT_DEALERSHIP_CONFIG,
   formatDealershipAddress,
   formatDealershipHours,
+  formatTradeInSummaryLine,
   getVehicleDisplayTitle,
   isSafeHttpUrl,
+  isVehicleAvailable,
   mergeDealershipConfig,
 } from './src/utils/vehicleDomain';
+import {
+  buildRouteSeoPayload,
+  injectSeoIntoHtml,
+} from './src/utils/seo';
 import {
   ChatTurnContextInput,
   ExternalInventoryRuntimeState,
@@ -76,7 +84,15 @@ import {
   buildDemoExternalSiteHtml,
   buildExternalWidgetScript,
 } from './src/server/widgetScript';
-import { DealershipSettings, Vehicle } from './src/types';
+import {
+  AppViewMode,
+  DealershipSettings,
+  NavModule,
+  SessionNegotiationContext,
+  TradeInSessionState,
+  Vehicle,
+  VehicleFinancingSummary,
+} from './src/types';
 
 if (fs.existsSync('.env.local')) {
   dotenv.config({ path: '.env.local', override: true });
@@ -2690,7 +2706,7 @@ app.post(
   }
 );
 
-app.get('/api/admin/notifications', requireAdminAuth, async (_req, res) => {
+app.get('/api/admin/notifications', requirePermission('today:view'), async (_req, res) => {
   try {
     const [chatMsgsRes, leadsRes] = await Promise.all([
       pool.query<{
@@ -2789,7 +2805,7 @@ app.get('/api/admin/notifications', requireAdminAuth, async (_req, res) => {
   }
 });
 
-app.get('/api/admin/chat-broadcasts', requireAdminAuth, async (_req, res) => {
+app.get('/api/admin/chat-broadcasts', requirePermission('sessions:view_own'), async (_req, res) => {
   try {
     const result = await pool.query<{
       id: number;
@@ -2819,7 +2835,7 @@ app.get('/api/admin/chat-broadcasts', requireAdminAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/admin/chat-broadcasts', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/chat-broadcasts', requirePermission('marketing:create'), async (req: AuthenticatedRequest, res) => {
   const rawMessage =
     typeof req.body?.message === 'string' ? req.body.message.trim() : '';
   const rawTitle =
@@ -2881,7 +2897,7 @@ const ALLOWED_CHAT_SESSION_TAGS: Record<string, string> = {
 
 app.patch(
   '/api/admin/chat-sessions/:sessionId/tag',
-  requireAdminAuth,
+  requirePermission('sessions:reply'),
   async (req, res) => {
     const sessionId = sanitizeSessionId(req.params.sessionId);
     if (!sessionId) {
@@ -3121,7 +3137,7 @@ app.patch(
 
 app.post(
   '/api/admin/chat-sessions/:sessionId/summary',
-  requireAdminAuth,
+  requirePermission('sessions:reply'),
   async (req, res) => {
     const sessionId = sanitizeSessionId(req.params.sessionId);
     if (!sessionId) {
@@ -3452,7 +3468,7 @@ Regras obrigatórias de formato:
 
 app.get(
   '/api/admin/chat-messages/:messageId/attachment',
-  requireAdminAuth,
+  requirePermission('sessions:view_own'),
   async (req, res) => {
     const messageId = Number(req.params.messageId);
     if (!Number.isInteger(messageId) || messageId <= 0) {
@@ -3944,7 +3960,7 @@ app.delete('/api/vehicles/:id', requirePermission('inventory:delete'), async (re
   }
 });
 
-app.get('/api/leads', requireAdminAuth, async (_req, res) => {
+app.get('/api/leads', requirePermission('sessions:view_own'), async (_req, res) => {
   try {
     const result = await pool.query<DbLeadRow>(
       'SELECT * FROM leads ORDER BY id DESC'
@@ -3963,7 +3979,7 @@ const ALLOWED_LEAD_STAGES = [
   'Fechado',
 ] as const;
 
-app.post('/api/leads', requireAdminAuth, async (req, res) => {
+app.post('/api/leads', requirePermission('sessions:reply'), async (req, res) => {
   try {
     const { name, phone, vehicle_interest, stage, chat_history } = req.body;
     const cleanName = typeof name === 'string' ? name.trim() : '';
@@ -4002,7 +4018,7 @@ app.post('/api/leads', requireAdminAuth, async (req, res) => {
   }
 });
 
-app.patch('/api/leads/:id', requireAdminAuth, async (req, res) => {
+app.patch('/api/leads/:id', requirePermission('sessions:reply'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'ID de lead inválido.' });
@@ -4086,7 +4102,7 @@ app.delete('/api/leads/:id', requirePermission('sessions:delete_lgpd'), async (r
   }
 });
 
-app.get('/api/contracts', requireAdminAuth, async (_req, res) => {
+app.get('/api/contracts', requirePermission('documents:view'), async (_req, res) => {
   try {
     const result = await pool.query<
       DbContractRow & {
@@ -4112,7 +4128,7 @@ app.get('/api/contracts', requireAdminAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/contracts', requireAdminAuth, async (req, res) => {
+app.post('/api/contracts', requirePermission('documents:emit_operational'), async (req, res) => {
   try {
     const { client_name, client_cpf, vehicle_id, final_price, payment_method } =
       req.body;
@@ -4180,7 +4196,7 @@ app.post('/api/contracts', requireAdminAuth, async (req, res) => {
 // Gemini AI Routes
 // ============================================================================
 
-app.post('/api/ai/generate-post', requireAdminAuth, async (req, res) => {
+app.post('/api/ai/generate-post', requirePermission('marketing:create'), async (req, res) => {
   const body = req.body as GeneratePostBody;
   if (!body || !body.vehicle) {
     res.status(400).json({ error: 'Dados do veículo são obrigatórios.' });
@@ -4390,9 +4406,7 @@ app.post('/api/ai/chat', async (req, res) => {
             : null;
 
       const isPdf = parsedAttachment.mimeType === 'application/pdf';
-      const attachmentAckReply = isPdf
-        ? `Recebi o seu documento PDF (**${safeAttachmentName}**) e ele foi registrado no seu atendimento.\n\nEle é uma **proposta/simulação**, **documento do carro para pré-avaliação na troca** ou outra informação para a equipe?`
-        : `Foto **${safeAttachmentName}** recebida e anexada ao seu atendimento.\n\nSe for do seu carro para **pré-avaliação na troca**, pode anexar mais ângulos (frente, traseira, laterais, interior e painel com km) usando o botão **Anexar fotos** ou complementar os dados por texto.`;
+      let preservedTradeInLine: string | null = null;
 
       if (auditSessionId) {
         const storedUserContent =
@@ -4411,6 +4425,56 @@ app.post('/api/ai/chat', async (req, res) => {
             attachmentMime: parsedAttachment.mimeType,
           }
         );
+
+        // Preserve any already-confirmed trade-in data untouched while counting attached photos
+        if (!isPdf) {
+          try {
+            const existingSessRes = await pool.query<{ context_json: string | null }>(
+              'SELECT context_json FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+              [auditSessionId]
+            );
+            let prevCtx: SessionNegotiationContext = {};
+            if (existingSessRes.rows[0]?.context_json) {
+              try {
+                prevCtx = JSON.parse(existingSessRes.rows[0].context_json) as SessionNegotiationContext;
+              } catch {
+                prevCtx = {};
+              }
+            }
+            const prevTrade: TradeInSessionState = prevCtx.tradeInSummary
+              ? { ...prevCtx.tradeInSummary }
+              : {};
+            const nextTrade: TradeInSessionState = {
+              ...prevTrade,
+              photosCount: (typeof prevTrade.photosCount === 'number' ? prevTrade.photosCount : 0) + 1,
+            };
+            preservedTradeInLine = formatTradeInSummaryLine(nextTrade);
+            const nextCtx: SessionNegotiationContext = {
+              ...prevCtx,
+              tradeInSummary: nextTrade,
+              handoffSummary:
+                buildConsolidatedHandoffSummary({
+                  financingSummary: prevCtx.financingSummary ?? null,
+                  tradeInSummary: nextTrade,
+                }) || prevCtx.handoffSummary || null,
+            };
+            await pool.query(
+              `UPDATE chat_sessions SET context_json = $2, updated_at = NOW() WHERE session_id = $1`,
+              [auditSessionId, JSON.stringify(nextCtx)]
+            );
+          } catch (photoCtxErr) {
+            console.warn('[ChatAttachment] Falha ao atualizar contagem de fotos na troca:', photoCtxErr);
+          }
+        }
+      }
+
+      const attachmentAckReply = isPdf
+        ? `Recebi o seu documento PDF (**${safeAttachmentName}**) e ele foi registrado no seu atendimento.\n\nEle é uma **proposta/simulação**, **documento do carro para pré-avaliação na troca** ou outra informação para a equipe?`
+        : preservedTradeInLine
+          ? `Foto **${safeAttachmentName}** recebida e vinculada à pré-avaliação do seu usado (**${preservedTradeInLine}**), mantendo todos os dados já confirmados.\n\nSe quiser, envie mais ângulos (frente, traseira, laterais, interior e painel com km) usando o botão **Anexar fotos**.`
+          : `Foto **${safeAttachmentName}** recebida e anexada ao seu atendimento.\n\nSe for do seu carro para **pré-avaliação na troca**, pode anexar mais ângulos (frente, traseira, laterais, interior e painel com km) usando o botão **Anexar fotos** ou complementar os dados por texto.`;
+
+      if (auditSessionId) {
         await recordChatAuditTurn(
           auditSessionId,
           auditOrigin,
@@ -4761,12 +4825,45 @@ app.post('/api/ai/chat', async (req, res) => {
       (typeof body.chatContext?.baseUrl === 'string' && body.chatContext.baseUrl.trim()) ||
       (req.headers.origin && typeof req.headers.origin === 'string' ? req.headers.origin : '');
 
+    const auditSessionId = sanitizeSessionId(body.sessionId);
+    const auditOrigin = sanitizeOrigin(body.origem);
+
+    // Load persisted session context BEFORE planning turn so confirmed trade-in & financing state are protected
+    let persistedSessionCtx: SessionNegotiationContext = {};
+    if (auditSessionId) {
+      try {
+        const preSessRes = await pool.query<{ context_json: string | null }>(
+          'SELECT context_json FROM chat_sessions WHERE session_id = $1 LIMIT 1',
+          [auditSessionId]
+        );
+        if (preSessRes.rows[0]?.context_json) {
+          persistedSessionCtx = JSON.parse(
+            preSessRes.rows[0].context_json
+          ) as SessionNegotiationContext;
+        }
+      } catch {
+        persistedSessionCtx = {};
+      }
+    }
+
     const turnPlan = planChatTurn({
       allVehicles: activeInventoryVehicles,
       messages: body.messages,
       latestUserUtterance: latestClientUtterance,
       chatContext: {
         ...(body.chatContext || {}),
+        focusedVehicleId:
+          body.chatContext?.focusedVehicleId ??
+          persistedSessionCtx.focusedVehicleId ??
+          null,
+        confirmedTradeIn:
+          body.chatContext?.confirmedTradeIn ??
+          persistedSessionCtx.tradeInSummary ??
+          null,
+        financingSummary:
+          body.chatContext?.financingSummary ??
+          persistedSessionCtx.financingSummary ??
+          null,
         baseUrl: reqOrigin,
       },
       dealership: effectiveDealership,
@@ -4789,9 +4886,6 @@ app.post('/api/ai/chat', async (req, res) => {
         : body.replyTo?.sender === 'cliente'
           ? 'user'
           : null;
-
-    const auditSessionId = sanitizeSessionId(body.sessionId);
-    const auditOrigin = sanitizeOrigin(body.origem);
 
     const clientMessagesOnly = body.messages.filter((m) => m.sender === 'cliente');
     const isFirstClientTurn = clientMessagesOnly.length <= 1;
@@ -4870,6 +4964,8 @@ app.post('/api/ai/chat', async (req, res) => {
       vehicleCards: turnPlan.vehicleCards,
       comparison: turnPlan.comparison,
       financingSummary: turnPlan.financingSummary,
+      tradeInSummary: turnPlan.tradeInSummary ?? null,
+      handoffSummary: turnPlan.handoffSummary ?? null,
       activeFilters: turnPlan.activeFilters,
       recentVehicleIds: turnPlan.recentVehicleIds,
       focusedVehicleId: turnPlan.focusedVehicleId,
@@ -4908,19 +5004,37 @@ app.post('/api/ai/chat', async (req, res) => {
             assigneeName: curSess.assigned_user_name || null,
           };
         }
-        let prevCtx: Record<string, unknown> = {};
+        let prevCtx: SessionNegotiationContext = {};
         if (curSess?.context_json) {
           try {
-            prevCtx = JSON.parse(curSess.context_json) as Record<string, unknown>;
+            prevCtx = JSON.parse(curSess.context_json) as SessionNegotiationContext;
           } catch {
             prevCtx = {};
           }
         }
-        const nextCtx = {
+        const mergedFocusedId = turnPlan.focusedVehicleId ?? prevCtx.focusedVehicleId ?? null;
+        const mergedFinancing = (turnPlan.financingSummary ?? prevCtx.financingSummary ?? null) as VehicleFinancingSummary | null;
+        const mergedTradeIn = (turnPlan.tradeInSummary ?? prevCtx.tradeInSummary ?? null) as TradeInSessionState | null;
+        const focusedVehForSummary = mergedFocusedId
+          ? activeInventoryVehicles.find((v) => String(v.id) === String(mergedFocusedId)) || null
+          : null;
+        const consolidatedHandoffSummary =
+          buildConsolidatedHandoffSummary({
+            focusedVehicle: focusedVehForSummary,
+            financingSummary: mergedFinancing,
+            tradeInSummary: mergedTradeIn,
+          }) ||
+          turnPlan.handoffSummary ||
+          prevCtx.handoffSummary ||
+          null;
+
+        const nextCtx: SessionNegotiationContext = {
           ...prevCtx,
           activeFilters: turnPlan.activeFilters ?? prevCtx.activeFilters ?? null,
-          focusedVehicleId: turnPlan.focusedVehicleId ?? prevCtx.focusedVehicleId ?? null,
-          financingSummary: turnPlan.financingSummary ?? prevCtx.financingSummary ?? null,
+          focusedVehicleId: mergedFocusedId,
+          financingSummary: mergedFinancing,
+          tradeInSummary: mergedTradeIn,
+          handoffSummary: consolidatedHandoffSummary,
           visitStatus: turnPlan.isVisitInquiryOnly
             ? prevCtx.visitStatus || 'consultada'
             : prevCtx.visitStatus ?? null,
@@ -4935,27 +5049,38 @@ app.post('/api/ai/chat', async (req, res) => {
           [auditSessionId, focusedNumeric, JSON.stringify(nextCtx)]
         );
 
-        // Auto-register trade-in lead in Central's trade_ins table if user mentions trade-in vehicle
+        // Auto-register or enrich trade-in lead in Central's trade_ins table without overwriting confirmed fields
         if (turnPlan.promptAttachPhotos && latestClientUtterance.length >= 6) {
           const existingTradeRes = await pool.query(
             'SELECT id FROM trade_ins WHERE session_id = $1 LIMIT 1',
             [auditSessionId]
           );
           if (existingTradeRes.rowCount === 0) {
+            const cleanBrandModel =
+              mergedTradeIn?.brandModel || latestClientUtterance.slice(0, 140);
+            const pendingList =
+              mergedTradeIn?.pendingItems && mergedTradeIn.pendingItems.length > 0
+                ? [...mergedTradeIn.pendingItems, 'Fotos externas e internas']
+                : ['Fotos externas e internas', 'Confirmação de pendências/documentação'];
             await pool.query(
               `INSERT INTO trade_ins (
                  session_id, target_vehicle_id, customer_name, customer_phone,
-                 brand_model, condition_notes, status, pending_items_json
+                 brand_model, year_text, version_text, transmission, km,
+                 condition_notes, status, pending_items_json
                )
-               VALUES ($1, $2, $3, $4, $5, $6, 'aguardando_fotos', $7)`,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'aguardando_fotos', $11)`,
               [
                 auditSessionId,
                 focusedNumeric,
                 resolvedVisitorName || curSess?.lead_name || null,
                 curSess?.lead_phone || null,
-                latestClientUtterance.slice(0, 140),
+                cleanBrandModel,
+                mergedTradeIn?.yearText || null,
+                mergedTradeIn?.version || null,
+                mergedTradeIn?.transmission || null,
+                mergedTradeIn?.km ?? null,
                 latestClientUtterance.slice(0, 500),
-                JSON.stringify(['Fotos externas e internas', 'Confirmação de pendências/documentação']),
+                JSON.stringify(pendingList),
               ]
             );
           }
@@ -5097,7 +5222,7 @@ ${hoursHeaderLine}
           model: replyModelUsed,
           usageMetadata: response.usageMetadata,
         });
-        reply = guardChatReply(response.text?.trim() || '', turnPlan);
+        reply = guardChatReply(response.text?.trim() || '', turnPlan, effectiveDealership);
       } catch (chatErr) {
         if (isNonFallbackGeminiError(chatErr)) {
           throw chatErr;
@@ -5115,7 +5240,7 @@ ${hoursHeaderLine}
             model: replyModelUsed,
             usageMetadata: fallbackRes.usageMetadata,
           });
-          reply = guardChatReply(fallbackRes.text?.trim() || '', turnPlan);
+          reply = guardChatReply(fallbackRes.text?.trim() || '', turnPlan, effectiveDealership);
         } catch {
           reply = turnPlan.deterministicReply;
         }
@@ -5207,14 +5332,14 @@ ${hoursHeaderLine}
       });
 
       if (!clientClosed) {
-        const guarded = guardChatReply(fullText.trim(), turnPlan);
+        const guarded = guardChatReply(fullText.trim(), turnPlan, effectiveDealership);
         if (auditSessionId) {
           void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', guarded);
         }
         res.write(`data: ${JSON.stringify({ type: 'done', reply: guarded })}\n\n`);
         res.end();
       } else if (auditSessionId && fullText.trim()) {
-        const guarded = guardChatReply(fullText.trim(), turnPlan);
+        const guarded = guardChatReply(fullText.trim(), turnPlan, effectiveDealership);
         void recordChatAuditTurn(auditSessionId, auditOrigin, 'assistant', guarded);
       }
     } catch (streamErr: unknown) {
@@ -5440,6 +5565,214 @@ registerCentralRevendaRoutes(app, {
   },
 });
 
+// ============================================================================
+// Technical SEO & GEO Endpoints (robots.txt, sitemap.xml, SSR meta injection)
+// ============================================================================
+
+function getRequestOrigin(req: Request): string {
+  const configuredAppUrl = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+  const forwardedProto =
+    typeof req.headers['x-forwarded-proto'] === 'string'
+      ? req.headers['x-forwarded-proto'].split(',')[0].trim()
+      : req.protocol || 'https';
+  const host =
+    (typeof req.headers['x-forwarded-host'] === 'string'
+      ? req.headers['x-forwarded-host'].split(',')[0].trim()
+      : req.get('host')) || '';
+  if (host) {
+    return `${forwardedProto}://${host}`.replace(/\/+$/, '');
+  }
+  return configuredAppUrl && /^https?:\/\//i.test(configuredAppUrl)
+    ? configuredAppUrl
+    : '';
+}
+
+function parseServerRouteForSeo(pathname: string): {
+  viewMode: AppViewMode;
+  activeModule: NavModule;
+  vehicleId: string | null;
+} {
+  const clean = pathname.replace(/\/+$/, '') || '/';
+  const vehicleMatch = clean.match(/^\/veiculo\/([^/]+)$/);
+  if (vehicleMatch?.[1]) {
+    return {
+      viewMode: 'vehicle_detail',
+      activeModule: 'hoje',
+      vehicleId: decodeURIComponent(vehicleMatch[1]),
+    };
+  }
+  if (clean === '/inicio' || clean === '/home') {
+    return { viewMode: 'home', activeModule: 'hoje', vehicleId: null };
+  }
+  if (clean === '/chat' || clean === '/atendimento') {
+    return { viewMode: 'chat', activeModule: 'hoje', vehicleId: null };
+  }
+  if (clean === '/privacidade' || clean === '/politica-de-privacidade') {
+    return { viewMode: 'privacy', activeModule: 'hoje', vehicleId: null };
+  }
+  if (clean === '/login') {
+    return { viewMode: 'login', activeModule: 'hoje', vehicleId: null };
+  }
+  if (
+    clean === '/revenda' ||
+    clean.startsWith('/revenda/') ||
+    clean === '/admin' ||
+    clean.startsWith('/admin/')
+  ) {
+    const sub = clean.startsWith('/revenda')
+      ? clean.slice('/revenda'.length)
+      : clean.slice('/admin'.length);
+    const modMap: Record<string, NavModule> = {
+      '': 'hoje',
+      '/hoje': 'hoje',
+      '/visao-geral': 'hoje',
+      '/dashboard': 'hoje',
+      '/atendimentos': 'atendimentos',
+      '/crm': 'atendimentos',
+      '/conversas': 'atendimentos',
+      '/chat-audit': 'atendimentos',
+      '/estoque': 'estoque',
+      '/agenda-trocas': 'agenda_trocas',
+      '/agenda': 'agenda_trocas',
+      '/trocas': 'agenda_trocas',
+      '/divulgacao': 'divulgacao',
+      '/ia': 'divulgacao',
+      '/posts-ia': 'divulgacao',
+      '/documentos': 'documentos',
+      '/contratos': 'documentos',
+      '/gestao': 'gestao',
+      '/configuracoes': 'configuracoes',
+    };
+    return {
+      viewMode: 'admin',
+      activeModule: modMap[sub] || 'hoje',
+      vehicleId: null,
+    };
+  }
+  return { viewMode: 'catalog', activeModule: 'hoje', vehicleId: null };
+}
+
+async function renderSeoHtmlForRequest(req: Request, rawHtml: string): Promise<string> {
+  try {
+    const rawPathname = (req.originalUrl || req.url || req.path || '/').split('?')[0] || '/';
+    const parsed = parseServerRouteForSeo(rawPathname);
+    const origin = getRequestOrigin(req);
+    const { config: settings } = await getPersistedDealershipConfig();
+    let vehicle: Vehicle | null = null;
+    let vehicles: Vehicle[] = [];
+
+    const toApiVehicleRow = (row: DbVehicleRow): ApiVehicleRow => ({
+      ...row,
+      created_at:
+        row.created_at instanceof Date
+          ? row.created_at.toISOString()
+          : String(row.created_at || ''),
+    });
+
+    if (parsed.viewMode === 'vehicle_detail' && parsed.vehicleId && /^\d+$/.test(parsed.vehicleId)) {
+      const vRes = await pool.query<DbVehicleRow>(
+        'SELECT * FROM vehicles WHERE id = $1 LIMIT 1',
+        [Number(parsed.vehicleId)]
+      );
+      if (vRes.rows[0]) {
+        vehicle = mapDbVehicleToFrontend(toApiVehicleRow(vRes.rows[0]));
+      }
+    } else if (parsed.viewMode === 'catalog' || parsed.viewMode === 'home') {
+      const listRes = await pool.query<DbVehicleRow>(
+        'SELECT * FROM vehicles ORDER BY created_at DESC, id DESC LIMIT 30'
+      );
+      vehicles = listRes.rows.map((row) => mapDbVehicleToFrontend(toApiVehicleRow(row)));
+    }
+
+    const seoPayload = buildRouteSeoPayload({
+      viewMode: parsed.viewMode,
+      activeModule: parsed.activeModule,
+      settings,
+      origin,
+      vehicle,
+      vehicles,
+    });
+    return injectSeoIntoHtml(rawHtml, seoPayload);
+  } catch {
+    return rawHtml;
+  }
+}
+
+app.get('/robots.txt', (req, res) => {
+  const origin = getRequestOrigin(req);
+  const lines = [
+    'User-agent: *',
+    'Allow: /',
+    'Allow: /inicio',
+    'Allow: /chat',
+    'Allow: /veiculo/',
+    'Allow: /privacidade',
+    'Disallow: /login',
+    'Disallow: /revenda',
+    'Disallow: /admin',
+    'Disallow: /api/',
+    ...(origin ? ['', `Sitemap: ${origin}/sitemap.xml`] : []),
+  ];
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(lines.join('\n'));
+});
+
+app.get('/sitemap.xml', async (req, res) => {
+  try {
+    const origin = getRequestOrigin(req) || 'https://agente-de-ia-carros.vercel.app';
+    const today = new Date().toISOString().slice(0, 10);
+    const vehicleRes = await pool.query<DbVehicleRow>(
+      'SELECT id, status, created_at FROM vehicles ORDER BY id DESC'
+    );
+    const availableVehicles = vehicleRes.rows
+      .map((r) => ({
+        id: String(r.id),
+        status: r.status,
+        lastmod: r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : today,
+      }))
+      .filter((v) =>
+        isVehicleAvailable({
+          status:
+            v.status === 'Reservado' || v.status === 'Vendido'
+              ? v.status
+              : 'Disponível',
+        })
+      );
+
+    const staticUrls = [
+      { loc: `${origin}/`, changefreq: 'daily', priority: '1.0', lastmod: today },
+      { loc: `${origin}/inicio`, changefreq: 'weekly', priority: '0.9', lastmod: today },
+      { loc: `${origin}/chat`, changefreq: 'weekly', priority: '0.8', lastmod: today },
+      { loc: `${origin}/privacidade`, changefreq: 'monthly', priority: '0.3', lastmod: today },
+    ];
+    const vehicleUrls = availableVehicles.map((v) => ({
+      loc: `${origin}${buildVehicleSheetPath(v.id)}`,
+      changefreq: 'daily',
+      priority: '0.85',
+      lastmod: v.lastmod,
+    }));
+
+    const xml =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n` +
+      [...staticUrls, ...vehicleUrls]
+        .map(
+          (u) =>
+            `  <url>\n    <loc>${u.loc}</loc>\n    <lastmod>${u.lastmod}</lastmod>\n    <changefreq>${u.changefreq}</changefreq>\n    <priority>${u.priority}</priority>\n  </url>`
+        )
+        .join('\n') +
+      `\n</urlset>`;
+
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=1800');
+    res.send(xml);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Erro ao gerar sitemap.xml';
+    res.status(500).type('text/plain').send(msg);
+  }
+});
+
 let dbInitPromise: Promise<void> | null = null;
 
 export function ensureDatabaseInitialized(): Promise<void> {
@@ -5485,14 +5818,36 @@ async function startServer() {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: 'spa',
+      appType: 'custom',
     });
     app.use(vite.middlewares);
+    app.use('*', async (req, res, next) => {
+      if (req.method !== 'GET' || req.originalUrl.startsWith('/api/')) {
+        next();
+        return;
+      }
+      try {
+        const template = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf-8');
+        const transformed = await vite.transformIndexHtml(req.originalUrl, template);
+        const seoHtml = await renderSeoHtmlForRequest(req, transformed);
+        res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').end(seoHtml);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
   } else {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    const distIndexPath = path.join(distPath, 'index.html');
+    app.use(express.static(distPath, { index: false }));
+    app.get('*', async (req, res) => {
+      try {
+        const rawHtml = fs.readFileSync(distIndexPath, 'utf-8');
+        const seoHtml = await renderSeoHtmlForRequest(req, rawHtml);
+        res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').send(seoHtml);
+      } catch {
+        res.sendFile(distIndexPath);
+      }
     });
   }
 

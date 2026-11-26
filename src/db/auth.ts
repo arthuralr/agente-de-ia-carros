@@ -195,6 +195,30 @@ export function buildClearSessionCookieHeader(req: Request): string {
   return attrs.join('; ');
 }
 
+export interface ResolvedAdminBootstrapEnv {
+  email: string;
+  password: string;
+  name: string;
+  usedLegacyPasswordAlias: boolean;
+}
+
+export function resolveAdminBootstrapEnv(
+  env: NodeJS.ProcessEnv = process.env
+): ResolvedAdminBootstrapEnv {
+  const email = (env.ADMIN_BOOTSTRAP_EMAIL || '').trim().toLowerCase();
+  const canonicalPassword = (env.ADMIN_BOOTSTRAP_PASSWORD || '').trim();
+  const legacyAliasPassword = (env.ADMIN_BOOTSTRAP_PASSWC || '').trim();
+  const usedLegacyPasswordAlias = !canonicalPassword && Boolean(legacyAliasPassword);
+  const password = canonicalPassword || legacyAliasPassword;
+  const name = (env.ADMIN_BOOTSTRAP_NAME || 'Administrador').trim();
+  return {
+    email,
+    password,
+    name,
+    usedLegacyPasswordAlias,
+  };
+}
+
 export async function ensureAdminUsersSchemaAndSeed(): Promise<void> {
   const client = await pool.connect();
   try {
@@ -219,23 +243,26 @@ export async function ensureAdminUsersSchemaAndSeed(): Promise<void> {
         ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 1
     `);
 
-    // Secure first-run bootstrap ONLY via explicit server environment variables when no user exists.
-    // Never creates hardcoded demo credentials.
+    // Secure idempotent first-run bootstrap ONLY via explicit server environment variables
+    // when admin_users table is completely empty (COUNT(*) = 0). Never exposes or hardcodes credentials.
     const countRes = await client.query<{ count: number }>(
       'SELECT COUNT(*)::int AS count FROM admin_users'
     );
 
     if ((countRes.rows[0]?.count ?? 0) === 0) {
-      const bootstrapEmail = (process.env.ADMIN_BOOTSTRAP_EMAIL || '').trim().toLowerCase();
-      const bootstrapPassword = (process.env.ADMIN_BOOTSTRAP_PASSWORD || '').trim();
-      const bootstrapName = (process.env.ADMIN_BOOTSTRAP_NAME || 'Administrador').trim();
-      if (bootstrapEmail && bootstrapPassword.length >= 10) {
-        const passwordHash = hashPassword(bootstrapPassword);
+      const bootstrap = resolveAdminBootstrapEnv();
+      if (bootstrap.usedLegacyPasswordAlias) {
+        console.warn(
+          '[Auth] Detectada variável legada ADMIN_BOOTSTRAP_PASSWC; padronize para ADMIN_BOOTSTRAP_PASSWORD no ambiente de produção.'
+        );
+      }
+      if (bootstrap.email && bootstrap.password.length >= 10) {
+        const passwordHash = hashPassword(bootstrap.password);
         await client.query(
           `INSERT INTO admin_users (name, email, password_hash, role, role_code, active, token_version)
            VALUES ($1, $2, $3, 'Administrador', 'administrador', true, 1)
            ON CONFLICT (email) DO NOTHING`,
-          [bootstrapName, bootstrapEmail, passwordHash]
+          [bootstrap.name, bootstrap.email, passwordHash]
         );
       }
     }

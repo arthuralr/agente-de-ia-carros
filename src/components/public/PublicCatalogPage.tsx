@@ -17,6 +17,7 @@ import { formatBRL, formatKm } from '../../utils/formatters';
 import {
   analyzeVehicleDataQuality,
   computeFipeMetrics,
+  getVehicleDisplayTitle,
 } from '../../utils/vehicleDomain';
 import { VehicleImage } from '../VehicleImage';
 import { PublicFooter } from './PublicFooter';
@@ -523,10 +524,19 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
           </div>
         ) : (
           <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {filteredAndSorted.map((vehicle) => {
+            {filteredAndSorted.map((vehicle, idx) => {
               const cat = inferVehicleCategory(vehicle);
               const quality = analyzeVehicleDataQuality(vehicle);
               const fipe = computeFipeMetrics(vehicle);
+              const displayTitle = getVehicleDisplayTitle(vehicle);
+              const descriptiveAlt = [
+                displayTitle,
+                vehicle.year,
+                vehicle.color,
+                quality.displayTransmission,
+              ]
+                .filter(Boolean)
+                .join(' · ');
 
               return (
                 <article
@@ -540,7 +550,8 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
                   >
                     <VehicleImage
                       src={vehicle.imageUrl}
-                      alt={`${vehicle.brand} ${vehicle.model} ${vehicle.version}`}
+                      alt={descriptiveAlt}
+                      priority={idx < 3}
                       className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-300"
                     />
                   </div>
@@ -560,11 +571,16 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
                       </div>
 
                       <h2 className="font-display text-lg font-semibold text-white mt-1 leading-snug">
-                        {vehicle.brand} {vehicle.model}
+                        {displayTitle}
                       </h2>
-                      <p className="text-xs text-zinc-400 truncate mt-0.5">
-                        {vehicle.version}
-                      </p>
+                      {vehicle.version &&
+                        !displayTitle
+                          .toLowerCase()
+                          .includes(vehicle.version.trim().toLowerCase()) && (
+                          <p className="text-xs text-zinc-400 truncate mt-0.5">
+                            {vehicle.version}
+                          </p>
+                        )}
 
                       {/* Clean unboxed technical metadata */}
                       <p className="text-xs text-zinc-300 mt-3 tabular-nums">
@@ -580,11 +596,15 @@ export const PublicCatalogPage: React.FC<PublicCatalogPageProps> = ({
                         </span>{' '}
                         · {vehicle.fuel}
                       </p>
-                      {fipe.isConfirmedBelowFipeOffer && fipe.diffBrl && (
+                      {fipe.isConfirmedBelowFipeOffer && fipe.diffBrl ? (
                         <p className="text-[11px] text-emerald-400 mt-1.5 tabular-nums">
                           {formatBRL(fipe.diffBrl)} abaixo da FIPE ({fipe.fipeReferenceMonth})
                         </p>
-                      )}
+                      ) : !fipe.hasFipeValue ? (
+                        <p className="text-[11px] text-zinc-500 mt-1.5">
+                          FIPE sob consulta
+                        </p>
+                      ) : null}
                     </div>
 
                     <div className="pt-4 border-t border-white/[0.06] space-y-4">

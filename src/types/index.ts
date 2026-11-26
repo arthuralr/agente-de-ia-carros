@@ -245,18 +245,32 @@ export type SessionCommercialStage =
   | 'Fechado'
   | 'Perdido';
 
+export interface TradeInSessionState {
+  brandModel?: string | null;
+  version?: string | null;
+  yearText?: string | null;
+  engine?: string | null;
+  transmission?: string | null;
+  km?: number | null;
+  kmText?: string | null;
+  photosCount?: number;
+  pendingItems?: string[];
+  confirmedAt?: string | null;
+  pendingConflict?: {
+    field: string;
+    existingValue: string;
+    newValue: string;
+  } | null;
+}
+
 export interface SessionNegotiationContext {
   activeFilters?: VehicleSearchFilters | null;
   focusedVehicleId?: string | null;
+  compareVehicleIds?: string[];
   budgetMax?: number | null;
   financingSummary?: VehicleFinancingSummary | null;
-  tradeInSummary?: {
-    brandModel?: string;
-    yearText?: string;
-    km?: number | null;
-    transmission?: string;
-    pendingItems?: string[];
-  } | null;
+  tradeInSummary?: TradeInSessionState | null;
+  handoffSummary?: string | null;
   visitStatus?: 'consultada' | 'solicitada' | 'confirmada' | null;
   nextAction?: string | null;
   sourceCampaign?: string | null;
@@ -271,6 +285,7 @@ export interface ChatSessionSummary {
   tag?: string | null;
   aiSummary?: string | null;
   aiSummaryUpdatedAt?: string | null;
+  handoffSummary?: string | null;
   whatsappHandoffAt?: string | null;
   handoffStatus?: string | null;
   assignedUserId?: number | null;

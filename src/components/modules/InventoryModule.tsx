@@ -27,6 +27,7 @@ import { formatBRL, formatKm } from '../../utils/formatters';
 import {
   analyzeVehicleDataQuality,
   computeFipeMetrics,
+  getVehicleDisplayTitle,
 } from '../../utils/vehicleDomain';
 import { VehicleImage } from '../VehicleImage';
 
@@ -502,6 +503,7 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                 {filteredVehicles.map((vehicle) => {
                   const quality = analyzeVehicleDataQuality(vehicle);
                   const fipe = computeFipeMetrics(vehicle);
+                  const displayTitle = getVehicleDisplayTitle(vehicle);
                   return (
                   <tr
                     key={vehicle.id}
@@ -512,13 +514,13 @@ export const InventoryModule: React.FC<InventoryModuleProps> = ({
                         <div className="w-20 h-14 rounded-lg overflow-hidden shrink-0 bg-zinc-900 border border-white/[0.06]">
                           <VehicleImage
                             src={vehicle.imageUrl}
-                            alt={`${vehicle.brand} ${vehicle.model}`}
+                            alt={`${displayTitle} ${vehicle.year}`}
                           />
                         </div>
                         <div className="min-w-0">
                           <div className="flex items-center gap-2">
                             <p className="font-medium text-white truncate">
-                              {vehicle.brand} {vehicle.model}
+                              {displayTitle}
                             </p>
                           </div>
                           <p className="text-xs text-zinc-400 truncate mt-0.5">

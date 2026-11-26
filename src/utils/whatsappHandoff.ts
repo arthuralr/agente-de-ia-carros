@@ -1,7 +1,15 @@
-import { ChatMessage, DealershipSettings, Vehicle } from '../types';
+import {
+  ChatMessage,
+  DealershipSettings,
+  TradeInSessionState,
+  Vehicle,
+  VehicleFinancingSummary,
+} from '../types';
 import {
   extractTradeInInfo,
   extractVehicleMatchTokens,
+  formatBrlCurrency,
+  formatTradeInSummaryLine,
   getVehicleDisplayTitle,
   normalizeTextForMatch,
   resolveVehicleSheetLink,
@@ -27,6 +35,8 @@ export interface WhatsAppHandoffParams {
   contextSummary?: string | null;
   vehicleLabel?: string | null;
   focusedVehicle?: Vehicle | null;
+  financingSummary?: VehicleFinancingSummary | null;
+  confirmedTradeIn?: TradeInSessionState | null;
   baseUrl?: string | null;
   purpose?: HandoffPurpose;
   destinationLabel?: string | null;
@@ -377,7 +387,23 @@ export function buildWhatsAppHandoffUrl(
     params.focusedVehicle ||
     resolveVehicleFromConversation(params.messages, params.vehicles);
 
-  const tradeInLabel = buildCompactTradeInLabel(params.messages);
+  // Extract latest financing simulation summary from params or conversation messages
+  const resolvedFinancing: VehicleFinancingSummary | null =
+    params.financingSummary ||
+    [...(params.messages || [])]
+      .reverse()
+      .find((m) => m.sender === 'ia' && m.financingSummary)?.financingSummary ||
+    null;
+
+  const financingClause = resolvedFinancing
+    ? ` Simulação: entrada ${formatBrlCurrency(resolvedFinancing.downPayment)}, saldo a financiar ${formatBrlCurrency(resolvedFinancing.principalBalance)}${
+        resolvedFinancing.months ? ` em ${resolvedFinancing.months}x` : ''
+      }.`
+    : '';
+
+  const tradeInLabel =
+    formatTradeInSummaryLine(params.confirmedTradeIn) ||
+    buildCompactTradeInLabel(params.messages);
   const intents = extractIntentsFromMessages(params.messages);
 
   const identityPart = cleanName
@@ -398,7 +424,10 @@ export function buildWhatsAppHandoffUrl(
   if (resolvedVehicle) {
     const vehicleName = `${getVehicleDisplayTitle(resolvedVehicle)} ${resolvedVehicle.year}`;
     const subjectParts: string[] = [];
-    if (purpose === 'financing' || intents.includes('simulação de financiamento')) {
+    if (
+      !resolvedFinancing &&
+      (purpose === 'financing' || intents.includes('simulação de financiamento'))
+    ) {
       subjectParts.push('uma simulação de financiamento');
     }
     if (purpose === 'visit' || intents.includes('solicitação de visita')) {
@@ -411,15 +440,18 @@ export function buildWhatsAppHandoffUrl(
     const subjectSuffix =
       subjectParts.length > 0 ? ` e ${subjectParts.join(' + ')}` : '';
     const tradeInClause = tradeInLabel ? ` Usado na troca: ${tradeInLabel}.` : '';
-    contextSummary = `${vehicleName}${subjectSuffix}${tradeInLabel ? ` · Usado na troca: ${tradeInLabel}` : ''}`.slice(
+    const finShort = resolvedFinancing
+      ? ` · Entrada ${formatBrlCurrency(resolvedFinancing.downPayment)} / Saldo ${formatBrlCurrency(resolvedFinancing.principalBalance)}`
+      : '';
+    contextSummary = `${vehicleName}${subjectSuffix}${finShort}${tradeInLabel ? ` · Troca: ${tradeInLabel}` : ''}`.slice(
       0,
-      160
+      200
     );
 
     actionLine =
       purpose === 'visit'
-        ? `Gostaria de solicitar um horário de visita para conhecer o ${vehicleName}.${tradeInClause}`
-        : `Gostaria de conversar sobre o ${vehicleName}${subjectSuffix}.${tradeInClause}`;
+        ? `Gostaria de solicitar um horário de visita para conhecer o ${vehicleName}.${financingClause}${tradeInClause}`
+        : `Gostaria de conversar sobre o ${vehicleName}${subjectSuffix}.${financingClause}${tradeInClause}`;
 
     if (sheetUrl && /^https?:\/\//i.test(sheetUrl)) {
       const linkPrefix =

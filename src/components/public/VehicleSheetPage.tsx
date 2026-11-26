@@ -34,6 +34,7 @@ import {
 } from '../../utils/vehicleDomain';
 import { WhatsAppHandoffModal } from './WhatsAppHandoffModal';
 import { HandoffPurpose } from '../../utils/whatsappHandoff';
+import { applyClientRouteSeo, buildRouteSeoPayload } from '../../utils/seo';
 
 interface VehicleSheetPageProps {
   vehicleId: string;
@@ -94,6 +95,19 @@ export const VehicleSheetPage: React.FC<VehicleSheetPageProps> = ({
   useEffect(() => {
     void loadVehicle();
   }, [loadVehicle]);
+
+  useEffect(() => {
+    if (!vehicle) return;
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+    applyClientRouteSeo(
+      buildRouteSeoPayload({
+        viewMode: 'vehicle_detail',
+        settings,
+        origin,
+        vehicle,
+      })
+    );
+  }, [vehicle, settings]);
 
   // Optionally consult official BrasilAPI FIPE when vehicle has a registered fipeCode
   useEffect(() => {

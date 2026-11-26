@@ -14,6 +14,7 @@ import { formatBRL, formatKm } from '../../utils/formatters';
 import {
   analyzeVehicleDataQuality,
   formatDealershipAddress,
+  getVehicleDisplayTitle,
   resolvePublicStorefrontLinks,
 } from '../../utils/vehicleDomain';
 import { VehicleImage } from '../VehicleImage';
@@ -394,6 +395,15 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               {activeStock.slice(0, 3).map((v) => {
                 const quality = analyzeVehicleDataQuality(v);
+                const displayTitle = getVehicleDisplayTitle(v);
+                const descriptiveAlt = [
+                  displayTitle,
+                  v.year,
+                  v.color,
+                  quality.displayTransmission,
+                ]
+                  .filter(Boolean)
+                  .join(' · ');
                 return (
                   <div
                     key={v.id}
@@ -403,12 +413,12 @@ export const PublicHomePage: React.FC<PublicHomePageProps> = ({
                       onClick={() => onOpenDetails(v)}
                       className="aspect-[4/3] w-full bg-zinc-950 overflow-hidden cursor-pointer"
                     >
-                      <VehicleImage src={v.imageUrl} alt={`${v.brand} ${v.model}`} />
+                      <VehicleImage src={v.imageUrl} alt={descriptiveAlt} />
                     </div>
                     <div className="p-5 flex-1 flex flex-col justify-between space-y-4">
                       <div>
                         <h3 className="font-display text-base font-semibold text-white">
-                          {v.brand} {v.model}
+                          {displayTitle}
                         </h3>
                         <p className="text-xs text-zinc-400 mt-0.5 truncate tabular-nums">
                           {v.year} · {formatKm(v.km)} · {quality.displayTransmission}

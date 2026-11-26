@@ -358,30 +358,39 @@ export const TodayModule: React.FC<TodayModuleProps> = ({
                       Nenhum cliente aguardando retorno neste momento.
                     </p>
                   ) : (
-                    summary.awaitingReply.slice(0, 6).map((s) => (
-                      <button
-                        key={s.sessionId}
-                        type="button"
-                        onClick={() => onOpenSession(s.sessionId)}
-                        className="w-full text-left px-5 py-3 hover:bg-white/[0.03] transition-colors flex items-start justify-between gap-3"
-                      >
-                        <div className="min-w-0">
-                          <p className="text-xs font-semibold text-white truncate">
-                            {s.leadName || `Visitante ${s.sessionId.slice(0, 8)}`}
-                          </p>
-                          <p className="text-[11px] text-zinc-400 truncate mt-0.5">
-                            {s.lastMessage || 'Conversa iniciada'}
-                          </p>
-                          <p className="text-[11px] text-zinc-500 mt-1">
-                            {s.stage || 'Novo Lead'} · {s.assignedUserName || 'Sem responsável'} ·{' '}
-                            {s.origem}
-                          </p>
-                        </div>
-                        <span className="text-[11px] font-mono tabular-nums text-zinc-500 shrink-0">
-                          {formatRelativeTime(s.updatedAt)}
-                        </span>
-                      </button>
-                    ))
+                    summary.awaitingReply.slice(0, 6).map((s) => {
+                      const consolidated =
+                        s.handoffSummary || s.context?.handoffSummary || null;
+                      return (
+                        <button
+                          key={s.sessionId}
+                          type="button"
+                          onClick={() => onOpenSession(s.sessionId)}
+                          className="w-full text-left px-5 py-3 hover:bg-white/[0.03] transition-colors flex items-start justify-between gap-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-xs font-semibold text-white truncate">
+                              {s.leadName || `Visitante ${s.sessionId.slice(0, 8)}`}
+                            </p>
+                            {consolidated && (
+                              <p className="text-[11px] text-emerald-300/90 mt-0.5 line-clamp-2">
+                                {consolidated}
+                              </p>
+                            )}
+                            <p className="text-[11px] text-zinc-400 truncate mt-0.5">
+                              {s.lastMessage || 'Conversa iniciada'}
+                            </p>
+                            <p className="text-[11px] text-zinc-500 mt-1">
+                              {s.stage || 'Novo Lead'} · {s.assignedUserName || 'Sem responsável'} ·{' '}
+                              {s.origem}
+                            </p>
+                          </div>
+                          <span className="text-[11px] font-mono tabular-nums text-zinc-500 shrink-0">
+                            {formatRelativeTime(s.updatedAt)}
+                          </span>
+                        </button>
+                      );
+                    })
                   )}
                 </div>
               </section>
